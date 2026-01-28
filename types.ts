@@ -46,6 +46,7 @@ export interface Lesson {
   monthlyBillMonth?: string;
   paymentStatus?: 'paid' | 'unpaid' | 'partial';
   attendanceConfirmed?: boolean;
+  price?: number; // מחיר השיעור (ניתן לעריכה)
 }
 
 export interface WeeklySlot {
@@ -57,6 +58,9 @@ export interface WeeklySlot {
   endTime: string;
   type: 'private' | 'group' | 'pair';
   status: 'active' | 'paused';
+  isFixed?: boolean; // Whether this slot is fixed/recurring (from 'קבוע' field)
+  reservedFor?: string; // Student ID if reserved (from 'reserved_for' field)
+  durationMin?: number; // Duration in minutes
 }
 
 export interface SlotInventory {
@@ -107,9 +111,13 @@ export interface Teacher {
 export interface Subscription {
   id: string;
   studentId: string;
-  planName: string;
-  price: number;
-  status: 'active' | 'cancelled' | 'expired';
+  fullName?: string; // Lookup from student_id, may be empty
+  subscriptionStartDate?: string; // Date
+  subscriptionEndDate?: string; // Date
+  monthlyAmount?: string; // Currency string like "₪480.00"
+  subscriptionType?: string; // Single select: e.g. "קבוצתי", "זוגי"
+  pauseSubscription?: boolean;
+  pauseDate?: string; // Date
 }
 
 export interface BillLineItem {

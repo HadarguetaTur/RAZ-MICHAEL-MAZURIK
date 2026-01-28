@@ -12,9 +12,21 @@ dist
 dist-ssr
 *.local
 
+# Environment and secrets files
+.env
+.env.local
+.env.development
+.env.production
+.env.test
+*.env
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
+.cursor/*
+!.cursor/plans/
+docs/admin_inbox_server_only.md
+mcp.json
 .idea
 .DS_Store
 *.suo

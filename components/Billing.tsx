@@ -10,30 +10,116 @@ const Billing: React.FC = () => {
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
   const [selectedBill, setSelectedBill] = useState<MonthlyBill | null>(null);
+  const [isCreatingCharges, setIsCreatingCharges] = useState(false);
 
   useEffect(() => {
     loadBills();
+  }, [selectedMonth, statusFilter, searchTerm]);
+
+  // Auto-create charges on 1st of month for previous month
+  useEffect(() => {
+    const checkAndCreateMonthlyCharges = async () => {
+      const now = new Date();
+      const today = now.getDate();
+      const currentMonth = now.getMonth() + 1;
+      const currentYear = now.getFullYear();
+      
+      // בדיקה אם היום הוא 1 לחודש
+      if (today === 1) {
+        // חודש שעבר
+        const lastMonth = currentMonth === 1 ? 12 : currentMonth - 1;
+        const lastMonthYear = currentMonth === 1 ? currentYear - 1 : currentYear;
+        const billingMonth = `${lastMonthYear}-${String(lastMonth).padStart(2, '0')}`;
+        
+        // בדיקה אם כבר נוצרו חיובים לחודש הזה היום
+        const lastRunKey = `billing_auto_${billingMonth}`;
+        const lastRun = localStorage.getItem(lastRunKey);
+        const todayStr = now.toISOString().split('T')[0];
+        
+        if (lastRun !== todayStr) {
+          try {
+            console.log(`[Auto Billing] Creating charges for ${billingMonth}`);
+            const result = await nexusApi.createMonthlyCharges(billingMonth);
+            localStorage.setItem(lastRunKey, todayStr);
+            console.log(`[Auto Billing] Created ${result.createdCount} charges, skipped ${result.skippedCount} for ${billingMonth}`);
+            
+            // רענון הרשימה אם זה החודש הנבחר
+            if (selectedMonth === billingMonth) {
+              await loadBills();
+            }
+          } catch (err) {
+            console.error(`[Auto Billing] Failed to create charges for ${billingMonth}:`, err);
+          }
+        }
+      }
+    };
+    
+    // בדיקה ראשונית
+    checkAndCreateMonthlyCharges();
+    
+    // בדיקה כל שעה (למקרה שהמשתמש פתח את האפליקציה אחרי 1 לחודש)
+    const interval = setInterval(checkAndCreateMonthlyCharges, 60 * 60 * 1000);
+    
+    return () => clearInterval(interval);
   }, [selectedMonth]);
 
   const loadBills = async () => {
     setLoading(true);
     try {
-      const data = await nexusApi.getMonthlyBills(selectedMonth);
+      // Pass filters to API for server-side filtering
+      const filters = {
+        statusFilter: statusFilter as 'all' | 'draft' | 'sent' | 'paid',
+        searchQuery: searchTerm || undefined,
+      };
+      
+      if (import.meta.env.DEV) {
+        console.log('[Billing] Loading bills for month:', selectedMonth, 'with filters:', filters);
+      }
+      
+      const data = await nexusApi.getMonthlyBills(selectedMonth, filters);
+      
+      if (import.meta.env.DEV) {
+        console.log('[Billing] Loaded', data.length, 'bills');
+      }
+      
       setBills(data);
     } catch (err) {
+      console.error('[Billing] Error loading bills:', err);
       alert(parseApiError(err));
+      setBills([]); // Set empty array on error
     } finally {
       setLoading(false);
     }
   };
 
-  const filteredBills = useMemo(() => {
-    return bills.filter(b => {
-      const matchesSearch = b.studentName.toLowerCase().includes(searchTerm.toLowerCase());
-      const matchesStatus = statusFilter === 'all' || b.status === statusFilter;
-      return matchesSearch && matchesStatus;
-    });
-  }, [bills, searchTerm, statusFilter]);
+  const handleCreateMonthlyCharges = async () => {
+    // אם זה חודש נוכחי, יצור חיובים עד עכשיו
+    const now = new Date();
+    const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    
+    const targetMonth = selectedMonth === currentMonth 
+      ? currentMonth  // במהלך החודש - עד עכשיו
+      : selectedMonth; // חודש שעבר - כל החודש
+    
+    if (!confirm(`האם ליצור חיובים חודשיים לחודש ${targetMonth}?`)) {
+      return;
+    }
+    
+    setIsCreatingCharges(true);
+    try {
+      const result = await nexusApi.createMonthlyCharges(targetMonth);
+      alert(`נוצרו ${result.createdCount} חיובים חדשים. ${result.skippedCount} חיובים כבר קיימים.${result.errors && result.errors.length > 0 ? `\n\nשגיאות: ${result.errors.length}` : ''}`);
+      // רענון הרשימה
+      await loadBills();
+    } catch (err) {
+      alert(parseApiError(err));
+    } finally {
+      setIsCreatingCharges(false);
+    }
+  };
+
+  // No need for client-side filtering anymore - API handles it
+  const filteredBills = bills;
 
   const stats = useMemo(() => {
     return {
@@ -113,8 +199,14 @@ const Billing: React.FC = () => {
             <option value="paid">שולמו</option>
           </select>
         </div>
-        <button className="h-12 bg-blue-600 text-white px-6 rounded-xl font-black text-sm shadow-lg shadow-blue-100 hover:bg-blue-700 active:scale-95 transition-all">
-          צור חיובים חודשיים
+        <button 
+          onClick={handleCreateMonthlyCharges}
+          disabled={isCreatingCharges}
+          className={`h-12 bg-blue-600 text-white px-6 rounded-xl font-black text-sm shadow-lg shadow-blue-100 hover:bg-blue-700 active:scale-95 transition-all ${
+            isCreatingCharges ? 'opacity-50 cursor-not-allowed' : ''
+          }`}
+        >
+          {isCreatingCharges ? 'יוצר חיובים...' : 'צור חיובים חודשיים'}
         </button>
       </div>
 
@@ -135,6 +227,13 @@ const Billing: React.FC = () => {
             <tbody className="divide-y divide-slate-100">
               {loading ? (
                 <tr><td colSpan={6} className="py-16 text-center text-slate-400">טוען...</td></tr>
+              ) : filteredBills.length === 0 ? (
+                <tr><td colSpan={6} className="py-16 text-center text-slate-400">
+                  <div className="flex flex-col items-center gap-2">
+                    <div className="text-lg font-bold">אין חיובים להצגה</div>
+                    <div className="text-sm">נסה לשנות את החודש או את הפילטרים</div>
+                  </div>
+                </td></tr>
               ) : filteredBills.map(bill => (
                 <tr key={bill.id} className="hover:bg-slate-50/50 cursor-pointer active:bg-slate-100 transition-colors" onClick={() => setSelectedBill(bill)}>
                   <td className="px-6 py-5">
@@ -158,6 +257,13 @@ const Billing: React.FC = () => {
         <div className="md:hidden divide-y divide-slate-100">
           {loading ? (
             <div className="p-10 text-center text-slate-400">טוען...</div>
+          ) : filteredBills.length === 0 ? (
+            <div className="p-10 text-center text-slate-400">
+              <div className="flex flex-col items-center gap-2">
+                <div className="text-lg font-bold">אין חיובים להצגה</div>
+                <div className="text-sm">נסה לשנות את החודש או את הפילטרים</div>
+              </div>
+            </div>
           ) : filteredBills.map(bill => (
             <div key={bill.id} className="p-5 active:bg-slate-50 transition-colors" onClick={() => setSelectedBill(bill)}>
               <div className="flex items-center justify-between mb-3">
@@ -243,6 +349,7 @@ const Billing: React.FC = () => {
                     />
                     <button className="px-4 py-3 bg-slate-900 text-white rounded-xl text-xs font-bold active:scale-95 transition-all">הוסף</button>
                   </div>
+
                 </div>
               </section>
             </div>

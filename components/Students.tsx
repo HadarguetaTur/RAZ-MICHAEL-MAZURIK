@@ -9,10 +9,21 @@ const Students: React.FC = () => {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedStudent, setSelectedStudent] = useState<Student | null>(null);
   const [profileTab, setProfileTab] = useState<'overview' | 'history' | 'homework' | 'tests'>('overview');
+  const [lessons, setLessons] = useState<Lesson[]>([]);
+  const [lessonsLoading, setLessonsLoading] = useState(false);
 
   useEffect(() => {
     loadData();
   }, []);
+
+  // Load lessons when student is selected
+  useEffect(() => {
+    if (selectedStudent) {
+      loadStudentLessons(selectedStudent.id);
+    } else {
+      setLessons([]);
+    }
+  }, [selectedStudent]);
 
   const loadData = async () => {
     setLoading(true);
@@ -23,6 +34,28 @@ const Students: React.FC = () => {
       alert(parseApiError(err));
     } finally {
       setLoading(false);
+    }
+  };
+
+  const loadStudentLessons = async (studentId: string) => {
+    setLessonsLoading(true);
+    try {
+      // Get lessons for the past year and next month to ensure we have all relevant lessons
+      const now = new Date();
+      const startDate = new Date(now.getFullYear() - 1, now.getMonth(), 1);
+      const endDate = new Date(now.getFullYear(), now.getMonth() + 2, 0);
+      const startDateStr = startDate.toISOString().split('T')[0];
+      const endDateStr = endDate.toISOString().split('T')[0];
+      
+      const allLessons = await nexusApi.getLessons(startDateStr, endDateStr);
+      // Filter lessons for this student
+      const studentLessons = allLessons.filter(lesson => lesson.studentId === studentId);
+      setLessons(studentLessons);
+    } catch (err) {
+      console.error('Error loading lessons:', err);
+      setLessons([]);
+    } finally {
+      setLessonsLoading(false);
     }
   };
 
@@ -207,6 +240,113 @@ const Students: React.FC = () => {
                        defaultValue={selectedStudent.notes || 'אין הערות רשומות.'}
                      />
                   </div>
+                </div>
+              )}
+
+              {profileTab === 'history' && (
+                <div className="space-y-6 animate-in fade-in slide-in-from-bottom-2">
+                  {lessonsLoading ? (
+                    <div className="py-10 text-center text-slate-300">טוען שיעורים...</div>
+                  ) : lessons.length === 0 ? (
+                    <div className="py-10 text-center text-slate-400">
+                      <div className="text-lg font-bold mb-2">אין שיעורים להצגה</div>
+                      <div className="text-sm">לא נמצאו שיעורים עבור תלמיד זה</div>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="flex items-center justify-between mb-4">
+                        <h3 className="text-lg font-black text-slate-800">שיעורים לפי חודש</h3>
+                        <button
+                          onClick={() => {
+                            const csv = [
+                              ['תאריך', 'שעה', 'משך (דקות)', 'מחיר (₪)', 'מקצוע', 'סטטוס'].join(','),
+                              ...lessons.map(l => {
+                                const displayPrice = l.price !== undefined 
+                                  ? l.price 
+                                  : (l.lessonType === 'private' && l.duration 
+                                      ? Math.round(l.duration * 2.92 * 100) / 100 
+                                      : 0);
+                                return [
+                                  l.date,
+                                  l.startTime,
+                                  l.duration,
+                                  displayPrice.toFixed(2),
+                                  l.subject,
+                                  l.status
+                                ].join(',');
+                              })
+                            ].join('\n');
+                            
+                            const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' });
+                            const link = document.createElement('a');
+                            link.href = URL.createObjectURL(blob);
+                            link.download = `שיעורים_${selectedStudent?.name}_${new Date().toISOString().split('T')[0]}.csv`;
+                            link.click();
+                          }}
+                          className="px-4 py-2 bg-blue-600 text-white rounded-xl text-xs font-black hover:bg-blue-700 transition-all"
+                        >
+                          ייצא פירוט
+                        </button>
+                      </div>
+                      {(() => {
+                        // קיבוץ לפי חודש
+                        const lessonsByMonth = new Map<string, Lesson[]>();
+                        lessons.forEach(lesson => {
+                          const month = lesson.date.substring(0, 7); // YYYY-MM
+                          if (!lessonsByMonth.has(month)) {
+                            lessonsByMonth.set(month, []);
+                          }
+                          lessonsByMonth.get(month)!.push(lesson);
+                        });
+                        
+                        return Array.from(lessonsByMonth.entries())
+                          .sort((a, b) => b[0].localeCompare(a[0])) // חדשים קודם
+                          .map(([month, monthLessons]) => (
+                            <div key={month} className="bg-white border border-slate-100 rounded-2xl p-6">
+                              <h3 className="text-lg font-black text-slate-800 mb-4">
+                                {new Date(month + '-01').toLocaleDateString('he-IL', { month: 'long', year: 'numeric' })}
+                              </h3>
+                              <div className="space-y-2">
+                                {monthLessons
+                                  .sort((a, b) => {
+                                    // Sort by date and time
+                                    const dateA = new Date(a.date + 'T' + a.startTime);
+                                    const dateB = new Date(b.date + 'T' + b.startTime);
+                                    return dateB.getTime() - dateA.getTime(); // Newest first
+                                  })
+                                  .map(lesson => {
+                                    // Calculate price if not available
+                                    const displayPrice = lesson.price !== undefined 
+                                      ? lesson.price 
+                                      : (lesson.lessonType === 'private' && lesson.duration 
+                                          ? Math.round(lesson.duration * 2.92 * 100) / 100 
+                                          : 0);
+                                    
+                                    return (
+                                      <div key={lesson.id} className="flex items-center justify-between p-3 bg-slate-50 rounded-xl">
+                                        <div>
+                                          <div className="font-bold text-slate-800">
+                                            {new Date(lesson.date).toLocaleDateString('he-IL')} {lesson.startTime}
+                                          </div>
+                                          <div className="text-xs text-slate-400">
+                                            {lesson.duration} דק׳ • {lesson.subject}
+                                          </div>
+                                        </div>
+                                        <div className="text-right">
+                                          <div className="font-black text-slate-800">
+                                            ₪{displayPrice.toFixed(2)}
+                                          </div>
+                                          <div className="text-xs text-slate-400">{lesson.status}</div>
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                              </div>
+                            </div>
+                          ));
+                      })()}
+                    </>
+                  )}
                 </div>
               )}
             </div>

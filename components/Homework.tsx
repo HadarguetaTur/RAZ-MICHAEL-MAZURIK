@@ -1,66 +1,82 @@
 
 import React, { useState, useEffect, useMemo } from 'react';
 import { HomeworkLibraryItem, HomeworkAssignment, Student } from '../types';
-import { nexusApi, parseApiError } from '../services/nexusApi';
+import { parseApiError } from '../services/nexusApi';
+import { getHomeworkLibrary, getHomeworkAssignments } from '../data/resources/homework';
+import { assignHomework } from '../data/mutations';
+import StudentPicker from './StudentPicker';
+import { useStudents } from '../hooks/useStudents';
+import AppSidePanel from './ui/AppSidePanel';
 
 const Homework: React.FC = () => {
   const [activeView, setActiveView] = useState<'library' | 'assignments'>('assignments');
+  const [showAssignModal, setShowAssignModal] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [library, setLibrary] = useState<HomeworkLibraryItem[]>([]);
   const [assignments, setAssignments] = useState<HomeworkAssignment[]>([]);
-  const [students, setStudents] = useState<Student[]>([]);
   const [loading, setLoading] = useState(true);
-  const [showAssignModal, setShowAssignModal] = useState(false);
 
   // Assignment Form State
   const [selectedHomework, setSelectedHomework] = useState<string>('');
-  const [selectedStudent, setSelectedStudent] = useState<string>('');
+  const [selectedStudent, setSelectedStudent] = useState<Student | null>(null);
   const [dueDate, setDueDate] = useState('');
+  
+  // Use the centralized students hook
+  const { getStudentById } = useStudents({ autoLoad: true });
 
   useEffect(() => {
+    const loadData = async () => {
+      setLoading(true);
+      try {
+        const [lib, assign] = await Promise.all([
+          getHomeworkLibrary(),
+          getHomeworkAssignments()
+        ]);
+        setLibrary(lib);
+        setAssignments(assign);
+      } catch (err) {
+        alert(parseApiError(err));
+      } finally {
+        setLoading(false);
+      }
+    };
     loadData();
   }, []);
 
-  const loadData = async () => {
-    setLoading(true);
-    try {
-      const [lib, assign, stds] = await Promise.all([
-        nexusApi.getHomeworkLibrary(),
-        nexusApi.getHomeworkAssignments(),
-        nexusApi.getStudents()
-      ]);
-      setLibrary(lib);
-      setAssignments(assign);
-      setStudents(stds);
-    } catch (err) {
-      alert(parseApiError(err));
-    } finally {
-      setLoading(false);
+  const handleAssign = async (e?: React.FormEvent) => {
+    if (e) {
+      e.preventDefault();
     }
-  };
-
-  const handleAssign = async (e: React.FormEvent) => {
-    e.preventDefault();
     if (!selectedHomework || !selectedStudent || !dueDate) {
       alert('יש למלא את כל השדות');
       return;
     }
 
     const homeworkItem = library.find(h => h.id === selectedHomework);
-    const studentItem = students.find(s => s.id === selectedStudent);
+    const studentItem = selectedStudent;
 
+    setIsSubmitting(true);
     try {
-      const newAssign = await nexusApi.assignHomework({
-        studentId: selectedStudent,
+      const newAssign = await assignHomework({
+        studentId: selectedStudent.id,
         studentName: studentItem?.name,
         homeworkId: selectedHomework,
         homeworkTitle: homeworkItem?.title,
         dueDate: dueDate
       });
-      setAssignments([newAssign, ...assignments]);
+      // Reload assignments to get fresh data (cache was invalidated by mutation)
+      const freshAssignments = await getHomeworkAssignments();
+      setAssignments(freshAssignments);
       setShowAssignModal(false);
+      // Reset form
+      setSelectedHomework('');
+      setSelectedStudent(null);
+      setDueDate('');
       alert('שיעורי הבית הוקצו בהצלחה');
     } catch (err) {
       alert(parseApiError(err));
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -168,59 +184,70 @@ const Homework: React.FC = () => {
         </div>
       )}
 
-      {/* Assign Modal */}
-      {showAssignModal && (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center p-6">
-          <div className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm" onClick={() => setShowAssignModal(false)}></div>
-          <form onSubmit={handleAssign} className="relative w-full max-w-lg bg-white rounded-[40px] shadow-2xl p-10 space-y-8 animate-in zoom-in-95 duration-300">
-            <h2 className="text-3xl font-black text-slate-800">הקצאת משימה חדשה</h2>
-            
-            <div className="space-y-6">
-              <div className="space-y-2">
-                <label className="text-xs font-black text-slate-400 uppercase mr-1">בחר תלמיד</label>
-                <select 
-                  className="w-full bg-slate-50 border border-slate-100 rounded-2xl px-5 py-3.5 text-sm font-bold outline-none focus:ring-4 focus:ring-blue-50 transition-all"
-                  value={selectedStudent}
-                  onChange={(e) => setSelectedStudent(e.target.value)}
-                  required
-                >
-                  <option value="">בחר...</option>
-                  {students.map(s => <option key={s.id} value={s.id}>{s.name} ({s.grade})</option>)}
-                </select>
-              </div>
+      {/* Assign Side Panel */}
+      <AppSidePanel
+        open={showAssignModal}
+        onOpenChange={setShowAssignModal}
+        title="הקצאת משימה חדשה"
+        width={480}
+        loading={isSubmitting}
+        footer={
+          <div className="flex gap-4 w-full">
+            <button
+              type="button"
+              onClick={() => setShowAssignModal(false)}
+              disabled={isSubmitting}
+              className="px-8 py-4 bg-slate-50 text-slate-400 rounded-2xl font-bold hover:bg-slate-100 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              ביטול
+            </button>
+            <button
+              type="button"
+              onClick={() => handleAssign()}
+              disabled={isSubmitting || !selectedHomework || !selectedStudent || !dueDate}
+              className="flex-1 py-4 bg-blue-600 text-white rounded-2xl font-black shadow-xl shadow-blue-100 hover:bg-blue-700 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {isSubmitting ? 'שומר...' : 'הקצה משימה'}
+            </button>
+          </div>
+        }
+      >
+        <form onSubmit={handleAssign} className="space-y-6">
+          <div className="space-y-2">
+            <label className="text-xs font-black text-slate-400 uppercase mr-1">בחר תלמיד</label>
+            <StudentPicker
+              value={selectedStudent}
+              onChange={(student) => setSelectedStudent(student)}
+              placeholder="חפש תלמיד לפי שם או טלפון..."
+              filterActiveOnly={true}
+            />
+          </div>
 
-              <div className="space-y-2">
-                <label className="text-xs font-black text-slate-400 uppercase mr-1">בחר משימה מהספרייה</label>
-                <select 
-                  className="w-full bg-slate-50 border border-slate-100 rounded-2xl px-5 py-3.5 text-sm font-bold outline-none focus:ring-4 focus:ring-blue-50 transition-all"
-                  value={selectedHomework}
-                  onChange={(e) => setSelectedHomework(e.target.value)}
-                  required
-                >
-                  <option value="">בחר...</option>
-                  {library.map(h => <option key={h.id} value={h.id}>{h.title} - {h.subject}</option>)}
-                </select>
-              </div>
+          <div className="space-y-2">
+            <label className="text-xs font-black text-slate-400 uppercase mr-1">בחר משימה מהספרייה</label>
+            <select 
+              className="w-full bg-slate-50 border border-slate-100 rounded-2xl px-5 py-3.5 text-sm font-bold outline-none focus:ring-4 focus:ring-blue-50 transition-all"
+              value={selectedHomework}
+              onChange={(e) => setSelectedHomework(e.target.value)}
+              required
+            >
+              <option value="">בחר...</option>
+              {library.map(h => <option key={h.id} value={h.id}>{h.title} - {h.subject}</option>)}
+            </select>
+          </div>
 
-              <div className="space-y-2">
-                <label className="text-xs font-black text-slate-400 uppercase mr-1">מועד הגשה</label>
-                <input 
-                  type="date"
-                  className="w-full bg-slate-50 border border-slate-100 rounded-2xl px-5 py-3.5 text-sm font-bold outline-none focus:ring-4 focus:ring-blue-50 transition-all"
-                  value={dueDate}
-                  onChange={(e) => setDueDate(e.target.value)}
-                  required
-                />
-              </div>
-            </div>
-
-            <div className="flex gap-4 pt-4">
-               <button type="submit" className="flex-1 py-4 bg-blue-600 text-white rounded-2xl font-black shadow-xl shadow-blue-100 hover:bg-blue-700 transition-all">הקצה משימה</button>
-               <button type="button" onClick={() => setShowAssignModal(false)} className="px-8 py-4 bg-slate-50 text-slate-400 rounded-2xl font-bold hover:bg-slate-100 transition-all">ביטול</button>
-            </div>
-          </form>
-        </div>
-      )}
+          <div className="space-y-2">
+            <label className="text-xs font-black text-slate-400 uppercase mr-1">מועד הגשה</label>
+            <input 
+              type="date"
+              className="w-full bg-slate-50 border border-slate-100 rounded-2xl px-5 py-3.5 text-sm font-bold outline-none focus:ring-4 focus:ring-blue-50 transition-all"
+              value={dueDate}
+              onChange={(e) => setDueDate(e.target.value)}
+              required
+            />
+          </div>
+        </form>
+      </AppSidePanel>
     </div>
   );
 };
