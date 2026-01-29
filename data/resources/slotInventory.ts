@@ -19,7 +19,8 @@ export interface SlotInventoryRange {
  */
 export async function getSlotInventory(
   range: SlotInventoryRange,
-  teacherId?: string
+  teacherId?: string,
+  forceRefresh?: boolean
 ): Promise<SlotInventory[]> {
   const { start, end } = range;
   // Use week start for cache key (group by week)
@@ -33,6 +34,13 @@ export async function getSlotInventory(
     weekStartIso,
     teacherId || 'all',
   ]);
+
+  // If forceRefresh is true, invalidate cache first
+  if (forceRefresh) {
+    invalidateCache(key);
+    // Also invalidate all to catch edge cases
+    invalidateCache('slot_inventory:*');
+  }
 
   return fetchWithCache({
     key,
