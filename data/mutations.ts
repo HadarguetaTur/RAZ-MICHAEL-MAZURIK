@@ -226,6 +226,25 @@ export async function updateSubscription(
 }
 
 /**
+ * Update billing status
+ */
+export async function updateBillStatus(
+  billId: string,
+  fields: { approved?: boolean; linkSent?: boolean; paid?: boolean },
+  month?: string
+): Promise<void> {
+  await nexusApi.updateBillStatus(billId, fields);
+  
+  // Invalidate billing cache
+  invalidateBilling(month);
+  
+  if (import.meta.env.DEV) {
+    const stats = getApiStats();
+    console.log(`[Mutations] updateBillStatus | invalidated: billing:${month || '*'}:* | calls/min: ${stats.callsPerMinute}`);
+  }
+}
+
+/**
  * Update bill adjustment
  */
 export async function updateBillAdjustment(
@@ -260,6 +279,21 @@ export async function createMonthlyCharges(
   }
   
   return result;
+}
+
+/**
+ * Delete a bill
+ */
+export async function deleteBill(billId: string, month?: string): Promise<void> {
+  await nexusApi.deleteBill(billId);
+  
+  // Invalidate billing cache
+  invalidateBilling(month);
+  
+  if (import.meta.env.DEV) {
+    const stats = getApiStats();
+    console.log(`[Mutations] deleteBill | invalidated: billing:${month || '*'} | calls/min: ${stats.callsPerMinute}`);
+  }
 }
 
 /**

@@ -11,8 +11,10 @@
  */
 
 import { AirtableClient } from './airtableClient';
+import { AIRTABLE_CONFIG } from '../config/airtable';
 import { Lesson, Subscription, MonthlyBill } from '../types';
 import { LessonStatus } from '../types';
+import { buildMonthForAllActiveStudents } from '../billing/billingEngine';
 
 export interface BillingCalculationResult {
   lessonsTotal: number;
@@ -675,128 +677,168 @@ export interface ChargeTableSchema {
   studentFieldIsArray: boolean; // Whether the student field expects array format
   billingMonthField: string; // Field name for billing month (e.g., "חודש חיוב")
   approvedField: string; // Field name for approval flag (e.g., "מאושר לחיוב")
+  linkSentField: string; // Field name for link sent flag (e.g., "נשלח קישור")
   paidField: string; // Field name for paid flag (e.g., "שולם")
 }
 
 /**
- * Discover the schema of the "חיובים" table by querying a sample record
+ * Discover the schema of the "חיובים" table by querying multiple records to find all field names
  */
-async function discoverChargeTableSchema(
+export async function discoverChargeTableSchema(
   client: AirtableClient
 ): Promise<ChargeTableSchema | MissingFields[]> {
   const billingTableId = client.getTableId('monthlyBills');
   
   try {
-    // Get a sample record to discover field names
-    const sampleRecords = await client.getRecords(billingTableId, { maxRecords: 1 });
+    // Get up to 100 records to ensure we find checkbox fields even if some are false
+    const records = await client.getRecords(billingTableId, { maxRecords: 100 });
     
-    // Known field names from actual schema (used as fallback)
-    const KNOWN_STUDENT_FIELD = 'full_name';
-    const KNOWN_BILLING_MONTH_FIELD = 'חודש חיוב';
-    const KNOWN_APPROVED_FIELD = 'מאושר לחיוב';
-    const KNOWN_PAID_FIELD = 'שולם';
+    // Helper to log string with character codes for invisible char detection
+    const logStringDetailed = (str: string) => {
+      const codes = Array.from(str).map(c => c.charCodeAt(0)).join(',');
+      return `"${str}" [codes: ${codes}]`;
+    };
+
+    // Known field names from config or actual schema (used as fallback)
+    const KNOWN_STUDENT_FIELD = AIRTABLE_CONFIG.fields.billingStudent || 'full_name';
+    const KNOWN_BILLING_MONTH_FIELD = AIRTABLE_CONFIG.fields.billingMonth || 'חודש חיוב';
+    const KNOWN_APPROVED_FIELD = AIRTABLE_CONFIG.fields.billingApproved || 'מאושר לחיוב';
+    const KNOWN_LINK_SENT_FIELD = AIRTABLE_CONFIG.fields.billingLinkSent || 'נשלח קישור';
+    const KNOWN_PAID_FIELD = AIRTABLE_CONFIG.fields.billingPaid || 'שולם';
     
-    if (sampleRecords.length === 0) {
-      // No records exist yet - use known field names from schema
+    if (records.length === 0) {
       return {
         studentField: KNOWN_STUDENT_FIELD,
-        studentFieldIsArray: true, // Default to array for linked records
+        studentFieldIsArray: true,
         billingMonthField: KNOWN_BILLING_MONTH_FIELD,
         approvedField: KNOWN_APPROVED_FIELD,
+        linkSentField: KNOWN_LINK_SENT_FIELD,
         paidField: KNOWN_PAID_FIELD,
       };
     }
     
-    const fields = Object.keys(sampleRecords[0].fields);
-    const sampleFields = sampleRecords[0].fields as any;
+    // Aggregate all unique field names from the records
+    // CRITICAL: Normalize all keys to NFC to handle Hebrew encoding variations correctly
+    const rawFields = new Set<string>();
+    records.forEach(r => {
+      Object.keys(r.fields).forEach(f => rawFields.add(f));
+    });
     
-    // Log available fields for debugging (dev only)
+    const fields = Array.from(rawFields);
+    const normalizedFieldsMap = new Map<string, string>(); // normalized -> raw
+    fields.forEach(f => normalizedFieldsMap.set(f.normalize('NFC').trim(), f));
+    
+    const normalizedFieldsList = Array.from(normalizedFieldsMap.keys());
+    
+    // Helper to find boolean-like fields (checkboxes)
+    const getBooleanFields = () => {
+      return normalizedFieldsList.filter(f => {
+        const rawKey = normalizedFieldsMap.get(f)!;
+        return records.some(r => {
+          const val = (r.fields as any)[rawKey];
+          // Check for explicit boolean OR null (checkboxes are null when false)
+          // but we only include it if it's explicitly null/boolean in some records
+          return typeof val === 'boolean' || val === 1 || val === 0 || val === null;
+        });
+      });
+    };
+
+    const booleanFields = getBooleanFields();
+
     if (import.meta.env.DEV) {
-      console.log('[discoverChargeTableSchema] Available fields in sample record:', fields);
+      console.log('--- AIRTABLE SCHEMA DIAGNOSTIC (חיובים) ---');
+      console.log('Total unique fields found in', records.length, 'records:', fields.length);
+      console.log('All available fields (normalized):', normalizedFieldsList.map(f => logStringDetailed(f)));
+      console.log('Fields with boolean/null values:', booleanFields);
+      console.log('------------------------------------------');
     }
     
-    // Find student link field - try "full_name" first (actual field name), then "id", then "תלמיד"
-    let studentField = fields.find(f => f === 'full_name' || f === 'id' || f === 'תלמיד' || f.toLowerCase() === 'student');
-    let studentFieldIsArray = false;
-    
-    if (!studentField) {
-      // Look for any field that might be a linked record (check if value is a record ID)
-      for (const fieldName of fields) {
-        const value = sampleFields[fieldName];
-        if (typeof value === 'string' && value.startsWith('rec')) {
-          studentField = fieldName;
-          studentFieldIsArray = false;
-          break;
-        } else if (Array.isArray(value) && value.length > 0 && typeof value[0] === 'string' && value[0].startsWith('rec')) {
-          studentField = fieldName;
-          studentFieldIsArray = true;
-          break;
+    const findExactRawField = (searchTerms: string[], fallback: string): string => {
+      // 1. Try exact match on normalized names
+      for (const term of searchTerms) {
+        const normalizedTerm = term.normalize('NFC').trim();
+        if (normalizedFieldsMap.has(normalizedTerm)) {
+          return normalizedFieldsMap.get(normalizedTerm)!;
         }
       }
-      // If still not found, use known field name as fallback
-      if (!studentField) {
-        studentField = KNOWN_STUDENT_FIELD;
-        studentFieldIsArray = true;
-      }
+      
+      // 2. Try fuzzy match on normalized names
+      const found = normalizedFieldsList.find(f => 
+        searchTerms.some(term => {
+          const normTerm = term.normalize('NFC').trim().toLowerCase();
+          return f.toLowerCase().includes(normTerm);
+        })
+      );
+      
+      if (found) return normalizedFieldsMap.get(found)!;
+      
+      // 3. Fallback
+      return fallback;
+    };
+
+    // Find student link field
+    let rawStudentField = findExactRawField([KNOWN_STUDENT_FIELD, 'id', 'תלמיד', 'student'], KNOWN_STUDENT_FIELD);
+    let studentFieldIsArray = false;
+    
+    // Check if the found field uses array format
+    const recordWithStudent = records.find(r => (r.fields as any)[rawStudentField]);
+    if (recordWithStudent) {
+      studentFieldIsArray = Array.isArray((recordWithStudent.fields as any)[rawStudentField]);
     } else {
-      // Check if the found field uses array format
-      const value = sampleFields[studentField];
-      studentFieldIsArray = Array.isArray(value);
+      // Fallback detection if primary search failed
+      for (const r of records) {
+        const rFields = r.fields as any;
+        for (const rawKey of Object.keys(rFields)) {
+          const value = rFields[rawKey];
+          if (typeof value === 'string' && value.startsWith('rec')) {
+            rawStudentField = rawKey;
+            studentFieldIsArray = false;
+            break;
+          } else if (Array.isArray(value) && value.length > 0 && typeof value[0] === 'string' && value[0].startsWith('rec')) {
+            rawStudentField = rawKey;
+            studentFieldIsArray = true;
+            break;
+          }
+        }
+        if (rawStudentField !== KNOWN_STUDENT_FIELD) break;
+      }
     }
     
     // Find billing month field
-    let billingMonthField = fields.find(f => 
-      f === 'חודש חיוב' || 
-      f.toLowerCase().includes('month') || 
-      f.toLowerCase().includes('חודש')
-    );
-    // Use known field name as fallback if not found
-    if (!billingMonthField) {
-      billingMonthField = KNOWN_BILLING_MONTH_FIELD;
-    }
+    let rawBillingMonthField = findExactRawField([KNOWN_BILLING_MONTH_FIELD, 'חודש חיוב', 'month', 'חודש'], KNOWN_BILLING_MONTH_FIELD);
     
-    // Find approval field
-    // Note: Checkbox fields that are false might not appear in fields object
-    let approvedField = fields.find(f => 
-      f === 'מאושר לחיוב' || 
-      f.toLowerCase().includes('approv') || 
-      f.toLowerCase().includes('מאושר')
-    );
-    // Use known field name as fallback if not found (field exists in schema even if unchecked)
-    if (!approvedField) {
-      approvedField = KNOWN_APPROVED_FIELD;
-    }
+    // Find approval field - prioritize boolean fields
+    const potentialApproved = booleanFields.find(f => f.includes('מאושר') && !f.includes('נשלח') && !f.includes('שולם'));
+    let rawApprovedField = potentialApproved ? normalizedFieldsMap.get(potentialApproved)! : 
+                          findExactRawField([KNOWN_APPROVED_FIELD, 'approved', 'מאושר'], KNOWN_APPROVED_FIELD);
+
+    // Find link sent field
+    const potentialLink = booleanFields.find(f => f.includes('נשלח') || f.includes('קישור'));
+    let rawLinkSentField = potentialLink ? normalizedFieldsMap.get(potentialLink)! :
+                          findExactRawField([KNOWN_LINK_SENT_FIELD, 'נשלח קישור', 'link', 'נשלח', 'קישור'], KNOWN_LINK_SENT_FIELD);
     
     // Find paid field
-    // Note: Checkbox fields that are false might not appear in fields object
-    let paidField = fields.find(f => 
-      f === 'שולם' || 
-      f.toLowerCase().includes('paid') || 
-      f.toLowerCase().includes('שולם')
-    );
-    // Use known field name as fallback if not found (field exists in schema even if unchecked)
-    if (!paidField) {
-      paidField = KNOWN_PAID_FIELD;
-    }
+    const potentialPaid = booleanFields.find(f => f.includes('שולם') && !f.includes('מאושר'));
+    let rawPaidField = potentialPaid ? normalizedFieldsMap.get(potentialPaid)! :
+                      findExactRawField([KNOWN_PAID_FIELD, 'paid', 'שולם'], KNOWN_PAID_FIELD);
     
-    // All fields should be found now (using fallbacks if needed)
-    // Return the schema - fields are guaranteed to exist based on known schema
     if (import.meta.env.DEV) {
-      console.log('[discoverChargeTableSchema] Discovered schema:', {
-        studentField,
-        studentFieldIsArray,
-        billingMonthField,
-        approvedField,
-        paidField,
+      console.log('[discoverChargeTableSchema] Discovered Raw Schema Mapping:', {
+        studentField: logStringDetailed(rawStudentField),
+        billingMonthField: logStringDetailed(rawBillingMonthField),
+        approvedField: logStringDetailed(rawApprovedField),
+        linkSentField: logStringDetailed(rawLinkSentField),
+        paidField: logStringDetailed(rawPaidField),
       });
     }
     
     return {
-      studentField: studentField!,
+      studentField: rawStudentField,
       studentFieldIsArray,
-      billingMonthField: billingMonthField!,
-      approvedField: approvedField!,
-      paidField: paidField!,
+      billingMonthField: rawBillingMonthField,
+      approvedField: rawApprovedField,
+      linkSentField: rawLinkSentField,
+      paidField: rawPaidField,
     };
   } catch (error: any) {
     // If we can't access the table, return missing fields error
@@ -1060,148 +1102,25 @@ export async function createMonthlyCharges(
     throw new Error(`Invalid billingMonth format: ${billingMonth}. Expected YYYY-MM`);
   }
   
-  // Discover schema for "חיובים" table
-  const schemaResult = await discoverChargeTableSchema(client);
-  if (Array.isArray(schemaResult)) {
-    throw {
-      MISSING_FIELDS: schemaResult,
+  try {
+    console.log(`[createMonthlyCharges] Starting billing creation for ${billingMonth} using BillingEngine`);
+    
+    // Use the robust billing engine instead of the simple logic
+    const result = await buildMonthForAllActiveStudents(client, billingMonth, false);
+    
+    return {
+      createdCount: result.summary.chargesCreated,
+      skippedCount: result.summary.chargesSkipped,
+      billingMonth,
+      errors: result.errors.map(e => ({
+        studentId: e.studentId,
+        error: e.error.message
+      }))
     };
+  } catch (error: any) {
+    console.error(`[createMonthlyCharges] Failed to create charges:`, error);
+    throw error;
   }
-  const schema = schemaResult;
-  
-  const billingTableId = client.getTableId('monthlyBills');
-  const lessonsTableId = client.getTableId('lessons');
-  
-  // Validate required Lessons fields exist
-  const sampleLessons = await client.getRecords(lessonsTableId, { maxRecords: 1 });
-  if (sampleLessons.length > 0) {
-    const lessonFields = Object.keys(sampleLessons[0].fields || {});
-    const requiredFields = ['billing_month', 'תלמידים'];
-    const missingFields: MissingFields[] = [];
-    
-    for (const fieldName of requiredFields) {
-      if (!lessonFields.includes(fieldName)) {
-        missingFields.push({
-          table: 'lessons',
-          field: fieldName,
-          why_needed: `Required for monthly charge creation: ${fieldName === 'billing_month' ? 'to filter lessons by month' : 'to link lessons to students'}`,
-          example_values: fieldName === 'billing_month' ? ['2024-03', '2024-04'] : ['rec123', '["rec123"]'],
-        });
-      }
-    }
-    
-    // Check for billable fields (at least one must exist)
-    const hasBillable = lessonFields.includes('billable');
-    const hasIsBillable = lessonFields.includes('is_billable');
-    if (!hasBillable && !hasIsBillable) {
-      missingFields.push({
-        table: 'lessons',
-        field: 'billable OR is_billable',
-        why_needed: 'Required to determine if lesson is billable (at least one field must exist)',
-        example_values: ['true', 'false', '1', '0'],
-      });
-    }
-    
-    // Check for amount fields (at least one should exist for meaningful charges)
-    const hasLineAmount = lessonFields.includes('line_amount');
-    const hasUnitPrice = lessonFields.includes('unit_price');
-    if (!hasLineAmount && !hasUnitPrice) {
-      // Warn but don't fail - we'll just use 0
-      console.warn(
-        `WARNING: Neither line_amount nor unit_price found in lessons table. ` +
-        `Charges will be created with 0 amount. Available fields: ${lessonFields.join(', ')}`
-      );
-    }
-    
-    if (missingFields.length > 0) {
-      throw {
-        MISSING_FIELDS: missingFields,
-      };
-    }
-  }
-  
-  // Step 1: Fetch lessons where billing_month == selectedMonth
-  const lessonsFilter = `{billing_month} = "${billingMonth}"`;
-  const allLessons = await client.getRecords(lessonsTableId, {
-    filterByFormula: lessonsFilter,
-    maxRecords: 10000, // Large limit to get all lessons
-  });
-  
-  // Step 2: Filter to only billable lessons
-  const billableLessons = allLessons.filter(lesson => {
-    const fields = lesson.fields as any;
-    return isBillable(fields);
-  });
-  
-  // Step 3: Group by studentRecordId = first(fields["תלמידים"])
-  // Step 4: Compute studentTotal = sum(line_amount) (fallback to unit_price)
-  const studentTotals = new Map<string, number>();
-  
-  for (const lesson of billableLessons) {
-    const fields = lesson.fields as any;
-    const studentRecordId = firstStudentId(fields['תלמידים']);
-    
-    if (!studentRecordId) {
-      // Skip lessons without student
-      console.warn(`Lesson ${lesson.id} has no student in תלמידים field`);
-      continue;
-    }
-    
-    const amount = extractAmount(fields);
-    const currentTotal = studentTotals.get(studentRecordId) || 0;
-    studentTotals.set(studentRecordId, currentTotal + amount);
-  }
-  
-  // Step 5: For each student, upsert into "חיובים"
-  let createdCount = 0;
-  let skippedCount = 0;
-  const errors: Array<{ studentId: string; error: string }> = [];
-  
-  for (const [studentRecordId, studentTotal] of studentTotals.entries()) {
-    try {
-      // Check if charge record already exists
-      const filterFormula = `AND(
-        {${schema.studentField}} = "${studentRecordId}",
-        {${schema.billingMonthField}} = "${billingMonth}"
-      )`;
-      
-      const existingCharges = await client.getRecords(billingTableId, {
-        filterByFormula: filterFormula,
-        maxRecords: 1,
-      });
-      
-      if (existingCharges.length > 0) {
-        // Record exists - never overwrite flags
-        skippedCount++;
-        continue;
-      }
-      
-      // Create new charge record
-      const newChargeFields: any = {
-        [schema.studentField]: schema.studentFieldIsArray ? [studentRecordId] : studentRecordId,
-        [schema.billingMonthField]: billingMonth,
-        [schema.approvedField]: false,
-        [schema.paidField]: false,
-      };
-      
-      await client.createRecord(billingTableId, newChargeFields);
-      createdCount++;
-      
-    } catch (error: any) {
-      errors.push({
-        studentId: studentRecordId,
-        error: error.message || String(error),
-      });
-      console.error(`Failed to process student ${studentRecordId}:`, error);
-    }
-  }
-  
-  return {
-    createdCount,
-    skippedCount,
-    billingMonth,
-    errors: errors.length > 0 ? errors : undefined,
-  };
 }
 
 /**
@@ -1211,7 +1130,7 @@ export async function createMonthlyCharges(
  * Do NOT compute charges from lessons - use lookup fields from charges table
  */
 
-export type ChargesReportStatusFilter = 'all' | 'draft' | 'sent' | 'paid';
+export type ChargesReportStatusFilter = 'all' | 'draft' | 'sent' | 'paid' | 'link_sent';
 
 export interface ChargesReportInput {
   billingMonth: string; // YYYY-MM format
@@ -1226,11 +1145,17 @@ export interface ChargeReportRow {
   studentRecordId: string;
   displayName: string; // Student/parent name from lookup
   lessonsCount?: number; // From lookup field if exists
+  lessonsAmount?: number;
   subscriptionsCount?: number; // From lookup field if exists
   subscriptionsAmount?: number; // From lookup field if exists
+  cancellationsAmount?: number;
   totalAmount?: number; // From lookup field: "כולל מע\"מ ומנויים (from תלמיד)" or equivalent
+  manualAdjustmentAmount?: number; // From charges table: manual_adjustment_amount
+  manualAdjustmentReason?: string; // From charges table: manual_adjustment_reason
+  manualAdjustmentDate?: string; // From charges table: manual_adjustment_date
   flags: {
     approved: boolean; // מאושר לחיוב
+    linkSent: boolean; // נשלח קישור
     paid: boolean; // שולם
   };
   derivedStatus: 'טיוטה' | 'נשלח' | 'שולם';
@@ -1250,6 +1175,7 @@ export interface ChargesReportResult {
 interface ChargesLookupFields {
   displayNameField?: string; // e.g., "שם מלא (from תלמיד)" or "full_name (from תלמיד)"
   lessonsCountField?: string; // Lookup field for lessons count
+  lessonsAmountField?: string; // Lookup field for lessons amount
   subscriptionsCountField?: string; // Lookup field for subscriptions count
   subscriptionsAmountField?: string; // Lookup field for subscriptions amount
   totalAmountField?: string; // e.g., "כולל מע\"מ ומנויים (from תלמיד)"
@@ -1259,67 +1185,38 @@ function discoverLookupFields(sampleRecord: any): ChargesLookupFields {
   const fields = Object.keys(sampleRecord.fields || {});
   const result: ChargesLookupFields = {};
   
-  // Look for display name field (student/parent name)
-  // Based on actual schema: "full_name" is the link field, but lookup fields may have "(from תלמיד)" suffix
-  // Common patterns: "שם מלא (from תלמיד)", "full_name (from תלמיד)", "Student_Name", etc.
-  result.displayNameField = fields.find(f => {
-    const lower = f.toLowerCase();
-    return (
-      f === 'full_name' || // Direct link field
-      f.includes('שם') && (f.includes('from') || f.includes('תלמיד')) ||
-      (lower.includes('full_name') && (lower.includes('from') || lower.includes('student'))) ||
-      lower.includes('student_name') ||
-      lower.includes('display_name') ||
-      f === 'שם מלא (from תלמיד)' ||
-      f === 'full_name (from תלמיד)'
-    );
-  });
-  
-  // Look for lessons count field
-  // Based on actual schema: "Total Lessons Attended This Month (from תלמיד)"
-  result.lessonsCountField = fields.find(f => {
-    const lower = f.toLowerCase();
-    return (
-      f === 'Total Lessons Attended This Month (from תלמיד)' ||
-      (lower.includes('lesson') && lower.includes('count')) ||
-      (lower.includes('lesson') && lower.includes('attended') && lower.includes('month')) ||
-      (lower.includes('שיעורים') && lower.includes('מספר'))
-    );
-  });
-  
-  // Look for subscriptions count field
-  result.subscriptionsCountField = fields.find(f => {
-    const lower = f.toLowerCase();
-    return (
-      lower.includes('subscription') && lower.includes('count') ||
-      lower.includes('מנויים') && lower.includes('מספר')
-    );
-  });
-  
-  // Look for subscriptions amount field
-  // Based on actual schema: "Subscription Monthly Amount (from תלמיד)"
-  result.subscriptionsAmountField = fields.find(f => {
-    const lower = f.toLowerCase();
-    return (
-      f === 'Subscription Monthly Amount (from תלמיד)' ||
-      (lower.includes('subscription') && lower.includes('monthly') && lower.includes('amount')) ||
-      (lower.includes('subscription') && (lower.includes('amount') || lower.includes('total'))) ||
-      (lower.includes('מנויים') && (lower.includes('סכום') || lower.includes('סה"כ')))
-    );
-  });
-  
-  // Look for total amount field
-  // Based on actual schema: "כולל מע"מ ומנויים (from תלמיד)"
-  result.totalAmountField = fields.find(f => {
-    const lower = f.toLowerCase();
-    return (
-      f === 'כולל מע"מ ומנויים (from תלמיד)' ||
-      (f.includes('כולל מע"מ ומנויים') && (f.includes('from') || f.includes('תלמיד'))) ||
-      (lower.includes('total') && (lower.includes('vat') || lower.includes('including'))) ||
-      (lower.includes('סה"כ') && (lower.includes('מע"מ') || lower.includes('מנויים')))
-    );
-  });
-  
+  // 1. Display Name
+  const preferredNameFields = ['שם מלא (from תלמיד)', 'full_name (from תלמיד)', 'Student_Name', 'תלמיד', 'full_name'];
+  result.displayNameField = fields.find(f => preferredNameFields.includes(f)) || 
+                           fields.find(f => f.toLowerCase().includes('name'));
+
+  // 2. Lessons Count
+  result.lessonsCountField = fields.find(f => f.includes('Total Lessons Attended') || f.includes('מספר שיעורים'));
+
+  // 3. Subscriptions Amount - EXACT FIELD from User
+  result.subscriptionsAmountField = fields.find(f => 
+    f === 'Subscription Monthly Amount (from full_name)' ||
+    f === 'Subscription Monthly Amount (from תלמיד)' ||
+    f === 'Subscription Monthly Amount'
+  );
+
+  // 4. Total Amount (The bottom line)
+  result.totalAmountField = fields.find(f => 
+    f === 'כולל מע״מ ומנויים' || 
+    f === 'כולל מע"מ ומנויים' || 
+    f === 'כולל מע״מ ומנויים (from תלמיד)' || 
+    f === 'כולל מע"מ ומנויים (from תלמיד)' ||
+    f === 'כולל מע״מ ומנויים (from full_name)' ||
+    f === 'כולל מע"מ ומנויים (from full_name)'
+  );
+
+  // 5. Lessons Amount (If exists as a separate field)
+  result.lessonsAmountField = fields.find(f => 
+    f === 'lessons_total' || 
+    f === 'סכום שיעורים' || 
+    f === 'שיעורים (סכום)'
+  );
+
   return result;
 }
 
@@ -1414,6 +1311,7 @@ function extractDisplayName(chargeRecord: any, lookupFields: ChargesLookupFields
 
 /**
  * Extract numeric value from lookup field
+ * Handles arrays (sums them), numbers, and strings
  */
 function extractNumericValue(chargeRecord: any, fieldName: string | undefined): number | undefined {
   if (!fieldName) {
@@ -1425,17 +1323,23 @@ function extractNumericValue(chargeRecord: any, fieldName: string | undefined): 
     return undefined;
   }
   
-  // Handle array (lookup fields can return arrays)
-  if (Array.isArray(value) && value.length > 0) {
-    const first = value[0];
-    if (typeof first === 'number') {
-      return first;
-    } else if (typeof first === 'string') {
-      const num = parseFloat(first.replace(/[₪,\s]/g, ''));
-      return isNaN(num) ? undefined : num;
-    } else if (first && typeof first === 'object' && typeof first.value === 'number') {
-      return first.value;
-    }
+  // Handle array (lookup fields can return arrays of numbers or objects)
+  if (Array.isArray(value)) {
+    if (value.length === 0) return 0;
+    
+    // Sum all numeric values in the array
+    return value.reduce((sum: number, val: any) => {
+      if (typeof val === 'number') return sum + val;
+      if (typeof val === 'string') {
+        const num = parseFloat(val.replace(/[₪,\s]/g, ''));
+        return sum + (isNaN(num) ? 0 : num);
+      }
+      // Handle object with value property (common in some Airtable lookups)
+      if (val && typeof val === 'object' && typeof val.value === 'number') {
+        return sum + val.value;
+      }
+      return sum;
+    }, 0);
   }
   
   // Handle direct number
@@ -1447,6 +1351,11 @@ function extractNumericValue(chargeRecord: any, fieldName: string | undefined): 
   if (typeof value === 'string') {
     const num = parseFloat(value.replace(/[₪,\s]/g, ''));
     return isNaN(num) ? undefined : num;
+  }
+
+  // Handle object with value property
+  if (value && typeof value === 'object' && typeof (value as any).value === 'number') {
+    return (value as any).value;
   }
   
   return undefined;
@@ -1471,41 +1380,45 @@ function deriveStatus(approved: boolean, paid: boolean): 'טיוטה' | 'נשל�
 function buildFilterFormula(
   billingMonth: string,
   statusFilter: ChargesReportStatusFilter,
+  schema: ChargeTableSchema,
   searchQuery?: string,
-  studentFieldName?: string,
   displayNameField?: string
 ): string {
   const filters: string[] = [];
   
+  const { billingMonthField, approvedField, linkSentField, paidField } = schema;
+  
   // Always filter by billing month
   // Note: If billingMonth is empty or "all", don't filter by month
-  // The field might be a date field (2026-01-01) or text field (2026-01)
-  // For date fields, use YEAR() and MONTH() functions
-  // For text fields, use exact match or FIND()
   if (billingMonth && billingMonth !== 'all') {
     const [year, month] = billingMonth.split('-');
     const yearNum = parseInt(year);
     const monthNum = parseInt(month);
     
-    // Try multiple approaches to handle both date and text fields:
-    // 1. For date fields: check YEAR and MONTH separately
-    // 2. For text fields: exact match or starts with
-    filters.push(
-      `OR(` +
-      `AND(YEAR({חודש חיוב}) = ${yearNum}, MONTH({חודש חיוב}) = ${monthNum}),` +
-      `{חודש חיוב} = "${billingMonth}",` +
-      `FIND("${billingMonth}", {חודש חיוב}) = 1` +
-      `)`
-    );
+    // Try Date field filter first (most likely scenario)
+    // Use YEAR and MONTH functions for Date fields
+    const dateFilter = `AND(YEAR({${billingMonthField}}) = ${yearNum}, MONTH({${billingMonthField}}) = ${monthNum})`;
+    
+    // Fallback to text match for Text fields
+    const textFilter = `{${billingMonthField}} = "${billingMonth}"`;
+    
+    // Combine with OR to handle both cases
+    filters.push(`OR(${dateFilter}, ${textFilter})`);
   }
   
-  // Apply status filter
+  // Apply status filter based on boolean fields
   if (statusFilter === 'draft') {
-    filters.push(`{מאושר לחיוב} = FALSE()`);
-  } else if (statusFilter === 'sent') {
-    filters.push(`AND({מאושר לחיוב} = TRUE(), {שולם} = FALSE())`);
+    // Draft = not approved
+    filters.push(`{${approvedField}} = FALSE()`);
+  } else if (statusFilter === 'link_sent') {
+    // Link sent = linkSent checkbox is true
+    filters.push(`{${linkSentField}} = TRUE()`);
   } else if (statusFilter === 'paid') {
-    filters.push(`{שולם} = TRUE()`);
+    // Paid = paid checkbox is true
+    filters.push(`{${paidField}} = TRUE()`);
+  } else if (statusFilter === 'sent') {
+    // Sent = approved but not paid (general sent status)
+    filters.push(`AND({${approvedField}} = TRUE(), {${paidField}} = FALSE())`);
   }
   // 'all' doesn't add status filter
   
@@ -1521,7 +1434,7 @@ function buildFilterFormula(
     } else {
       // Fallback: try common field names including direct link field
       const searchFields = [
-        'full_name', // Direct link field
+        schema.studentField, // Direct link field
         'שם מלא (from תלמיד)',
         'full_name (from תלמיד)',
         'Student_Name',
@@ -1539,6 +1452,83 @@ function buildFilterFormula(
   }
   
   return filters.length > 1 ? `AND(${filters.join(', ')})` : filters[0];
+}
+
+/**
+ * Filter records in memory as fallback when Airtable filter fails
+ */
+function filterRecordsInMemory(
+  records: any[],
+  input: ChargesReportInput,
+  schema: ChargeTableSchema,
+  lookupFields: ChargesLookupFields
+): any[] {
+  return records.filter(rec => {
+    const fields = rec.fields as any;
+    
+    // Filter by billing month
+    if (input.billingMonth && input.billingMonth !== 'all') {
+      const val = fields[schema.billingMonthField];
+      if (!val) return false;
+      
+      const [year, month] = input.billingMonth.split('-').map(Number);
+      const yearNum = parseInt(year.toString());
+      const monthNum = parseInt(month.toString());
+      
+      // Try date match first
+      try {
+        const date = new Date(val);
+        if (!isNaN(date.getTime())) {
+          if (date.getFullYear() !== yearNum || date.getMonth() + 1 !== monthNum) {
+            return false;
+          }
+        } else {
+          // Not a date, try string match
+          const valStr = String(val);
+          if (!valStr.includes(input.billingMonth)) {
+            return false;
+          }
+        }
+      } catch (e) {
+        // Not a date, try string match
+        const valStr = String(val);
+        if (!valStr.includes(input.billingMonth)) {
+          return false;
+        }
+      }
+    }
+    
+    // Filter by status
+    const statusFilter = input.statusFilter || 'all';
+    if (statusFilter !== 'all') {
+      const approved = fields[schema.approvedField] === true || fields[schema.approvedField] === 1;
+      const linkSent = fields[schema.linkSentField] === true || fields[schema.linkSentField] === 1;
+      const paid = fields[schema.paidField] === true || fields[schema.paidField] === 1;
+      
+      if (statusFilter === 'draft') {
+        if (approved) return false;
+      } else if (statusFilter === 'link_sent') {
+        if (!linkSent) return false;
+      } else if (statusFilter === 'paid') {
+        if (!paid) return false;
+      } else if (statusFilter === 'sent') {
+        if (!approved || paid) return false;
+      }
+    }
+    
+    // Filter by search query
+    if (input.searchQuery && input.searchQuery.trim()) {
+      const searchTerm = input.searchQuery.toLowerCase();
+      const displayName = extractDisplayName(rec, lookupFields);
+      const nameStr = String(displayName || '').toLowerCase();
+      
+      if (!nameStr.includes(searchTerm)) {
+        return false;
+      }
+    }
+    
+    return true;
+  });
 }
 
 /**
@@ -1575,149 +1565,109 @@ export async function getChargesReport(
     
     // Discover schema
     const schemaResult = await discoverChargeTableSchema(client);
+    let schema: ChargeTableSchema;
     if (Array.isArray(schemaResult)) {
-      throw {
-        MISSING_FIELDS: schemaResult,
+      if (import.meta.env.DEV) {
+        console.warn('[getChargesReport] Schema discovery returned missing fields, but continuing with fallbacks:', schemaResult);
+      }
+      // Use fallback schema instead of throwing
+      schema = {
+        studentField: AIRTABLE_CONFIG.fields.billingStudent || 'full_name',
+        studentFieldIsArray: true,
+        billingMonthField: AIRTABLE_CONFIG.fields.billingMonth || 'חודש חיוב',
+        approvedField: AIRTABLE_CONFIG.fields.billingApproved || 'מאושר לחיוב',
+        linkSentField: AIRTABLE_CONFIG.fields.billingLinkSent || 'נשלח קישור',
+        paidField: AIRTABLE_CONFIG.fields.billingPaid || 'שולם',
       };
+    } else {
+      // Schema discovery succeeded
+      schema = schemaResult;
     }
-    const schema = schemaResult;
-    
-    // Discover lookup fields
     const lookupFields = discoverLookupFields(sampleRecords[0]);
     
-    // Log sample record for debugging
-    if (import.meta.env.DEV) {
-      console.log('[getChargesReport] Sample record fields:', Object.keys(sampleRecords[0].fields));
-      console.log('[getChargesReport] Sample record data:', {
-        id: sampleRecords[0].id,
-        fields: sampleRecords[0].fields,
-        billingMonthField: schema.billingMonthField,
-        billingMonthValue: (sampleRecords[0].fields as any)[schema.billingMonthField],
-      });
-    }
-    
-    // First, get ALL records (without month filter) to see what we have
-    const allRecordsBeforeFilter = await client.getRecords(billingTableId, { maxRecords: 100 });
-    if (import.meta.env.DEV) {
-      console.log('[getChargesReport] Total records in table (before filter):', allRecordsBeforeFilter.length);
-      allRecordsBeforeFilter.forEach((record, idx) => {
-        const fields = record.fields as any;
-        console.log(`[getChargesReport] Record ${idx + 1}:`, {
-          id: record.id,
-          billingMonth: fields[schema.billingMonthField],
-          studentName: fields[schema.studentField] || fields['full_name'],
-          allFields: Object.keys(fields),
-        });
-      });
-    }
-    
-    // Build filter formula
+    // Build complete filter using buildFilterFormula (includes month, status, and search)
     const filterFormula = buildFilterFormula(
-      input.billingMonth,
-      input.statusFilter,
+      input.billingMonth || '',
+      input.statusFilter || 'all',
+      schema,
       input.searchQuery,
-      schema.studentField,
       lookupFields.displayNameField
     );
     
-    if (import.meta.env.DEV) {
-      console.log('[getChargesReport] Filter formula:', filterFormula);
-      console.log('[getChargesReport] Looking for billingMonth:', input.billingMonth);
-    }
+    // Fetch records with the complete filter
+    let chargeRecords: any[] = [];
     
-    // Query charges with paging support
-    // We'll use getRecords but need to handle offset manually
-    // For now, fetch with maxRecords to get all matching records
-    // In production, you might want to add a method to AirtableClient that returns offset
-    const queryOptions: any = {
-      maxRecords: input.pageSize ? input.pageSize * 2 : undefined, // Fetch more to handle paging
-      pageSize: input.pageSize || 100,
-    };
-    
-    // Only add filterByFormula if we have a filter
     if (filterFormula) {
-      queryOptions.filterByFormula = filterFormula;
-    }
-    
-    let chargeRecords = await client.getRecords(billingTableId, queryOptions);
-    
-    if (import.meta.env.DEV) {
-      console.log('[getChargesReport] Records found after filter:', chargeRecords.length);
-      
-      // If no records found with filter, try without month filter to see what we have
-      if (chargeRecords.length === 0 && input.billingMonth) {
-        console.warn('[getChargesReport] No records found with month filter. Checking all records...');
-        const allRecords = await client.getRecords(billingTableId, { maxRecords: 100 });
-        console.log('[getChargesReport] All records in table:', allRecords.length);
-        allRecords.forEach((record, idx) => {
-          const fields = record.fields as any;
-          const monthValue = fields[schema.billingMonthField];
-          console.log(`[getChargesReport] Record ${idx + 1} (ID: ${record.id}):`, {
-            billingMonthField: schema.billingMonthField,
-            billingMonthValue: monthValue,
-            billingMonthValueType: typeof monthValue,
-            studentName: fields[schema.studentField] || fields['full_name'],
-            requestedMonth: input.billingMonth,
-            matches: monthValue === input.billingMonth,
-          });
+      try {
+        chargeRecords = await client.getRecords(billingTableId, {
+          filterByFormula: filterFormula,
+          maxRecords: 100,
         });
+        
+        if (import.meta.env.DEV) {
+          console.log(`[getChargesReport] Filter formula: ${filterFormula}`);
+          console.log(`[getChargesReport] Found ${chargeRecords.length} records with filter`);
+        }
+      } catch (e) {
+        if (import.meta.env.DEV) {
+          console.warn('[getChargesReport] Filter failed, trying fallback:', e);
+        }
+        // Fallback: fetch all and filter in memory
+        try {
+          const allRecords = await client.getRecords(billingTableId, { maxRecords: 100 });
+          chargeRecords = filterRecordsInMemory(allRecords, input, schema, lookupFields);
+          
+          if (import.meta.env.DEV) {
+            console.log(`[getChargesReport] Filtered ${chargeRecords.length} records from ${allRecords.length} total in memory (fallback)`);
+          }
+        } catch (fallbackError) {
+          console.error('[getChargesReport] Failed to fetch all records for fallback:', fallbackError);
+          chargeRecords = [];
+        }
       }
+    } else {
+      // No filter - get all records
+      chargeRecords = await client.getRecords(billingTableId, { maxRecords: 100 });
     }
-    
-    // For proper paging, we'd need to make a direct API call to get the offset
-    // For now, we'll return all records and indicate if there might be more
-    // TODO: Add a method to AirtableClient that returns { records, offset } for proper paging
-    const nextOffset = undefined; // Would need API call to get this
-    
-    // Map to report rows
+
     const rows: ChargeReportRow[] = chargeRecords.map(record => {
-    const fields = record.fields as any;
-    
-    // Extract student record ID
-    const studentRecordId = extractStudentRecordId(record, schema.studentField) || '';
-    
-    // Extract display name
-    const displayName = extractDisplayName(record, lookupFields);
-    
-    // Extract numeric values
-    const lessonsCount = extractNumericValue(record, lookupFields.lessonsCountField);
-    const subscriptionsCount = extractNumericValue(record, lookupFields.subscriptionsCountField);
-    const subscriptionsAmount = extractNumericValue(record, lookupFields.subscriptionsAmountField);
-    const totalAmount = extractNumericValue(record, lookupFields.totalAmountField);
-    
-    // Extract flags
-    const approved = fields[schema.approvedField] === true || fields[schema.approvedField] === 1;
-    const paid = fields[schema.paidField] === true || fields[schema.paidField] === 1;
-    
-    // Derive status
-    const derivedStatus = deriveStatus(approved, paid);
-    
-    return {
-      chargeRecordId: record.id,
-      studentRecordId,
-      displayName,
-      lessonsCount,
-      subscriptionsCount,
-      subscriptionsAmount,
-      totalAmount,
-      flags: {
-        approved,
-        paid,
-      },
-      derivedStatus,
-    };
-  });
-  
-    // Determine if there are more records
-    // Since we can't get offset from getRecords, we check if we got exactly pageSize records
-    const pageSize = input.pageSize || 100;
-    const hasMore = chargeRecords.length === pageSize;
-    
+      const fields = record.fields as any;
+      const studentRecordId = extractStudentRecordId(record, schema.studentField) || '';
+      const displayName = extractDisplayName(record, lookupFields);
+      
+      const lessonsCount = fields.lessons_count || extractNumericValue(record, lookupFields.lessonsCountField);
+      const subscriptionsCount = extractNumericValue(record, lookupFields.subscriptionsCountField);
+      const subscriptionsAmount = fields.subscriptions_amount || extractNumericValue(record, lookupFields.subscriptionsAmountField);
+      const totalAmount = fields.total_amount || extractNumericValue(record, lookupFields.totalAmountField);
+      const lessonsAmount = fields.lessons_amount || extractNumericValue(record, lookupFields.lessonsAmountField);
+      const cancellationsAmount = fields.cancellations_amount;
+      
+      const approved = fields[schema.approvedField] === true || fields[schema.approvedField] === 1;
+      const linkSent = fields[schema.linkSentField] === true || fields[schema.linkSentField] === 1;
+      const paid = fields[schema.paidField] === true || fields[schema.paidField] === 1;
+      
+      return {
+        chargeRecordId: record.id,
+        studentRecordId,
+        displayName,
+        lessonsCount,
+        lessonsAmount,
+        subscriptionsCount,
+        subscriptionsAmount,
+        cancellationsAmount,
+        totalAmount,
+        manualAdjustmentAmount: extractNumericValue(record, 'manual_adjustment_amount'),
+        manualAdjustmentReason: fields.manual_adjustment_reason,
+        manualAdjustmentDate: fields.manual_adjustment_date,
+        flags: { approved, linkSent, paid },
+        derivedStatus: deriveStatus(approved, paid),
+      };
+    });
+
     return {
       rows,
-      totalCount: rows.length, // Note: This is the count for this page, not total
-      hasMore,
-      offset: nextOffset, // Would be set if we had proper paging support
+      totalCount: rows.length,
+      hasMore: false,
     };
   } catch (error: any) {
     // Handle 403 errors (permission/table not found) with detailed diagnostics
@@ -1765,7 +1715,16 @@ export interface ChargesReportKPIs {
   billingMonth: string;
   totalToBill: number;
   paidTotal: number;
-  pendingTotal: number;
+  pendingTotal: number;        // Total unpaid (draft + approved unpaid)
+  draftTotal: number;          // Not yet approved
+  approvedUnpaidTotal: number; // Approved but not yet paid
+  // New KPIs
+  collectionRate: number;      // (paidTotal / totalToBill) * 100
+  pendingLinkCount: number;    // Number of approved bills where linkSent is false
+  avgBillPerStudent: number;   // totalToBill / studentCount
+  totalLessonsAmount: number;  // Sum of lessonsAmount lookup
+  totalSubscriptionsAmount: number; // Sum of subscriptionsAmount lookup
+  studentCount: number;        // Unique students with bills
 }
 
 /**
@@ -1782,8 +1741,8 @@ export async function getChargesReportKPIs(
   
   const billingTableId = client.getTableId('monthlyBills');
   
-  // Get a sample record to discover field names
-  const sampleRecords = await client.getRecords(billingTableId, { maxRecords: 1 });
+  // Get multiple records to ensure we find checkbox fields even if some are false
+  const sampleRecords = await client.getRecords(billingTableId, { maxRecords: 10 });
   
   if (sampleRecords.length === 0) {
     // No records - return zeros
@@ -1792,6 +1751,14 @@ export async function getChargesReportKPIs(
       totalToBill: 0,
       paidTotal: 0,
       pendingTotal: 0,
+      draftTotal: 0,
+      approvedUnpaidTotal: 0,
+      collectionRate: 0,
+      pendingLinkCount: 0,
+      avgBillPerStudent: 0,
+      totalLessonsAmount: 0,
+      totalSubscriptionsAmount: 0,
+      studentCount: 0,
     };
   }
   
@@ -1867,54 +1834,217 @@ export async function getChargesReportKPIs(
   }
   
   // Query all charge records for this billing month
-  const filterFormula = `{חודש חיוב} = "${billingMonth}"`;
+  // Use schema.billingMonthField for accurate filtering
+  // Handle both Date and Text field types
+  const [year, month] = billingMonth.split('-').map(Number);
+  const yearNum = parseInt(year.toString());
+  const monthNum = parseInt(month.toString());
+  const monthStartDate = `${billingMonth}-01`;
+  // Get last day of month: new Date(year, month, 0) gives last day of (month-1), so use month
+  const lastDayOfMonth = new Date(yearNum, monthNum, 0).getDate();
+  const monthEndDate = `${billingMonth}-${String(lastDayOfMonth).padStart(2, '0')}`;
   
-  // Fetch all records (no limit for accurate totals)
-  const chargeRecords = await client.getRecords(billingTableId, {
-    filterByFormula: filterFormula,
-    maxRecords: 10000, // Large limit to get all records
-  });
+  // Try multiple filter strategies - try Date first (most likely), then Text
+  let chargeRecords: any[] = [];
+  
+  // Strategy 1: Try Date field filters first (since field is likely Date type)
+  try {
+    const dateFilter = `AND(YEAR({${schema.billingMonthField}}) = ${yearNum}, MONTH({${schema.billingMonthField}}) = ${monthNum})`;
+    chargeRecords = await client.getRecords(billingTableId, {
+      filterByFormula: dateFilter,
+      maxRecords: 10000,
+    });
+    
+    if (import.meta.env.DEV && chargeRecords.length > 0) {
+      console.log(`[getChargesReportKPIs] Found ${chargeRecords.length} records with date filter (YEAR/MONTH)`);
+    }
+  } catch (e) {
+    if (import.meta.env.DEV) {
+      console.warn('[getChargesReportKPIs] Date YEAR/MONTH filter failed:', e);
+    }
+  }
+  
+  // Strategy 2: If no records, try date range filter
+  if (chargeRecords.length === 0) {
+    try {
+      const rangeFilter = `AND(IS_AFTER({${schema.billingMonthField}}, "${monthStartDate}"), IS_BEFORE({${schema.billingMonthField}}, "${monthEndDate}T23:59:59"))`;
+      chargeRecords = await client.getRecords(billingTableId, {
+        filterByFormula: rangeFilter,
+        maxRecords: 10000,
+      });
+      
+      if (import.meta.env.DEV && chargeRecords.length > 0) {
+        console.log(`[getChargesReportKPIs] Found ${chargeRecords.length} records with date range filter`);
+      }
+    } catch (e) {
+      if (import.meta.env.DEV) {
+        console.warn('[getChargesReportKPIs] Date range filter failed:', e);
+      }
+    }
+  }
+  
+  // Strategy 3: If still no records, try simple text match (for Text fields)
+  if (chargeRecords.length === 0) {
+    try {
+      const simpleFilter = `{${schema.billingMonthField}} = "${billingMonth}"`;
+      chargeRecords = await client.getRecords(billingTableId, {
+        filterByFormula: simpleFilter,
+        maxRecords: 10000,
+      });
+      
+      if (import.meta.env.DEV && chargeRecords.length > 0) {
+        console.log(`[getChargesReportKPIs] Found ${chargeRecords.length} records with text filter`);
+      }
+    } catch (e) {
+      if (import.meta.env.DEV) {
+        console.warn('[getChargesReportKPIs] Text filter failed:', e);
+      }
+    }
+  }
+  
+  // Strategy 4: Last resort - fetch ALL and filter in memory
+  if (chargeRecords.length === 0) {
+    if (import.meta.env.DEV) {
+      console.warn('[getChargesReportKPIs] All filters returned 0 records, fetching all and filtering in memory');
+    }
+    try {
+      const allRecords = await client.getRecords(billingTableId, { maxRecords: 10000 });
+      chargeRecords = allRecords.filter(rec => {
+        const val = rec.fields[schema.billingMonthField];
+        if (!val) return false;
+        
+        // Try to match as date first
+        try {
+          const date = new Date(val);
+          if (!isNaN(date.getTime())) {
+            const recordYear = date.getFullYear();
+            const recordMonth = date.getMonth() + 1;
+            if (recordYear === yearNum && recordMonth === monthNum) {
+              return true;
+            }
+          }
+        } catch (e) {
+          // Not a date, try string match
+        }
+        
+        // Try to match as string
+        const valStr = String(val);
+        if (valStr.includes(billingMonth)) return true;
+        
+        return false;
+      });
+      
+      if (import.meta.env.DEV) {
+        console.log(`[getChargesReportKPIs] Filtered ${chargeRecords.length} records from ${allRecords.length} total records in memory`);
+      }
+    } catch (e) {
+      console.error('[getChargesReportKPIs] Failed to fetch all records:', e);
+      chargeRecords = [];
+    }
+  }
+  
+  if (import.meta.env.DEV) {
+    console.log(`[getChargesReportKPIs] Final result: ${chargeRecords.length} records for month ${billingMonth}`);
+    if (chargeRecords.length > 0) {
+      console.log(`[getChargesReportKPIs] Sample record billing month value:`, chargeRecords[0].fields[schema.billingMonthField]);
+    }
+  }
   
   // Calculate totals
   let totalToBill = 0;
   let paidTotal = 0;
   let pendingTotal = 0;
+  let draftTotal = 0;
+  let approvedUnpaidTotal = 0;
+  let pendingLinkCount = 0;
+  let totalLessonsAmount = 0;
+  let totalSubscriptionsAmount = 0;
+  const studentIds = new Set<string>();
   
   const totalAmountFieldName = lookupFields.totalAmountField!;
+  const lessonsAmountFieldName = lookupFields.lessonsAmountField;
+  const subscriptionsAmountFieldName = lookupFields.subscriptionsAmountField;
   
   for (const record of chargeRecords) {
     const fields = record.fields as any;
     
-    // Extract totalAmount value
-    const totalAmount = extractNumericValue(record, totalAmountFieldName);
-    
-    // Validate that totalAmount is numeric
-    if (totalAmount === undefined || totalAmount === null || isNaN(totalAmount)) {
-      const fieldValue = fields[totalAmountFieldName];
-      throw new Error(
-        `NON_NUMERIC_TOTAL_AMOUNT: Field "${totalAmountFieldName}" contains non-numeric value ` +
-        `for charge record ${record.id}. Value: ${JSON.stringify(fieldValue)}. ` +
-        `Expected a numeric value (number or parseable string).`
-      );
+    // Track unique students
+    const studentId = extractStudentRecordId(record, schema.studentField);
+    if (studentId) {
+      studentIds.add(studentId);
     }
     
-    // Add to total
-    totalToBill += totalAmount;
+    // Extract totalAmount value
+    let totalAmount = extractNumericValue(record, totalAmountFieldName) || 0;
     
-    // Check paid flag
+    // Extract breakdown amounts
+    const subscriptionsAmount = extractNumericValue(record, subscriptionsAmountFieldName) || 0;
+    let lessonsAmount = extractNumericValue(record, lessonsAmountFieldName) || 0;
+    const adjustmentAmount = extractNumericValue(record, 'manual_adjustment_amount') || 0;
+    
+    // CALCULATION LOGIC:
+    // 1. If we have a total but no explicit lessons amount field, lessons = total - subs
+    if (totalAmount > 0 && lessonsAmount === 0) {
+      lessonsAmount = Math.max(0, totalAmount - subscriptionsAmount);
+    }
+    
+    // 2. If the total field itself is missing but we have parts, calculate it
+    if (totalAmount === 0 && (lessonsAmount > 0 || subscriptionsAmount > 0)) {
+      totalAmount = lessonsAmount + subscriptionsAmount + adjustmentAmount;
+    }
+
+    // 3. SMART RECOVERY (Same as nexusApi):
+    // If totalAmount + adjustmentAmount == subscriptionsAmount, then totalAmount is Subtotal.
+    if (totalAmount > 0 && Math.abs(totalAmount + adjustmentAmount - subscriptionsAmount) < 1) {
+       totalAmount = totalAmount + adjustmentAmount;
+    }
+    
+    totalToBill += totalAmount;
+    totalLessonsAmount += lessonsAmount;
+    totalSubscriptionsAmount += subscriptionsAmount;
+    
+    // Check flags
+    const approved = fields[schema.approvedField] === true || fields[schema.approvedField] === 1;
     const paid = fields[schema.paidField] === true || fields[schema.paidField] === 1;
+    const linkSent = fields[schema.linkSentField] === true || fields[schema.linkSentField] === 1;
     
     if (paid) {
       paidTotal += totalAmount;
     } else {
+      // SMART CALCULATION: pendingTotal is the real "debt"
       pendingTotal += totalAmount;
+      if (approved) {
+        approvedUnpaidTotal += totalAmount;
+        if (!linkSent) {
+          pendingLinkCount++;
+        }
+      } else {
+        draftTotal += totalAmount;
+      }
     }
   }
+  
+  // FINAL ADJUSTMENT: Ensure consistency between sum of parts and grand total
+  if (totalToBill === 0 && (totalLessonsAmount > 0 || totalSubscriptionsAmount > 0)) {
+    totalToBill = totalLessonsAmount + totalSubscriptionsAmount;
+  }
+  
+  const studentCount = studentIds.size;
+  const collectionRate = totalToBill > 0 ? (paidTotal / totalToBill) * 100 : 0;
+  const avgBillPerStudent = studentCount > 0 ? totalToBill / studentCount : 0;
   
   return {
     billingMonth,
     totalToBill,
     paidTotal,
     pendingTotal,
+    draftTotal,
+    approvedUnpaidTotal,
+    collectionRate,
+    pendingLinkCount,
+    avgBillPerStudent,
+    totalLessonsAmount,
+    totalSubscriptionsAmount,
+    studentCount,
   };
 }

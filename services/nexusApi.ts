@@ -2,8 +2,11 @@
 import { Lesson, Student, Teacher, Subscription, MonthlyBill, LessonStatus, SystemError, HomeworkLibraryItem, HomeworkAssignment, WeeklySlot, SlotInventory } from '../types';
 import { mockData } from './mockApi';
 import { AIRTABLE_CONFIG } from '../config/airtable';
-import { getChargesReport, createMonthlyCharges, CreateMonthlyChargesResult } from './billingService';
+import { getChargesReport, createMonthlyCharges, CreateMonthlyChargesResult, discoverChargeTableSchema, ChargeTableSchema, getChargesReportKPIs, ChargesReportKPIs } from './billingService';
 import { airtableClient } from './airtableClient';
+
+// Cache for table schema to avoid redundant discovery calls
+let cachedChargeSchema: ChargeTableSchema | null = null;
 import { getTableId, getField, isComputedField, filterComputedFields } from '../contracts/fieldMap';
 import { getWeeklySlots as getWeeklySlotsService, getSlotInventory as getSlotInventoryService, updateWeeklySlot as updateWeeklySlotService, updateSlotInventory as updateSlotInventoryService, createWeeklySlot as createWeeklySlotService, deleteWeeklySlot as deleteWeeklySlotService } from './slotManagementService';
 
@@ -54,11 +57,6 @@ async function airtableRequest<T>(endpoint: string, options: RequestInit = {}): 
       } catch {
         errorData = { error: errorText };
       }
-      // #region agent log
-      const logAirtableError = {location:'nexusApi.ts:49',message:'Airtable API error response',data:{status:response.status,statusText:response.statusText,errorText:errorText,errorData:errorData,endpoint:endpoint},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'};
-      console.error('[DEBUG] Airtable API error:', logAirtableError);
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(logAirtableError)}).catch(()=>{});
-      // #endregion
       console.error(`[Airtable] Error ${response.status}:`, errorData);
       throw {
         message: errorData.error?.message || `Airtable API error: ${response.statusText}`,
@@ -200,16 +198,9 @@ function mapAirtableToLesson(record: any): Lesson {
   
   if (startDatetime) {
     console.log(`[DEBUG] Parsing startDatetime: ${startDatetime}`);
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:117',message:'Parsing startDatetime from Airtable',data:{rawStartDatetime:startDatetime,rawEndDatetime:endDatetime,rawLessonDate:lessonDate,timezoneOffset:new Date().getTimezoneOffset(),localTimeString:new Date().toString(),isoString:new Date().toISOString()},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-    // #endregion
     const startDate = new Date(startDatetime);
     console.log(`[DEBUG] Parsed Date object:`, startDate);
     console.log(`[DEBUG] Date isValid:`, !isNaN(startDate.getTime()));
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:120',message:'Date object created from startDatetime',data:{startDateISO:startDate.toISOString(),startDateLocal:startDate.toString(),startDateTimeString:startDate.toTimeString(),startDateGetHours:startDate.getHours(),startDateGetUTCHours:startDate.getUTCHours(),timezoneOffset:startDate.getTimezoneOffset()},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-    // #endregion
-    
     // FIX: Airtable returns UTC datetimes (with Z), but we want to display local time
     // If the datetime string ends with Z (UTC), extract UTC hours/minutes and convert to local
     // If it doesn't have Z, treat it as local time already
@@ -230,18 +221,11 @@ function mapAirtableToLesson(record: any): Lesson {
     }
     
     console.log(`[DEBUG] Extracted date: ${date}, startTime: ${startTime}`);
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:123',message:'Extracted date and time for display',data:{extractedDate:date,extractedStartTime:startTime,originalStartDatetime:startDatetime,startDateGetHours:startDate.getHours(),startDateGetUTCHours:startDate.getUTCHours(),isUTC:isUTC},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-    // #endregion
-    
     if (endDatetime) {
       const endDate = new Date(endDatetime);
       duration = Math.round((endDate.getTime() - startDate.getTime()) / (1000 * 60)); // duration in minutes
       console.log(`[DEBUG] Calculated duration: ${duration} minutes`);
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:128',message:'Calculated duration from endDatetime',data:{rawEndDatetime:endDatetime,endDateISO:endDate.toISOString(),endDateLocal:endDate.toString(),durationMinutes:duration},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-      // #endregion
-    }
+      }
   } else if (lessonDate) {
     date = typeof lessonDate === 'string' ? lessonDate : lessonDate.split('T')[0];
     console.log(`[DEBUG] Using lessonDate fallback: ${date}`);
@@ -316,16 +300,32 @@ function mapAirtableToStudent(record: any): Student {
   const fields = record.fields || {};
   const fullNameField = getField('students', 'full_name');
   const phoneField = getField('students', 'phone_number');
+  const parentPhoneField = getField('students', 'parent_phone');
+  const parentNameField = getField('students', 'parent_name');
+  const gradeLevelField = getField('students', 'grade_level');
+  const subjectFocusField = getField('students', 'subject_focus');
+  const levelField = getField('students', 'level');
+  const weeklyLessonsLimitField = getField('students', 'weekly_lessons_limit');
+  const paymentStatusField = getField('students', 'payment_status');
+  const isActiveField = getField('students', 'is_active');
+  const registrationDateField = getField('students', 'registration_date');
+  const lastActivityField = getField('students', 'last_activity');
   
   return {
     id: record.id,
     name: fields[fullNameField] || '',
-    parentName: fields['Parent_Name'] || fields['parent_name'],
+    parentName: fields[parentNameField] || fields['Parent_Name'] || '',
+    parentPhone: fields[parentPhoneField] || '',
     email: fields['Email'] || fields['email'] || '',
     phone: fields[phoneField] || '',
-    // Note: parent_phone is available in Airtable but not in Student interface
-    grade: fields['Grade'] || fields['grade'],
-    status: (fields['Status'] || fields['status'] || 'active') as 'active' | 'on_hold' | 'inactive',
+    grade: fields[gradeLevelField] || fields['Grade'] || '',
+    level: fields[levelField] || '',
+    subjectFocus: fields[subjectFocusField] || '',
+    weeklyLessonsLimit: fields[weeklyLessonsLimitField] || 0,
+    paymentStatus: fields[paymentStatusField] || '',
+    registrationDate: fields[registrationDateField] || '',
+    lastActivity: fields[lastActivityField] || '',
+    status: (fields['Status'] || (fields[isActiveField] ? 'active' : 'inactive')) as 'active' | 'on_hold' | 'inactive',
     subscriptionType: fields['Subscription_Type'] || fields['subscription_type'] || '',
     balance: fields['Balance'] || fields['balance'] || 0,
     notes: fields['Notes'] || fields['notes'],
@@ -576,12 +576,6 @@ async function getTeachersMap(): Promise<Map<string, string>> {
 
 export const nexusApi = {
   getTeachers: async (): Promise<Teacher[]> => {
-    // #region agent log
-    const logEntry = {location:'nexusApi.ts:578',message:'getTeachers function entry',data:{hasApiKey:!!AIRTABLE_API_KEY,hasBaseId:!!AIRTABLE_BASE_ID},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'};
-    console.log('[DEBUG]', logEntry);
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(logEntry)}).catch(()=>{});
-    // #endregion
-    
     // Fetch from Airtable - no fallback
     if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
       throw new Error('Airtable API Key or Base ID not configured');
@@ -592,37 +586,14 @@ export const nexusApi = {
     });
     const teachersTableId = getTableId('teachers');
     
-    // #region agent log
-    const logBeforeRequest = {location:'nexusApi.ts:590',message:'Before Airtable request',data:{teachersTableId:teachersTableId,params:params.toString()},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'};
-    console.log('[DEBUG]', logBeforeRequest);
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(logBeforeRequest)}).catch(()=>{});
-    // #endregion
     const response = await airtableRequest<{ records: any[] }>(`/${teachersTableId}?${params}`);
-    
-    // #region agent log
-    const logRawResponse = {location:'nexusApi.ts:588',message:'Raw Airtable teachers response',data:{recordsCount:response.records.length,firstRecordFields:response.records[0]?.fields,firstRecordFieldsKeys:response.records[0] ? Object.keys(response.records[0].fields || {}) : [],sampleRecord:response.records[0]},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'};
-    console.log('[DEBUG]', logRawResponse);
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(logRawResponse)}).catch(()=>{});
-    // #endregion
     
     const teachers = response.records.map((record: any) => {
       const fields = record.fields || {};
       
-      // #region agent log
-      const logFieldMapping = {location:'nexusApi.ts:595',message:'Mapping teacher fields',data:{recordId:record.id,fieldsKeys:Object.keys(fields),nameField:fields['Name'],teacherNameField:fields['Teacher_Name'],fullNameField:fields['full_name'],allFields:fields},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'};
-      console.log('[DEBUG]', logFieldMapping);
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(logFieldMapping)}).catch(()=>{});
-      // #endregion
-      
       // Use the same logic as getTeachersMap - try multiple field names
       // This matches the exact logic in getTeachersMap (line 567)
       const name = fields['Name'] || fields['Teacher_Name'] || fields['full_name'] || '';
-      
-      // #region agent log
-      const logMappedTeacher = {location:'nexusApi.ts:602',message:'Mapped teacher result',data:{recordId:record.id,extractedName:name,nameLength:name.length,nameIsEmpty:name === '',triedFields:{Name:fields['Name'],Teacher_Name:fields['Teacher_Name'],full_name:fields['full_name']}},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'};
-      console.log('[DEBUG]', logMappedTeacher);
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(logMappedTeacher)}).catch(()=>{});
-      // #endregion
       
       return {
         id: record.id,
@@ -630,12 +601,6 @@ export const nexusApi = {
         specialties: fields['Specialties'] || fields['specialties'] || [],
       };
     });
-    
-    // #region agent log
-    const logFinalTeachers = {location:'nexusApi.ts:614',message:'Final teachers array',data:{teachersCount:teachers.length,teachersWithNames:teachers.filter(t => t.name && t.name.trim() !== '').length,teachersWithEmptyNames:teachers.filter(t => !t.name || t.name.trim() === '').length,sampleTeachers:teachers.slice(0, 3).map(t => ({id:t.id,name:t.name,nameLength:t.name.length}))},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'};
-    console.log('[DEBUG]', logFinalTeachers);
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(logFinalTeachers)}).catch(()=>{});
-    // #endregion
     
     console.log(`[Airtable] Fetched ${teachers.length} teachers`);
     return teachers;
@@ -656,6 +621,43 @@ export const nexusApi = {
     const students = response.records.map(mapAirtableToStudent);
     console.log(`[Airtable] Fetched ${students.length} students`);
     return students;
+  },
+
+  updateStudent: async (id: string, updates: Partial<Student>): Promise<Student> => {
+    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
+      throw new Error('Airtable API Key or Base ID not configured');
+    }
+
+    const airtableFields: any = { fields: {} };
+    
+    if (updates.name !== undefined) airtableFields.fields[getField('students', 'full_name')] = updates.name;
+    if (updates.phone !== undefined) airtableFields.fields[getField('students', 'phone_number')] = updates.phone;
+    if (updates.parentName !== undefined) airtableFields.fields[getField('students', 'parent_name')] = updates.parentName;
+    if (updates.parentPhone !== undefined) airtableFields.fields[getField('students', 'parent_phone')] = updates.parentPhone;
+    if (updates.grade !== undefined) airtableFields.fields[getField('students', 'grade_level')] = updates.grade;
+    if (updates.subjectFocus !== undefined) airtableFields.fields[getField('students', 'subject_focus')] = updates.subjectFocus;
+    if (updates.level !== undefined) airtableFields.fields[getField('students', 'level')] = updates.level;
+    if (updates.weeklyLessonsLimit !== undefined) airtableFields.fields[getField('students', 'weekly_lessons_limit')] = updates.weeklyLessonsLimit;
+    if (updates.paymentStatus !== undefined) airtableFields.fields[getField('students', 'payment_status')] = updates.paymentStatus;
+    if (updates.notes !== undefined) airtableFields.fields[getField('students', 'notes' as any)] = updates.notes;
+    if (updates.email !== undefined) airtableFields.fields[getField('students', 'email' as any)] = updates.email;
+    
+    if (updates.status !== undefined) {
+      airtableFields.fields[getField('students', 'is_active')] = updates.status === 'active';
+      // Also update 'Status' field if it exists (Airtable often has both)
+      airtableFields.fields['Status'] = updates.status;
+    }
+
+    const studentsTableId = getTableId('students');
+    const response = await airtableRequest<{ id: string; fields: any }>(
+      `/${studentsTableId}/${id}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify(airtableFields),
+      }
+    );
+
+    return mapAirtableToStudent({ id: response.id || id, fields: response.fields });
   },
 
   getLessons: async (start: string, end: string, teacherId?: string): Promise<Lesson[]> => {
@@ -728,10 +730,6 @@ export const nexusApi = {
       
       // Collect all unique status values from all records
       const allStatusValues = [...new Set(response.records.map((r: any) => r.fields?.[statusField]).filter((v: any) => v))];
-      
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:420',message:'Existing lesson status values from Airtable',data:{existingStatusValue:existingStatusValue,existingStatusType:typeof existingStatusValue,existingStatusLength:existingStatusValue?.length,existingStatusCharCodes:existingStatusValue?.split('').map((c:any)=>c.charCodeAt(0)),statusFieldName:statusField,allStatusValues:allStatusValues,allStatusValuesWithCharCodes:allStatusValues.map((v:any)=>({value:v,charCodes:v.split('').map((c:any)=>c.charCodeAt(0))}))},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
-      // #endregion
       
       console.log(`[DEBUG] First record ID: ${firstRecord.id}`);
       console.log(`[DEBUG] First record fields:`, JSON.stringify(firstRecord.fields, null, 2));
@@ -811,10 +809,6 @@ export const nexusApi = {
                       (typeof fieldValue[0] === 'object' && fieldValue[0]?.id?.startsWith('rec')))
         });
       });
-      
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:430',message:'All field names from existing lesson record',data:{allFieldNames:allFieldNames,subjectField:firstRecord.fields?.['Subject'],subjectLowercase:firstRecord.fields?.['subject'],hebrewFields:allFieldNames.filter(k => /[\u0590-\u05FF]/.test(k))},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
-      // #endregion
       
       // STEP 3: Inspect ALL field names to identify correct mappings
       // Reuse allFieldNames declared above in PART A
@@ -1130,13 +1124,6 @@ export const nexusApi = {
       
       // Extract teacher ID from linked record array
       const teacherIdValue = fields[teacherIdField];
-      // #region agent log
-      const logTeacherIdExtraction = {location:'nexusApi.ts:1054',message:'Extracting teacherId from Airtable record',data:{recordId:record.id,teacherIdField:teacherIdField,teacherIdValue:teacherIdValue,teacherIdValueType:typeof teacherIdValue,teacherIdValueIsArray:Array.isArray(teacherIdValue),teacherIdValueStringified:JSON.stringify(teacherIdValue),allFieldsKeys:Object.keys(fields),allFieldsSample:Object.keys(fields).reduce((acc, key) => { acc[key] = typeof fields[key]; return acc; }, {} as Record<string, string>)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'};
-      console.log('[DEBUG]', logTeacherIdExtraction);
-      console.log('[DEBUG] All fields in record:', Object.keys(fields));
-      console.log('[DEBUG] teacherIdValue raw:', teacherIdValue);
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(logTeacherIdExtraction)}).catch(()=>{});
-      // #endregion
       let extractedTeacherId = Array.isArray(teacherIdValue) 
         ? (typeof teacherIdValue[0] === 'string' ? teacherIdValue[0] : teacherIdValue[0]?.id || '')
         : (typeof teacherIdValue === 'string' ? teacherIdValue : teacherIdValue?.id || '');
@@ -1150,12 +1137,6 @@ export const nexusApi = {
         }
       }
       
-      // #region agent log
-      const logExtracted = {location:'nexusApi.ts:1060',message:'Extracted teacherId',data:{recordId:record.id,extractedTeacherId:extractedTeacherId,extractedTeacherIdType:typeof extractedTeacherId,extractedTeacherIdStartsWithRec:extractedTeacherId.startsWith('rec'),extractedTeacherIdLength:extractedTeacherId.length,teachersMapHasId:teachersMap.has(extractedTeacherId)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'};
-      console.log('[DEBUG]', logExtracted);
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(logExtracted)}).catch(()=>{});
-      // #endregion
-      
       // Extract source weekly slot (נוצר מתוך)
       const sourceField = getField('slotInventory', 'נוצר_מתוך'); // Returns 'נוצר מתוך'
       const sourceValue = fields[sourceField];
@@ -1168,10 +1149,24 @@ export const nexusApi = {
       // Extract status
       const statusField = getField('slotInventory', 'סטטוס');
       const statusValue = fields[statusField] || 'open';
-      const status = (statusValue === 'booked' || statusValue === 'blocked' 
-        ? statusValue 
-        : 'open') as 'open' | 'booked' | 'blocked';
+      // Map 'booked' or 'סגור' to 'closed' for internal consistency with types.ts
+      const status = (statusValue === 'booked' || statusValue === 'closed' || statusValue === 'סגור'
+        ? 'closed' 
+        : statusValue === 'blocked' || statusValue === 'canceled' || statusValue === 'מבוטל'
+        ? 'canceled'
+        : 'open') as 'open' | 'closed' | 'canceled';
       
+      const occupied = fields[getField('slotInventory', 'תפוסה_נוכחית' as any)] as number || 0;
+      const capacity = fields[getField('slotInventory', 'קיבולת_כוללת' as any)] as number || 1;
+
+      // Extract student IDs from linked record field
+      const studentField = getField('slotInventory', 'תלמידים' as any);
+      const studentVal = fields[studentField];
+      let studentIds: string[] = [];
+      if (Array.isArray(studentVal)) {
+        studentIds = studentVal.map((s: any) => typeof s === 'string' ? s : s.id).filter(Boolean);
+      }
+
       return {
         id: record.id,
         naturalKey: fields.natural_key || '',
@@ -1184,6 +1179,9 @@ export const nexusApi = {
         lessonType: fields[getField('slotInventory', 'סוג_שיעור')],
         sourceWeeklySlot: sourceWeeklySlot,
         status: status,
+        occupied,
+        capacityOptional: capacity,
+        students: studentIds,
         dayOfWeek: fields.day_of_week,
         startDT: fields.StartDT,
         endDT: fields.EndDT,
@@ -1356,21 +1354,12 @@ export const nexusApi = {
       fields.natural_key = (updates as any).naturalKey;
     }
     if (updates.teacherId !== undefined) {
-      // #region agent log
-      const logEntry = {location:'nexusApi.ts:1247',message:'updateSlotInventory received teacherId',data:{slotId:id,updatesTeacherId:updates.teacherId,updatesTeacherIdType:typeof updates.teacherId,updatesTeacherIdIsArray:Array.isArray(updates.teacherId),updatesTeacherIdStringified:JSON.stringify(updates.teacherId)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'};
-      console.log('[DEBUG]', logEntry);
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(logEntry)}).catch(()=>{});
-      // #endregion
-      
       // "מורה" must be an array of recordIds (wrap single value)
       // Ensure teacherId is a clean string value, not a stringified array
       let teacherIdValue: string;
       if (Array.isArray(updates.teacherId)) {
         teacherIdValue = typeof updates.teacherId[0] === 'string' ? updates.teacherId[0] : String(updates.teacherId[0]);
-        // #region agent log
-        console.log('[DEBUG] Normalized from array:', { teacherIdValue, arrayLength: updates.teacherId.length });
-        // #endregion
-      } else if (typeof updates.teacherId === 'string') {
+        } else if (typeof updates.teacherId === 'string') {
         // If it's already a string, use it directly (but check if it's a stringified array)
         const trimmed = updates.teacherId.trim();
         if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
@@ -1383,35 +1372,20 @@ export const nexusApi = {
             } else {
               teacherIdValue = String(parsed || '');
             }
-            // #region agent log
-            console.log('[DEBUG] Normalized from stringified array (parsed):', { teacherIdValue, parsed, original: updates.teacherId });
-            // #endregion
-          } catch (parseError) {
+            } catch (parseError) {
             // If parsing fails, try to extract the value manually
             // Remove brackets and quotes, then trim
             teacherIdValue = trimmed.replace(/^\[|\]$/g, '').replace(/"/g, '').replace(/'/g, '').trim();
-            // #region agent log
-            console.log('[DEBUG] Normalized from stringified array (parse failed):', { teacherIdValue, original: updates.teacherId, parseError: parseError instanceof Error ? parseError.message : String(parseError) });
-            // #endregion
-          }
+            }
         } else {
           teacherIdValue = trimmed;
-          // #region agent log
-          console.log('[DEBUG] Using string as-is:', { teacherIdValue, original: updates.teacherId });
-          // #endregion
-        }
+          }
       } else {
         teacherIdValue = String(updates.teacherId);
-        // #region agent log
-        console.log('[DEBUG] Converted to string:', { teacherIdValue });
-        // #endregion
-      }
+        }
       
       // Validate that we have a non-empty teacherId
       if (!teacherIdValue || teacherIdValue.trim() === '') {
-        // #region agent log
-        console.error('[DEBUG] teacherId validation failed:', { teacherIdValue });
-        // #endregion
         throw new Error('teacherId cannot be empty');
       }
       
@@ -1435,12 +1409,6 @@ export const nexusApi = {
       }
       
       fields[teacherIdField] = [trimmedTeacherId];
-      
-      // #region agent log
-      const logFinal = {location:'nexusApi.ts:1281',message:'Setting teacherId field for Airtable',data:{teacherIdField:teacherIdField,fieldsValue:fields[teacherIdField],fieldsValueType:typeof fields[teacherIdField],fieldsValueIsArray:Array.isArray(fields[teacherIdField]),fieldsValueStringified:JSON.stringify(fields[teacherIdField]),teacherIdValue:trimmedTeacherId,teachersMapKeys:Array.from(teachersMap.keys()).slice(0, 5)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'};
-      console.log('[DEBUG]', logFinal);
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(logFinal)}).catch(()=>{});
-      // #endregion
       
       console.log(`[nexusApi] Setting teacherId field "${teacherIdField}" to array:`, [trimmedTeacherId]);
     }
@@ -1469,7 +1437,11 @@ export const nexusApi = {
       fields[getField('slotInventory', 'סוג_שיעור')] = (updates as any).lessonType;
     }
     if (updates.status !== undefined) {
-      fields[getField('slotInventory', 'סטטוס')] = updates.status;
+      // Map new status values to Airtable values if needed
+      let statusValue = updates.status as string;
+      if (statusValue === 'closed') statusValue = 'סגור';
+      if (statusValue === 'canceled') statusValue = 'מבוטל';
+      fields[getField('slotInventory', 'סטטוס')] = statusValue;
     }
     if ((updates as any).isLocked !== undefined) {
       fields.is_locked = (updates as any).isLocked ? 1 : 0;
@@ -1478,20 +1450,6 @@ export const nexusApi = {
     // Update record in Airtable
     // Use typecast: true to allow Airtable to automatically add new options to Single Select fields
     // This enables adding new time values like "18:05" to the select field options
-    // #region agent log
-    const requestBody = { 
-      fields,
-      typecast: true // Enable automatic option creation for Single Select fields
-    };
-    const requestBodyString = JSON.stringify(requestBody);
-    const logRequest = {location:'nexusApi.ts:1302',message:'Sending PATCH request to Airtable',data:{slotId:id,tableId:tableId,fields:fields,fieldsKeys:Object.keys(fields),fieldsStringified:JSON.stringify(fields),requestBodyString:requestBodyString,teacherIdFieldValue:fields[teacherIdField],teacherIdFieldValueType:typeof fields[teacherIdField],teacherIdFieldValueIsArray:Array.isArray(fields[teacherIdField]),teacherIdFieldValueStringified:JSON.stringify(fields[teacherIdField]),teacherIdFieldValueInspect:JSON.stringify(fields[teacherIdField], null, 2)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'};
-    console.log('[DEBUG]', logRequest);
-    console.log('[DEBUG] Request body that will be sent:', requestBodyString);
-    console.log('[DEBUG] teacherIdField value in fields object:', fields[teacherIdField]);
-    console.log('[DEBUG] teacherIdField value type:', typeof fields[teacherIdField]);
-    console.log('[DEBUG] teacherIdField value isArray:', Array.isArray(fields[teacherIdField]));
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(logRequest)}).catch(()=>{});
-    // #endregion
     let response: { id: string; fields: any };
     try {
       response = await airtableRequest<{ id: string; fields: any }>(
@@ -1549,12 +1507,6 @@ export const nexusApi = {
         throw error;
       }
     }
-    // #region agent log
-    const logResponse = {location:'nexusApi.ts:1310',message:'Airtable PATCH response',data:{responseId:response.id,responseFieldsKeys:Object.keys(response.fields || {})},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'};
-    console.log('[DEBUG]', logResponse);
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(logResponse)}).catch(()=>{});
-    // #endregion
-    
     // Map response back to SlotInventory
     const responseFields = response.fields || {};
     const teacherIdValue = responseFields[teacherIdField];
@@ -1689,22 +1641,29 @@ export const nexusApi = {
     return updatedLesson;
   },
 
+  getBillingKPIs: async (month: string): Promise<ChargesReportKPIs> => {
+    try {
+      if (import.meta.env.DEV) {
+        console.log('[nexusApi] Fetching billing KPIs for month:', month);
+      }
+      const kpis = await getChargesReportKPIs(airtableClient, month);
+      if (import.meta.env.DEV) {
+        console.log('[nexusApi] Received KPIs:', kpis);
+      }
+      return kpis;
+    } catch (error) {
+      console.error('[nexusApi] Error fetching billing KPIs:', error);
+      throw error;
+    }
+  },
+
   getMonthlyBills: async (
     month: string,
-    options?: { statusFilter?: 'all' | 'draft' | 'sent' | 'paid'; searchQuery?: string }
+    options?: { statusFilter?: 'all' | 'draft' | 'sent' | 'paid' | 'link_sent'; searchQuery?: string }
   ): Promise<MonthlyBill[]> => {
     try {
-      // Map UI status filter to API status filter
-      let apiStatusFilter: 'all' | 'draft' | 'sent' | 'paid' = 'all';
-      if (options?.statusFilter) {
-        if (options.statusFilter === 'link_sent') {
-          apiStatusFilter = 'sent';
-        } else if (options.statusFilter === 'paid') {
-          apiStatusFilter = 'paid';
-        } else if (options.statusFilter === 'draft') {
-          apiStatusFilter = 'draft';
-        }
-      }
+      // Pass status filter directly to API (no mapping needed - getChargesReport supports all values)
+      const apiStatusFilter: 'all' | 'draft' | 'sent' | 'paid' | 'link_sent' = options?.statusFilter || 'all';
       
       if (import.meta.env.DEV) {
         console.log('[nexusApi.getMonthlyBills] Fetching for month:', month, 'statusFilter:', apiStatusFilter, 'searchQuery:', options?.searchQuery);
@@ -1721,6 +1680,57 @@ export const nexusApi = {
         console.log('[nexusApi.getMonthlyBills] Got', report.rows.length, 'rows from getChargesReport');
       }
       
+      // Update cached schema if not already set (discovery already happened inside getChargesReport)
+      if (!cachedChargeSchema) {
+        const schemaResult = await discoverChargeTableSchema(airtableClient);
+        if (!Array.isArray(schemaResult)) {
+          cachedChargeSchema = schemaResult;
+        }
+      }
+      
+      // Build student name and parent info map
+      const studentIds = new Set<string>();
+      for (const row of report.rows) {
+        if (row.studentRecordId) {
+          studentIds.add(row.studentRecordId);
+        } else if (typeof row.displayName === 'string' && row.displayName.startsWith('rec')) {
+          studentIds.add(row.displayName);
+        }
+      }
+
+      const studentNameMap = new Map<string, { name: string; parentName?: string; parentPhone?: string }>();
+      if (studentIds.size > 0 && AIRTABLE_API_KEY && AIRTABLE_BASE_ID) {
+        const studentsTableId = getTableId('students');
+        const allIds = Array.from(studentIds);
+        const chunkSize = 50; 
+
+        for (let i = 0; i < allIds.length; i += chunkSize) {
+          const chunk = allIds.slice(i, i + chunkSize);
+          const filterByFormula = `OR(${chunk.map(id => `RECORD_ID() = "${id}"`).join(',')})`;
+          const params = new URLSearchParams({
+            filterByFormula,
+            pageSize: String(chunk.length),
+            maxRecords: String(chunk.length),
+          });
+
+          const response = await airtableRequest<{ records: any[] }>(`/${studentsTableId}?${params}`);
+          for (const rec of response.records) {
+            const fields = rec.fields || {};
+            const name = fields[getField('students', 'full_name')] || fields['full_name'];
+            const parentName = fields[getField('students', 'parent_name')] || fields['parent_name'];
+            const parentPhone = fields[getField('students', 'parent_phone')] || fields['parent_phone'];
+
+            if (name && typeof name === 'string') {
+              studentNameMap.set(rec.id, { 
+                name, 
+                parentName: typeof parentName === 'string' ? parentName : undefined,
+                parentPhone: typeof parentPhone === 'string' ? parentPhone : undefined
+              });
+            }
+          }
+        }
+      }
+
       // Map ChargeReportRow to MonthlyBill format
       return report.rows.map(row => {
         // Map derivedStatus to MonthlyBill status
@@ -1733,24 +1743,84 @@ export const nexusApi = {
           status = 'draft';
         }
         
-        // Calculate lessonsAmount from totalAmount - subscriptionsAmount
-        // If totalAmount and subscriptionsAmount are available, calculate the difference
-        // Otherwise, fallback to lessonsCount * average price (but this is not accurate)
-        const lessonsAmount = row.totalAmount && row.subscriptionsAmount !== undefined
-          ? row.totalAmount - (row.subscriptionsAmount || 0)
-          : (row.lessonsCount ? row.lessonsCount * 175 : 0); // Fallback - not accurate
+        const resolvedStudentId = row.studentRecordId || (typeof row.displayName === 'string' && row.displayName.startsWith('rec') ? row.displayName : '');
+        const studentInfo = resolvedStudentId ? studentNameMap.get(resolvedStudentId) : undefined;
+        let studentName = studentInfo?.name || row.displayName;
+
+        if (!studentName || (studentName.startsWith('rec') && studentName.length > 3)) {
+          studentName = 'לא צוין';
+        }
+
+        // Calculate amounts correctly
+        const adjustmentAmount = typeof row.manualAdjustmentAmount === 'number' ? row.manualAdjustmentAmount : 0;
+        let subscriptionsAmount = typeof row.subscriptionsAmount === 'number' ? row.subscriptionsAmount : 0;
+        let lessonsAmount = typeof row.lessonsAmount === 'number' ? row.lessonsAmount : 0;
+        let totalAmount = typeof row.totalAmount === 'number' ? row.totalAmount : 0;
+
+        // SMART RECOVERY LOGIC:
+        // If total is 0 or looks like a subtotal, we need to handle it.
+        // The user says Subscription is 480, Total is 280, Adjustment is -200.
+        // If we extracted Sub=280 and Total=480, they are likely swapped OR Total is Subtotal.
         
+        if (totalAmount > 0 && Math.abs(totalAmount + adjustmentAmount - subscriptionsAmount) < 1) {
+          // Case: Total=480, Adj=-200, Subs=280. 
+          // Here 480 is actually the Subtotal (Subs+Lessons).
+          // We should swap them or recalculate.
+          const subtotal = totalAmount;
+          totalAmount = subtotal + adjustmentAmount; // 480 - 200 = 280 (Correct Total)
+          subscriptionsAmount = subtotal - lessonsAmount; // 480 - 0 = 480 (Correct Subs)
+        } else if (totalAmount === 0 && (subscriptionsAmount !== 0 || lessonsAmount !== 0)) {
+          totalAmount = subscriptionsAmount + lessonsAmount + adjustmentAmount;
+        }
+
+        // Build line items
+        const lineItems: BillLineItem[] = [];
+        if (subscriptionsAmount !== 0) {
+          lineItems.push({
+            id: `${row.chargeRecordId}_subscription`,
+            description: `דמי מנוי חודשיים (${row.subscriptionsCount || 0} מנויים)`,
+            amount: subscriptionsAmount,
+            type: 'subscription',
+          });
+        }
+        if (lessonsAmount !== 0 || (row.lessonsCount && row.lessonsCount > 0)) {
+          lineItems.push({
+            id: `${row.chargeRecordId}_lessons_summary`,
+            description: `שיעורים שבוצעו (${row.lessonsCount || 0} שיעורים)`,
+            amount: lessonsAmount,
+            type: 'lesson',
+          });
+        }
+        if (adjustmentAmount !== 0) {
+          lineItems.push({
+            id: `${row.chargeRecordId}_adjustment`,
+            description: row.manualAdjustmentReason || 'התאמה ידנית',
+            amount: adjustmentAmount,
+            type: 'adjustment',
+            date: row.manualAdjustmentDate,
+          });
+        }
+
         return {
           id: row.chargeRecordId,
           studentId: row.studentRecordId,
-          studentName: row.displayName || 'לא צוין',
+          studentName,
+          parentName: studentInfo?.parentName,
+          parentPhone: studentInfo?.parentPhone,
           month: month,
-          lessonsAmount: lessonsAmount,
-          subscriptionsAmount: row.subscriptionsAmount || 0,
-          adjustmentAmount: 0, // Not available from charges table
-          totalAmount: row.totalAmount || 0,
+          lessonsAmount,
+          lessonsCount: row.lessonsCount,
+          subscriptionsAmount,
+          adjustmentAmount,
+          totalAmount,
           status,
-          lineItems: [], // Not available from charges table directly
+          approved: row.flags.approved,
+          linkSent: row.flags.linkSent,
+          paid: row.flags.paid,
+          manualAdjustmentAmount: row.manualAdjustmentAmount,
+          manualAdjustmentReason: row.manualAdjustmentReason,
+          manualAdjustmentDate: row.manualAdjustmentDate,
+          lineItems,
         };
       });
     } catch (error: any) {
@@ -1780,6 +1850,78 @@ export const nexusApi = {
       }
       // Return empty array or fallback to mock
       return mockData.getMonthlyBills(month);
+    }
+  },
+
+  updateBillStatus: async (billId: string, fields: { approved?: boolean; linkSent?: boolean; paid?: boolean }): Promise<void> => {
+    const billingTableId = getTableId('monthlyBills');
+    
+    const performUpdate = async (approvedField: string, linkSentField: string, paidField: string) => {
+      const airtableFields: Record<string, any> = {};
+      if (fields.approved !== undefined) airtableFields[approvedField] = fields.approved;
+      if (fields.linkSent !== undefined) airtableFields[linkSentField] = fields.linkSent;
+      if (fields.paid !== undefined) airtableFields[paidField] = fields.paid;
+
+      if (import.meta.env.DEV) {
+        console.log(`[nexusApi.updateBillStatus] Sending update to Airtable.`, {
+          table: billingTableId,
+          record: billId,
+          fields: airtableFields,
+        });
+      }
+
+      return await airtableClient.updateRecord(billingTableId, billId, airtableFields, { typecast: true });
+    };
+
+    try {
+      if (import.meta.env.DEV) {
+        console.log(`[nexusApi.updateBillStatus] Starting update for bill ${billId}`, fields);
+      }
+
+      // Try multiple known variations of field names if discovery is not reliable
+      const approvedVariations = ['מאושר לחיוב', 'מאושר_לחיוב', 'Approved', 'מאושר'];
+      const linkSentVariations = ['נשלח קישור', 'נשלח_קישור', 'Link Sent', 'נשלח'];
+      const paidVariations = ['שולם', 'Paid', 'שולם?'];
+
+      // 1. If we have a cached schema from a previous successful discovery, use it
+      if (cachedChargeSchema) {
+        try {
+          await performUpdate(cachedChargeSchema.approvedField, cachedChargeSchema.linkSentField, cachedChargeSchema.paidField);
+          return;
+        } catch (e) {
+          console.warn('[nexusApi] Cached schema failed, clearing cache and trying fallbacks');
+          cachedChargeSchema = null;
+        }
+      }
+
+      // 2. Try discovery
+      const discoveryResult = await discoverChargeTableSchema(airtableClient);
+      if (!Array.isArray(discoveryResult)) {
+        try {
+          await performUpdate(discoveryResult.approvedField, discoveryResult.linkSentField, discoveryResult.paidField);
+          cachedChargeSchema = discoveryResult;
+          return;
+        } catch (e) {
+          console.warn('[nexusApi] Discovery result failed, trying hardcoded defaults');
+        }
+      }
+
+      // 3. Last resort: Try hardcoded defaults from config
+      const defaultApproved = AIRTABLE_CONFIG.fields.billingApproved || 'מאושר לחיוב';
+      const defaultLinkSent = AIRTABLE_CONFIG.fields.billingLinkSent || 'נשלח קישור';
+      const defaultPaid = AIRTABLE_CONFIG.fields.billingPaid || 'שולם';
+
+      await performUpdate(defaultApproved, defaultLinkSent, defaultPaid);
+      if (import.meta.env.DEV) console.log('[nexusApi.updateBillStatus] Update successful with defaults');
+
+    } catch (error: any) {
+      console.error('[nexusApi.updateBillStatus] Final update failure:', {
+        billId,
+        fields,
+        message: error.message,
+        details: error.details
+      });
+      throw error;
     }
   },
 
@@ -2093,19 +2235,11 @@ export const nexusApi = {
     const studentField = getField('lessons', 'full_name'); // Linked record to students
     const teacherField = getField('lessons', 'teacher_id'); // Linked record to teachers
     
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1088',message:'checkLessonConflicts called',data:{startDatetime:startDatetime,endDatetime:endDatetime,studentId:studentId,teacherId:teacherId,excludeLessonId:excludeLessonId,startDatetimeType:typeof startDatetime,endDatetimeType:typeof endDatetime,timezoneOffset:new Date().getTimezoneOffset()},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
-    // #endregion
-    
     let filterFormula = `AND(
       {${statusField}} != 'בוטל',
       {${startDatetimeField}} < '${endDatetime}',
       {${endDatetimeField}} > '${startDatetime}'
     )`;
-
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1095',message:'Conflict check filter formula in checkLessonConflicts',data:{filterFormula:filterFormula,startDatetime:startDatetime,endDatetime:endDatetime},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
-    // #endregion
 
     // Note: Airtable linked record filtering in formulas can be complex
     // We'll filter by student/teacher client-side after fetching for accuracy
@@ -2118,10 +2252,6 @@ export const nexusApi = {
     const lessonsTableId = getTableId('lessons');
     const response = await airtableRequest<{ records: any[] }>(`/${lessonsTableId}?${params}`);
     
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1103',message:'Conflict check response from Airtable in checkLessonConflicts',data:{recordsCount:response.records.length,records:response.records.map((r:any)=>({id:r.id,startDatetime:r.fields?.[startDatetimeField],endDatetime:r.fields?.[endDatetimeField],studentField:r.fields?.[studentField]})).slice(0,5),filterFormula:filterFormula},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
-    // #endregion
-    
     // Filter client-side:
     // 1. Exclude the current lesson if updating
     // 2. Filter by student if provided (check if studentId is in the linked record array)
@@ -2133,37 +2263,19 @@ export const nexusApi = {
     }
     
     if (studentId) {
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1158',message:'Filtering by studentId',data:{studentId:studentId,studentField:studentField,recordsBeforeFilter:filteredRecords.length,records:filteredRecords.map((r:any)=>({id:r.id,studentFieldValue:r.fields?.[studentField],studentFieldType:typeof r.fields?.[studentField],isArray:Array.isArray(r.fields?.[studentField])}))},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
-      // #endregion
       filteredRecords = filteredRecords.filter(record => {
         const studentFieldValue = record.fields?.[studentField];
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1161',message:'Checking record for student match',data:{recordId:record.id,studentFieldValue:studentFieldValue,studentFieldValueType:typeof studentFieldValue,isArray:Array.isArray(studentFieldValue),searchingForStudentId:studentId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
-        // #endregion
         if (Array.isArray(studentFieldValue)) {
           // Check if any linked record ID matches
           const matches = studentFieldValue.some((link: any) => {
             const linkId = typeof link === 'string' ? link : link.id;
-            // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1166',message:'Comparing link ID with studentId',data:{linkId:linkId,studentId:studentId,matches:linkId===studentId,linkType:typeof link},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
-            // #endregion
             return linkId === studentId;
           });
-          // #region agent log
-          fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1170',message:'Student match result',data:{recordId:record.id,matches:matches},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
-          // #endregion
           return matches;
         }
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1174',message:'Student field is not array - rejecting',data:{recordId:record.id,studentFieldValue:studentFieldValue},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
-        // #endregion
         return false;
       });
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1177',message:'After student filter',data:{recordsAfterFilter:filteredRecords.length,studentId:studentId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
-      // #endregion
-    }
+      }
     
     if (teacherId) {
       filteredRecords = filteredRecords.filter(record => {
@@ -2179,9 +2291,6 @@ export const nexusApi = {
     
     const conflicts = filteredRecords.map(mapAirtableToLesson);
     console.log(`[Airtable] Conflict check: found ${conflicts.length} conflicting lessons`);
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1140',message:'Mapped conflicts in checkLessonConflicts',data:{conflictsCount:conflicts.length,conflicts:conflicts.map(c=>({id:c.id,studentName:c.studentName,date:c.date,startTime:c.startTime,duration:c.duration})),filteredRecordsCount:filteredRecords.length,originalStartDatetime:startDatetime,originalEndDatetime:endDatetime},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
-    // #endregion
     return conflicts;
   },
 
@@ -2247,10 +2356,6 @@ export const nexusApi = {
     const localStartDatetime = `${lesson.date}T${lesson.startTime}:00`;
     const localStartDate = new Date(localStartDatetime);
     
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1198',message:'Creating lesson - input values',data:{lessonDate:lesson.date,lessonStartTime:lesson.startTime,lessonDuration:lesson.duration,localStartDatetime:localStartDatetime,localStartDateISO:localStartDate.toISOString(),localStartDateLocal:localStartDate.toString(),timezoneOffset:new Date().getTimezoneOffset()},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
-    // #endregion
-    
     if (isNaN(localStartDate.getTime())) {
       throw {
         message: `Invalid date/time format: ${localStartDatetime}`,
@@ -2262,17 +2367,9 @@ export const nexusApi = {
     // Convert local time to UTC for Airtable (Airtable stores as UTC)
     const startDatetime = localStartDate.toISOString(); // Full ISO string with Z (UTC)
     
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1204',message:'Converted local time to UTC for Airtable',data:{localStartDatetime:localStartDatetime,startDatetime:startDatetime,localStartDateISO:localStartDate.toISOString(),localHours:localStartDate.getHours(),localUTCHours:localStartDate.getUTCHours(),timezoneOffset:localStartDate.getTimezoneOffset()},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
-    // #endregion
-    
     // Calculate end time in UTC
     const endDate = new Date(localStartDate.getTime() + (lesson.duration * 60 * 1000));
     const endDatetime = endDate.toISOString(); // Full ISO string with Z (UTC)
-    
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1216',message:'Calculated end_datetime in UTC',data:{endDatetime:endDatetime,endDateISO:endDate.toISOString(),endDateLocal:endDate.toString(),localEndHours:endDate.getHours(),utcEndHours:endDate.getUTCHours(),startDatetime:startDatetime},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
-    // #endregion
     
     // Validation: Ensure end > start
     const startTimeMs = localStartDate.getTime();
@@ -2293,10 +2390,6 @@ export const nexusApi = {
 
     // Server-side conflict check (call the function directly, not through nexusApi to avoid circular reference)
     const conflicts = await (async () => {
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1218',message:'Starting server-side conflict check',data:{lessonDate:lesson.date,lessonStartTime:lesson.startTime,lessonDuration:lesson.duration,startDatetime:startDatetime,endDatetime:endDatetime,studentId:lesson.studentId,teacherId:lesson.teacherId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
-      // #endregion
-      
       if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
         throw new Error('Airtable API Key or Base ID not configured');
       }
@@ -2316,10 +2409,6 @@ export const nexusApi = {
         {${endDatetimeField}} > '${startDatetime}'
       )`;
 
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1261',message:'Conflict check filter formula in createLesson',data:{filterFormula:filterFormula,startDatetime:startDatetime,endDatetime:endDatetime,startDatetimeType:typeof startDatetime,endDatetimeType:typeof endDatetime,timezoneOffset:new Date().getTimezoneOffset()},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
-      // #endregion
-
       // Note: Airtable linked record filtering in formulas uses the field name directly
       // The filter will be applied client-side for accuracy (see below)
       // We don't add student/teacher filters to the formula here to keep it simple
@@ -2332,49 +2421,23 @@ export const nexusApi = {
       const lessonsTableId = getTableId('lessons');
       const response = await airtableRequest<{ records: any[] }>(`/${lessonsTableId}?${params}`);
       
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1248',message:'Conflict check response from Airtable',data:{recordsCount:response.records.length,records:response.records.map((r:any)=>({id:r.id,startDatetime:r.fields?.[startDatetimeField],endDatetime:r.fields?.[endDatetimeField],studentField:r.fields?.[studentField]})).slice(0,5)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
-      // #endregion
-      
       // Filter client-side by student and teacher if provided
       let filteredRecords = response.records;
       
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1342',message:'Before student/teacher filter in createLesson',data:{recordsCount:filteredRecords.length,studentId:lesson.studentId,teacherId:lesson.teacherId,records:filteredRecords.map((r:any)=>({id:r.id,studentField:r.fields?.[studentField],teacherField:r.fields?.[teacherField]})).slice(0,5)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
-      // #endregion
-      
       if (lesson.studentId) {
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1346',message:'Filtering by studentId in createLesson',data:{studentId:lesson.studentId,studentField:studentField,recordsBeforeFilter:filteredRecords.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
-        // #endregion
         filteredRecords = filteredRecords.filter(record => {
           const studentFieldValue = record.fields?.[studentField];
-          // #region agent log
-          fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1350',message:'Checking record for student match in createLesson',data:{recordId:record.id,studentFieldValue:studentFieldValue,studentFieldValueType:typeof studentFieldValue,isArray:Array.isArray(studentFieldValue),searchingForStudentId:lesson.studentId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
-          // #endregion
           if (Array.isArray(studentFieldValue)) {
             // Check if any linked record ID matches
             const matches = studentFieldValue.some((link: any) => {
               const linkId = typeof link === 'string' ? link : link.id;
-              // #region agent log
-              fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1356',message:'Comparing link ID with studentId in createLesson',data:{linkId:linkId,studentId:lesson.studentId,matches:linkId===lesson.studentId,linkType:typeof link},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
-              // #endregion
               return linkId === lesson.studentId;
             });
-            // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1361',message:'Student match result in createLesson',data:{recordId:record.id,matches:matches},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
-            // #endregion
             return matches;
           }
-          // #region agent log
-          fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1366',message:'Student field is not array in createLesson - rejecting',data:{recordId:record.id,studentFieldValue:studentFieldValue},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
-          // #endregion
           return false;
         });
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1370',message:'After student filter in createLesson',data:{recordsAfterFilter:filteredRecords.length,studentId:lesson.studentId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
-        // #endregion
-      }
+        }
       
       if (lesson.teacherId) {
         filteredRecords = filteredRecords.filter(record => {
@@ -2390,16 +2453,8 @@ export const nexusApi = {
       
       const mappedConflicts = filteredRecords.map(mapAirtableToLesson);
       
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1278',message:'Mapped conflicts after filtering',data:{conflictsCount:mappedConflicts.length,conflicts:mappedConflicts.map(c=>({id:c.id,studentName:c.studentName,date:c.date,startTime:c.startTime,duration:c.duration})),filteredRecordsCount:filteredRecords.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
-      // #endregion
-      
       return mappedConflicts;
     })();
-
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1281',message:'Final conflict check result',data:{conflictsLength:conflicts.length,conflicts:conflicts.map(c=>({id:c.id,studentName:c.studentName,date:c.date,startTime:c.startTime})),willThrow:conflicts.length>0},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
-    // #endregion
 
     if (conflicts.length > 0) {
       // Build detailed conflict message
@@ -2425,10 +2480,6 @@ export const nexusApi = {
     const statusField = getField('lessons', 'status');
     const lessonDateField = getField('lessons', 'lesson_date');
     
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1256',message:'Status value before assignment',data:{lessonStatus:lesson.status,lessonStatusType:typeof lesson.status,LessonStatusSCHEDULED:LessonStatus.SCHEDULED,LessonStatusSCHEDULEDValue:LessonStatus.SCHEDULED,statusFieldName:statusField},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-    // #endregion
-    
     airtableFields.fields[startDatetimeField] = startDatetime;
     airtableFields.fields[endDatetimeField] = endDatetime;
     
@@ -2441,19 +2492,11 @@ export const nexusApi = {
       const sampleResponse = await airtableRequest<{ records: any[] }>(`/${lessonsTableId}?${sampleParams}`);
       if (sampleResponse.records && sampleResponse.records.length > 0) {
         const sampleStatus = sampleResponse.records[0].fields?.[statusField];
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1262',message:'Sample status value from existing lesson',data:{sampleStatus:sampleStatus,sampleStatusType:typeof sampleStatus,sampleStatusLength:sampleStatus?.length,sampleStatusCharCodes:sampleStatus?.split('').map((c:any)=>c.charCodeAt(0))},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
-        // #endregion
         validStatusValue = sampleStatus;
       }
     } catch (sampleError) {
       console.warn(`[DEBUG createLesson] Could not fetch sample lesson to check status values:`, sampleError);
     }
-    
-    // #region agent log
-    const statusValue = lesson.status || LessonStatus.SCHEDULED;
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1274',message:'Status value being sent to Airtable',data:{statusValue:statusValue,statusValueType:typeof statusValue,statusValueLength:statusValue?.length,statusValueCharCodes:statusValue?.split('').map((c:any)=>c.charCodeAt(0)),validStatusValue:validStatusValue,statusFieldName:statusField},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-    // #endregion
     
     // Use valid status value if found, otherwise use the requested value
     // If status field is required but we can't determine valid value, try common options
@@ -2470,7 +2513,16 @@ export const nexusApi = {
     // Format: array of record ID strings for linked record fields
     airtableFields.fields[studentFieldName] = [studentRecordId];
     console.log(`[DEBUG createLesson] PART B - Writing student to field "${studentFieldName}" = ["${studentRecordId}"]`);
-    console.log(`[DEBUG createLesson] PART B - If this fails with "cannot accept value", check getLessons PART A logs for the correct writable field name`);
+
+    // Add source if available
+    try {
+      const sourceField = getField('lessons', 'source');
+      if (lesson.source) {
+        airtableFields.fields[sourceField] = lesson.source;
+      }
+    } catch (e) {
+      console.warn(`[nexusApi] source field not found in mapping, skipping`);
+    }
 
     // Teacher link - OPTIONAL
     // Note: According to the report, the field is 'teacher_id' (linked record to teachers)
@@ -2484,17 +2536,9 @@ export const nexusApi = {
       }
     }
 
-    // Notes - OPTIONAL
-    // Note: 'פרטי השיעור' is a computed field according to the report, so we shouldn't write to it
-    // If notes need to be stored, we may need a different field
-    // For now, we'll skip writing notes if it's computed
     if (lesson.notes) {
       const lessonDetailsField = getField('lessons', 'פרטי_השיעור' as any);
-      if (!isComputedField('lessons', lessonDetailsField)) {
-        airtableFields.fields[lessonDetailsField] = lesson.notes;
-      } else {
-        console.warn(`[DEBUG createLesson] Skipping notes - 'פרטי השיעור' is a computed field`);
-      }
+      airtableFields.fields[lessonDetailsField] = lesson.notes;
     }
 
     // Price - OPTIONAL (only for private lessons)
@@ -2525,22 +2569,10 @@ export const nexusApi = {
     console.log(`[DEBUG createLesson] All fields are from config mapping - no hardcoded field names`);
     console.log(`[DEBUG createLesson] Complete Airtable payload:`, JSON.stringify(airtableFields, null, 2));
 
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1317',message:'Final payload before sending to Airtable',data:{payloadFields:Object.keys(airtableFields.fields),statusFieldValue:airtableFields.fields[statusField],statusFieldName:statusField,fullPayload:airtableFields},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-    // #endregion
-
     // Create the lesson in Airtable using STRICT field mapping (no fallbacks)
     // All field names must be defined in fieldMap
     try {
       const lessonsTableId = getTableId('lessons');
-      
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1325',message:'About to send POST request to Airtable',data:{lessonsTableId:lessonsTableId,statusFieldValue:airtableFields.fields[statusField]},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-      // #endregion
-      
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1418',message:'About to send POST to Airtable',data:{airtableFields:airtableFields,requestedDate:lesson.date,requestedStartTime:lesson.startTime,requestedDuration:lesson.duration},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
-      // #endregion
       
       const response = await airtableRequest<{ id: string; fields: any }>(
         `/${lessonsTableId}`,
@@ -2550,21 +2582,11 @@ export const nexusApi = {
         }
       );
       
-      // #region agent log
-      const startDatetimeField = getField('lessons', 'start_datetime');
-      const endDatetimeField = getField('lessons', 'end_datetime');
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1425',message:'Lesson created in Airtable',data:{responseId:response.id,responseFields:Object.keys(response.fields||{}),responseStartDatetime:response.fields?.[startDatetimeField],responseEndDatetime:response.fields?.[endDatetimeField],requestedDate:lesson.date,requestedStartTime:lesson.startTime},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
-      // #endregion
-      
       console.log(`[DEBUG createLesson] STEP 5 - SUCCESS! Created lesson ${response.id}`);
       console.log(`[DEBUG createLesson] STEP 5 - Response fields:`, Object.keys(response.fields || {}));
       
       // Map response to Lesson
       const newLesson = mapAirtableToLesson({ id: response.id, fields: response.fields });
-      
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1430',message:'Mapped lesson from Airtable response',data:{newLessonId:newLesson.id,newLessonDate:newLesson.date,newLessonStartTime:newLesson.startTime,newLessonDuration:newLesson.duration,requestedDate:lesson.date,requestedStartTime:lesson.startTime,timeDifference:newLesson.startTime!==lesson.startTime},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
-      // #endregion
       
       console.log(`[Airtable] Created lesson ${response.id}`);
       return newLesson;
@@ -2575,10 +2597,6 @@ export const nexusApi = {
       console.error(`[DEBUG createLesson] STEP 5 - Payload that failed:`, JSON.stringify(airtableFields, null, 2));
       console.error(`[DEBUG createLesson] STEP 5 - Field names in payload:`, Object.keys(airtableFields.fields));
       console.error(`[DEBUG createLesson] STEP 5 - If error mentions "Unknown field name", check getLessons logs to discover correct field names`);
-      
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1334',message:'Error creating lesson',data:{errorMessage:error?.message,errorDetails:error?.details,statusFieldValue:airtableFields.fields[statusField],statusFieldName:statusField,fullError:JSON.stringify(error)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-      // #endregion
       
       throw error;
     }
@@ -2591,4 +2609,72 @@ export const nexusApi = {
     
     return await createMonthlyCharges(airtableClient, billingMonth);
   },
+
+  updateBillAdjustment: async (billId: string, adjustment: { amount: number; reason: string }): Promise<void> => {
+    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
+      throw new Error('Airtable API Key or Base ID not configured');
+    }
+
+    const billingTableId = getTableId('monthlyBills');
+    const amountField = getField('monthlyBills', 'manual_adjustment_amount');
+    const reasonField = getField('monthlyBills', 'manual_adjustment_reason');
+    const dateField = getField('monthlyBills', 'manual_adjustment_date');
+
+    try {
+      // Get current bill to calculate new total
+      const currentBill = await airtableClient.getRecord(billingTableId, billId);
+      const currentFields = currentBill.fields as any;
+      
+      const lessonsAmount = currentFields[getField('monthlyBills', 'lessons_amount')] || 0;
+      const subscriptionsAmount = currentFields[getField('monthlyBills', 'subscriptions_amount')] || 0;
+      const cancellationsAmount = currentFields[getField('monthlyBills', 'cancellations_amount')] || 0;
+      const newTotal = lessonsAmount + subscriptionsAmount + cancellationsAmount + adjustment.amount;
+
+      const updateFields: any = {
+        [amountField]: adjustment.amount,
+        [reasonField]: adjustment.reason || '',
+        [dateField]: new Date().toISOString().split('T')[0], // Today's date in YYYY-MM-DD format
+        [getField('monthlyBills', 'total_amount')]: newTotal,
+      };
+
+      await airtableClient.updateRecord(billingTableId, billId, updateFields);
+
+      if (import.meta.env.DEV) {
+        console.log(`[nexusApi.updateBillAdjustment] Updated adjustment for bill ${billId}`, adjustment);
+      }
+    } catch (error: any) {
+      console.error('[nexusApi.updateBillAdjustment] Failed to update adjustment:', error);
+      throw {
+        message: `Failed to update bill adjustment: ${error.message || 'Unknown error'}`,
+        code: 'UPDATE_ADJUSTMENT_ERROR',
+        status: error.status || 500,
+        details: error,
+      };
+    }
+  },
+
+  deleteBill: async (billId: string): Promise<void> => {
+    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
+      throw new Error('Airtable API Key or Base ID not configured');
+    }
+
+    const billingTableId = getTableId('monthlyBills');
+
+    try {
+      await airtableClient.deleteRecord(billingTableId, billId);
+
+      if (import.meta.env.DEV) {
+        console.log(`[nexusApi.deleteBill] Deleted bill ${billId}`);
+      }
+    } catch (error: any) {
+      console.error('[nexusApi.deleteBill] Failed to delete bill:', error);
+      throw {
+        message: `Failed to delete bill: ${error.message || 'Unknown error'}`,
+        code: 'DELETE_BILL_ERROR',
+        status: error.status || 500,
+        details: error,
+      };
+    }
+  },
 };
+
