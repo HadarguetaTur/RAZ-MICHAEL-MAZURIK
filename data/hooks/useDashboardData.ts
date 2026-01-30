@@ -104,10 +104,10 @@ export function useDashboardData() {
   // Fetch Billing KPIs for current month
   const { kpis: billingKpis, isLoading: billingLoading, refresh: refreshBilling } = useBilling(currentMonthStr);
 
-  // Fetch Students data
+  // Fetch Students data (first page only for dashboard - faster)
   const { students, isLoading: studentsLoading, refreshStudents } = useStudents({
     filterActiveOnly: false,
-    loadAllPages: true
+    loadAllPages: false  // Only first 100 students for dashboard speed
   });
 
   // Fetch overdue bills (previous months, unpaid)
@@ -117,29 +117,28 @@ export function useDashboardData() {
   const loadOverdueBills = useCallback(async () => {
     setOverdueLoading(true);
     try {
-      // Fetch last 6 months of billing data to find overdue
+      // Fetch last 3 months of billing data to find overdue (optimized)
       const months: string[] = [];
-      for (let i = 1; i <= 6; i++) {
+      for (let i = 1; i <= 3; i++) {
         const d = new Date(today.getFullYear(), today.getMonth() - i, 1);
         months.push(d.toISOString().slice(0, 7));
       }
       
-      // Fetch bills for each previous month
-      const allBillsArrays = await Promise.all(
-        months.map(m => getMonthlyBills(m, { statusFilter: 'all' }))
-      );
-      
-      // Flatten and filter: only unpaid bills from previous months
+      // Fetch bills for each previous month sequentially to reduce load
       const unpaidBills: MonthlyBill[] = [];
-      allBillsArrays.forEach((bills, idx) => {
-        const month = months[idx];
-        bills.forEach(bill => {
-          // Overdue = month < currentMonth AND not paid
-          if (month < currentMonthStr && !bill.paid) {
-            unpaidBills.push(bill);
-          }
-        });
-      });
+      for (const month of months) {
+        try {
+          const bills = await getMonthlyBills(month, { statusFilter: 'all' });
+          bills.forEach(bill => {
+            // Overdue = month < currentMonth AND not paid
+            if (month < currentMonthStr && !bill.paid) {
+              unpaidBills.push(bill);
+            }
+          });
+        } catch (monthErr) {
+          console.warn(`[useDashboardData] Could not load bills for ${month}:`, monthErr);
+        }
+      }
       
       setOverdueBills(unpaidBills);
     } catch (err) {
@@ -335,9 +334,13 @@ export function useDashboardData() {
     ]);
   }, [refreshLessonsToday, refreshCurrentWeek, refreshPrevWeek, refreshBilling, refreshStudents, loadOverdueBills, loadRevenueTrend]);
 
+  // Core loading: only essential data blocks the initial render
+  // Students, overdue bills, and revenue trend load in background (non-blocking)
+  const isCoreLoading = lessonsLoading || currentWeekLoading || prevWeekLoading || billingLoading;
+  
   return {
     metrics,
-    isLoading: lessonsLoading || currentWeekLoading || prevWeekLoading || billingLoading || studentsLoading || overdueLoading || revenueLoading,
+    isLoading: isCoreLoading,
     refresh
   };
 }

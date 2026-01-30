@@ -9,6 +9,7 @@ import SlotInventoryModal from './SlotInventoryModal';
 import StudentPicker from './StudentPicker';
 import StudentsPicker from './StudentsPicker';
 import LessonOverlapWarningModal from './ui/LessonOverlapWarningModal';
+import CancelLessonModal from './ui/CancelLessonModal';
 import type { ConflictItem, CheckConflictsResult } from '../services/conflictsCheckService';
 import { buildConflictSummary } from '../services/conflictsCheckService';
 import { useOpenSlotModal } from '../hooks/useOpenSlotModal';
@@ -17,6 +18,7 @@ import { isOverlapping } from '../utils/overlaps';
 import { apiUrl } from '../config/api';
 import { useToast } from '../hooks/useToast';
 import { useConfirmDialog } from '../hooks/useConfirmDialog';
+import { sendTeacherCancelNotification, normalizePhoneNumber } from '../services/makeApi';
 
 const HOURS = Array.from({ length: 14 }, (_, i) => i + 8); // 08:00 to 21:00
 const DAYS_HEBREW = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'];
@@ -122,6 +124,10 @@ const Calendar: React.FC = () => {
     hasOverlap: boolean;
     conflicts: Array<{ type: 'lesson' | 'slot'; label: string; time: string }>;
   } | null>(null);
+  
+  // Cancel lesson modal state
+  const [showCancelModal, setShowCancelModal] = useState(false);
+  const [cancelModalLesson, setCancelModalLesson] = useState<Lesson | null>(null);
 
   const weekDates = useMemo(() => {
     const dates = [];
@@ -772,27 +778,82 @@ const Calendar: React.FC = () => {
     setPendingSaveAction(null);
   };
 
-  const handleCancel = async () => {
+  // Open cancel modal instead of direct confirm
+  const handleCancel = () => {
     if (!selectedLesson) return;
+    setCancelModalLesson(selectedLesson);
+    setShowCancelModal(true);
+  };
+
+  // Close cancel modal
+  const handleCancelModalClose = () => {
+    setShowCancelModal(false);
+    setCancelModalLesson(null);
+  };
+
+  // Cancel lesson only (without notification)
+  const handleCancelOnly = async () => {
+    if (!cancelModalLesson) return;
     
-    const confirmed = await confirm({
-      title: 'ביטול שיעור',
-      message: 'האם אתה בטוח שברצונך לבטל את השיעור?',
-      variant: 'warning',
-      confirmLabel: 'בטל שיעור',
-      cancelLabel: 'חזור'
-    });
-    if (!confirmed) return;
-    
-    setIsSaving(true);
     try {
-      const updated = await nexusApi.updateLesson(selectedLesson.id, { status: LessonStatus.CANCELLED });
-      setLessons(prev => prev.map(l => l.id === selectedLesson.id ? updated : l));
+      const updated = await nexusApi.updateLesson(cancelModalLesson.id, { status: LessonStatus.CANCELLED });
+      setLessons(prev => prev.map(l => l.id === cancelModalLesson.id ? updated : l));
       setSelectedLesson(null);
+      setShowCancelModal(false);
+      setCancelModalLesson(null);
+      toast.success('השיעור בוטל בהצלחה');
     } catch (err: any) {
       toast.error(parseApiError(err));
-    } finally {
-      setIsSaving(false);
+      throw err; // Re-throw to keep modal open on error
+    }
+  };
+
+  // Cancel lesson and send notification to student
+  const handleCancelAndNotify = async () => {
+    if (!cancelModalLesson) return;
+    
+    // First, cancel the lesson
+    let updated: Lesson;
+    try {
+      updated = await nexusApi.updateLesson(cancelModalLesson.id, { status: LessonStatus.CANCELLED });
+      setLessons(prev => prev.map(l => l.id === cancelModalLesson.id ? updated : l));
+    } catch (err: any) {
+      toast.error(parseApiError(err));
+      throw err; // Re-throw to keep modal open on error
+    }
+    
+    // Lesson cancelled successfully - now try to send notification
+    // Get student phone number
+    const student = students.find(s => s.id === cancelModalLesson.studentId);
+    const studentPhone = student?.phone || student?.parentPhone;
+    const studentName = cancelModalLesson.studentName || student?.name || '';
+    const lessonDate = cancelModalLesson.date;
+    
+    if (!studentPhone) {
+      // No phone number available - show warning but close modal
+      setSelectedLesson(null);
+      setShowCancelModal(false);
+      setCancelModalLesson(null);
+      toast.warning('השיעור בוטל, אבל לא נמצא מספר טלפון לשליחת הודעה');
+      return;
+    }
+    
+    // Send notification via Make scenario
+    const result = await sendTeacherCancelNotification({
+      phone: studentPhone,
+      date: lessonDate,
+      name: studentName,
+    });
+    
+    setSelectedLesson(null);
+    setShowCancelModal(false);
+    setCancelModalLesson(null);
+    
+    if (result.success) {
+      toast.success('השיעור בוטל והודעה נשלחה לתלמיד');
+    } else {
+      // Lesson cancelled but notification failed
+      toast.warning(`השיעור בוטל, אבל ההודעה לא נשלחה: ${result.error || 'שגיאה לא ידועה'}`);
     }
   };
 
@@ -1516,6 +1577,17 @@ const Calendar: React.FC = () => {
         onContinue={handleOverlapContinue}
         onBack={handleOverlapBack}
         isLoading={isSaving}
+      />
+
+      {/* Cancel Lesson Modal */}
+      <CancelLessonModal
+        isOpen={showCancelModal}
+        lessonDate={cancelModalLesson?.date || ''}
+        lessonTime={cancelModalLesson?.startTime}
+        studentName={cancelModalLesson?.studentName || ''}
+        onClose={handleCancelModalClose}
+        onCancelOnly={handleCancelOnly}
+        onCancelAndNotify={handleCancelAndNotify}
       />
     </div>
   );
