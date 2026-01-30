@@ -1,5 +1,5 @@
 
-import { Lesson, Student, Teacher, Subscription, MonthlyBill, LessonStatus, SystemError, HomeworkLibraryItem, HomeworkAssignment, WeeklySlot, SlotInventory } from '../types';
+import { Lesson, Student, Teacher, Subscription, MonthlyBill, LessonStatus, HomeworkLibraryItem, HomeworkAssignment, WeeklySlot, SlotInventory, Entity, EntityPermission } from '../types';
 import { mockData } from './mockApi';
 import { AIRTABLE_CONFIG } from '../config/airtable';
 import { getChargesReport, createMonthlyCharges, CreateMonthlyChargesResult, discoverChargeTableSchema, ChargeTableSchema, getChargesReportKPIs, ChargesReportKPIs } from './billingService';
@@ -9,6 +9,7 @@ import { airtableClient } from './airtableClient';
 let cachedChargeSchema: ChargeTableSchema | null = null;
 import { getTableId, getField, isComputedField, filterComputedFields } from '../contracts/fieldMap';
 import { getWeeklySlots as getWeeklySlotsService, getSlotInventory as getSlotInventoryService, updateWeeklySlot as updateWeeklySlotService, updateSlotInventory as updateSlotInventoryService, createWeeklySlot as createWeeklySlotService, deleteWeeklySlot as deleteWeeklySlotService } from './slotManagementService';
+import { openNewWeek as openNewWeekService } from './weeklyRolloverService';
 
 // Use Vite's import.meta.env for client-side environment variables
 const API_BASE_URL = 'https://api.airtable.com/v0';
@@ -310,6 +311,12 @@ function mapAirtableToStudent(record: any): Student {
   const isActiveField = getField('students', 'is_active');
   const registrationDateField = getField('students', 'registration_date');
   const lastActivityField = getField('students', 'last_activity');
+  const totalWithVatField = getField('students', 'כולל_מעמ_ומנויים'); // כולל מע"מ ומנויים - formula field
+  
+  // DEBUG: Log balance field info for first few students
+  const rawBalance = fields[totalWithVatField];
+  const studentName = fields[fullNameField];
+  console.log(`[DEBUG Student Balance] ${studentName}: field="${totalWithVatField}", raw="${rawBalance}", type=${typeof rawBalance}`);
   
   return {
     id: record.id,
@@ -327,7 +334,7 @@ function mapAirtableToStudent(record: any): Student {
     lastActivity: fields[lastActivityField] || '',
     status: (fields['Status'] || (fields[isActiveField] ? 'active' : 'inactive')) as 'active' | 'on_hold' | 'inactive',
     subscriptionType: fields['Subscription_Type'] || fields['subscription_type'] || '',
-    balance: fields['Balance'] || fields['balance'] || 0,
+    balance: parseFloat(fields[totalWithVatField] || '0') || 0, // סכום כולל מע״מ ומנויים
     notes: fields['Notes'] || fields['notes'],
   };
 }
@@ -498,8 +505,24 @@ function mapAirtableToWeeklySlot(record: any, teachersMap: Map<string, string>):
   // Extract fixed status (checkbox - can be boolean, 0/1, or undefined)
   const isFixed = fields[fixedField] === true || fields[fixedField] === 1;
   
-  // Extract type
-  const type = (fields[typeField] || 'private') as 'private' | 'group' | 'pair';
+  // Extract type - NO FALLBACK, use actual value from Airtable
+  // Type values in Airtable are in Hebrew: "פרטי", "זוגי", "קבוצתי"
+  const rawTypeValue = fields[typeField];
+  // Map Hebrew values to English for internal use
+  let type: 'private' | 'group' | 'pair' | undefined;
+  if (rawTypeValue) {
+    const typeStr = String(rawTypeValue).trim();
+    if (typeStr === 'פרטי' || typeStr.toLowerCase() === 'private') {
+      type = 'private';
+    } else if (typeStr === 'קבוצתי' || typeStr.toLowerCase() === 'group') {
+      type = 'group';
+    } else if (typeStr === 'זוגי' || typeStr.toLowerCase() === 'pair') {
+      type = 'pair';
+    } else {
+      // Unknown value - keep as-is for debugging
+      type = rawTypeValue as any;
+    }
+  }
   
   return {
     id: record.id,
@@ -508,7 +531,7 @@ function mapAirtableToWeeklySlot(record: any, teachersMap: Map<string, string>):
     dayOfWeek: dayOfWeek,
     startTime: fields[startTimeField] || '',
     endTime: fields[endTimeField] || '',
-    type: type,
+    type: type || 'private', // Only fallback to 'private' if completely missing
     status: 'active', // Default to active (can be enhanced later if status field exists)
     isFixed: isFixed,
     reservedFor: reservedFor,
@@ -536,10 +559,31 @@ function mapAirtableToSlotInventory(record: any, teachersMap: Map<string, string
     : (typeof teacherIdValue === 'string' ? teacherIdValue : teacherIdValue?.id || '');
   
   // Extract status
-  const statusValue = fields[statusField] || 'open';
-  const status = (statusValue === 'booked' || statusValue === 'blocked' 
-    ? statusValue 
-    : 'open') as 'open' | 'booked' | 'blocked';
+  const rawStatusValue = fields[statusField] || 'open';
+  // Normalize status value: trim whitespace and handle both Hebrew and English
+  const statusValue = typeof rawStatusValue === 'string' ? rawStatusValue.trim() : String(rawStatusValue).trim();
+  // Map status values (Hebrew and English) to internal enum for consistency
+  // Hebrew: "פתוח" → 'open', "סגור" → 'booked' (for this function's return type)
+  // English: "open" → 'open', "closed"/"booked" → 'booked'
+  const status = (
+    statusValue === 'פתוח' || statusValue === 'open'
+      ? 'open'
+      : statusValue === 'סגור' || statusValue === 'closed' || statusValue === 'booked'
+      ? 'booked'
+      : statusValue === 'blocked'
+      ? 'blocked'
+      : 'open' // Default to 'open' for unknown values
+  ) as 'open' | 'booked' | 'blocked';
+  
+  // Extract lesson IDs from linked record field (for filtering slots with lessons)
+  const lessonsField = getField('slotInventory', 'lessons');
+  const lessonsVal = fields[lessonsField] || fields.lessons;
+  let lessonIds: string[] = [];
+  if (Array.isArray(lessonsVal)) {
+    lessonIds = lessonsVal.map((l: any) => typeof l === 'string' ? l : l.id).filter(Boolean);
+  } else if (lessonsVal) {
+    lessonIds = [typeof lessonsVal === 'string' ? lessonsVal : lessonsVal.id].filter(Boolean);
+  }
   
   return {
     id: record.id,
@@ -549,6 +593,7 @@ function mapAirtableToSlotInventory(record: any, teachersMap: Map<string, string
     startTime: fields[startTimeField] || '',
     endTime: fields[endTimeField] || '',
     status: status,
+    lessons: lessonIds, // Include linked lessons for filtering
   };
 }
 
@@ -571,6 +616,48 @@ async function getTeachersMap(): Promise<Map<string, string>> {
   } catch (error) {
     console.warn('[nexusApi] Failed to fetch teachers, using empty map:', error);
     return new Map();
+  }
+}
+
+/**
+ * Convert teacherId (number or record ID) to Airtable record ID
+ * If teacherId is already a record ID (starts with 'rec'), return it as-is
+ * If teacherId is a number (e.g., "1"), look up the teacher by teacher_id field and return record ID
+ */
+async function resolveTeacherRecordId(teacherId: string | undefined): Promise<string | undefined> {
+  if (!teacherId) {
+    return undefined;
+  }
+  
+  // If already a record ID, return as-is
+  if (teacherId.startsWith('rec')) {
+    return teacherId;
+  }
+  
+  // Otherwise, try to find teacher by teacher_id field
+  try {
+    const { airtableClient } = await import('./airtableClient');
+    const teachersTableId = getTableId('teachers');
+    const teacherIdField = getField('teachers', 'teacher_id');
+    
+    // Try to find by teacher_id (can be number or string)
+    const records = await airtableClient.getRecords<{ teacher_id?: string | number }>(
+      teachersTableId,
+      {
+        filterByFormula: `OR({${teacherIdField}} = ${teacherId}, {${teacherIdField}} = "${teacherId}")`,
+        maxRecords: 1,
+      }
+    );
+    
+    if (records.length > 0) {
+      return records[0].id;
+    }
+    
+    // If not found, return undefined (will check all teachers)
+    return undefined;
+  } catch (error) {
+    console.warn(`[resolveTeacherRecordId] Failed to resolve teacherId "${teacherId}":`, error);
+    return undefined;
   }
 }
 
@@ -658,6 +745,86 @@ export const nexusApi = {
     );
 
     return mapAirtableToStudent({ id: response.id || id, fields: response.fields });
+  },
+
+  createStudent: async (student: Partial<Student>): Promise<Student> => {
+    console.log('[createStudent] Entry - received student data:', student);
+    
+    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
+      console.error('[createStudent] Missing API Key or Base ID');
+      throw new Error('Airtable API Key or Base ID not configured');
+    }
+
+    // Validate required fields
+    if (!student.name || !student.phone) {
+      console.error('[createStudent] Missing required fields - name:', student.name, 'phone:', student.phone);
+      throw { 
+        message: 'חובה למלא שם וטלפון', 
+        code: 'VALIDATION_ERROR', 
+        status: 400 
+      };
+    }
+
+    console.log('[createStudent] Creating new student:', student.name);
+
+    // Build Airtable fields
+    const airtableFields: any = { fields: {} };
+    
+    // Required fields
+    airtableFields.fields[getField('students', 'full_name')] = student.name;
+    airtableFields.fields[getField('students', 'phone_number')] = student.phone;
+    
+    // Optional fields
+    if (student.parentName) {
+      airtableFields.fields[getField('students', 'parent_name')] = student.parentName;
+    }
+    if (student.parentPhone) {
+      airtableFields.fields[getField('students', 'parent_phone')] = student.parentPhone;
+    }
+    // Note: Email field removed - doesn't exist in Airtable students table
+    if (student.grade) {
+      airtableFields.fields[getField('students', 'grade_level')] = student.grade;
+    }
+    if (student.subjectFocus) {
+      // Handle multiple select - can be comma-separated string or array
+      const subjects = typeof student.subjectFocus === 'string' 
+        ? student.subjectFocus.split(',').map(s => s.trim()).filter(Boolean)
+        : student.subjectFocus;
+      airtableFields.fields[getField('students', 'subject_focus')] = subjects;
+    }
+    if (student.level) {
+      airtableFields.fields[getField('students', 'level')] = student.level;
+    }
+    if (student.weeklyLessonsLimit !== undefined) {
+      airtableFields.fields[getField('students', 'weekly_lessons_limit')] = student.weeklyLessonsLimit;
+    }
+    if (student.paymentStatus) {
+      airtableFields.fields[getField('students', 'payment_status')] = student.paymentStatus;
+    }
+    if (student.notes) {
+      airtableFields.fields[getField('students', 'notes' as any)] = student.notes;
+    }
+    
+    // Default values for new students
+    airtableFields.fields[getField('students', 'is_active')] = true;
+    airtableFields.fields[getField('students', 'registration_date')] = new Date().toISOString().split('T')[0];
+
+    // Create record in Airtable
+    const studentsTableId = getTableId('students');
+    console.log('[createStudent] Table ID:', studentsTableId);
+    console.log('[createStudent] Request body:', JSON.stringify(airtableFields, null, 2));
+    
+    const response = await airtableRequest<{ id: string; fields: any }>(
+      `/${studentsTableId}`,
+      {
+        method: 'POST',
+        body: JSON.stringify(airtableFields),
+      }
+    );
+
+    console.log('[createStudent] Successfully created student:', response.id);
+    console.log('[createStudent] Response fields:', response.fields);
+    return mapAirtableToStudent({ id: response.id, fields: response.fields });
   },
 
   getLessons: async (start: string, end: string, teacherId?: string): Promise<Lesson[]> => {
@@ -956,14 +1123,53 @@ export const nexusApi = {
         }
       }
       
-      // Extract reserved_for (linked record)
+      // Extract reserved_for (linked record) - can be single or multiple
       const reservedForField = getField('weeklySlot', 'reserved_for');
       const reservedForValue = fields[reservedForField];
-      const reservedFor = reservedForValue
-        ? (Array.isArray(reservedForValue) 
-            ? (typeof reservedForValue[0] === 'string' ? reservedForValue[0] : reservedForValue[0]?.id || undefined)
-            : (typeof reservedForValue === 'string' ? reservedForValue : reservedForValue?.id || undefined))
-        : undefined;
+      
+      // Extract reservedForIds array
+      let reservedForIds: string[] = [];
+      if (reservedForValue) {
+        if (Array.isArray(reservedForValue)) {
+          reservedForIds = reservedForValue
+            .map(item => typeof item === 'string' ? item : (item?.id || ''))
+            .filter(id => id && id.startsWith('rec'));
+        } else if (typeof reservedForValue === 'string' && reservedForValue.startsWith('rec')) {
+          reservedForIds = [reservedForValue];
+        } else if (reservedForValue?.id && reservedForValue.id.startsWith('rec')) {
+          reservedForIds = [reservedForValue.id];
+        }
+      }
+      
+      // Backward compatibility: single reservedFor
+      const reservedFor = reservedForIds.length > 0 ? reservedForIds[0] : undefined;
+      
+      // Extract lookup field "full_name (from reserved_for)" - try multiple possible field names
+      let reservedForNames: string[] = [];
+      const lookupFieldNames = [
+        'full_name (from reserved_for)',
+        'full_name (from reserved_for)',
+        'Full Name (from reserved_for)',
+        'שם מלא (from reserved_for)',
+      ];
+      
+      for (const lookupFieldName of lookupFieldNames) {
+        const lookupValue = fields[lookupFieldName];
+        if (lookupValue) {
+          if (Array.isArray(lookupValue)) {
+            reservedForNames = lookupValue
+              .map(item => {
+                if (typeof item === 'string') return item.trim();
+                if (item && typeof item === 'object' && 'name' in item) return String(item.name).trim();
+                return '';
+              })
+              .filter(name => name.length > 0);
+          } else if (typeof lookupValue === 'string') {
+            reservedForNames = [lookupValue.trim()].filter(name => name.length > 0);
+          }
+          if (reservedForNames.length > 0) break;
+        }
+      }
       
       // Extract קבוע (fixed checkbox)
       const fixedField = getField('weeklySlot', 'קבוע' as any);
@@ -978,9 +1184,30 @@ export const nexusApi = {
             : (typeof overlapWithValue === 'string' ? overlapWithValue : overlapWithValue?.id || undefined))
         : undefined;
       
-      // Extract type
+      // Extract type - NO FALLBACK, use actual value from Airtable
+      // Type values in Airtable are in Hebrew: "פרטי", "זוגי", "קבוצתי"
       const typeField = getField('weeklySlot', 'type');
-      const type = (fields[typeField] || 'private') as 'private' | 'group' | 'pair';
+      const rawTypeValue = fields[typeField];
+      // Map Hebrew values to English for internal use
+      let type: 'private' | 'group' | 'pair' | undefined;
+      if (rawTypeValue) {
+        const typeStr = String(rawTypeValue).trim();
+        if (typeStr === 'פרטי' || typeStr.toLowerCase() === 'private') {
+          type = 'private';
+        } else if (typeStr === 'קבוצתי' || typeStr.toLowerCase() === 'group') {
+          type = 'group';
+        } else if (typeStr === 'זוגי' || typeStr.toLowerCase() === 'pair') {
+          type = 'pair';
+        } else {
+          // Unknown value - keep as-is for debugging
+          type = rawTypeValue as any;
+        }
+      }
+      
+      // DEBUG LOG: Show type mapping (temporary, remove before commit)
+      if (import.meta.env.DEV && recordIndex < 10) {
+        console.log(`[DEBUG getWeeklySlots] Slot ${record.id.substring(0, 8)}: type="${rawTypeValue}" → mapped="${type}", reserved_for_count=${reservedForIds.length}`);
+      }
       
       return {
         id: record.id,
@@ -989,10 +1216,12 @@ export const nexusApi = {
         endTime: fields[getField('weeklySlot', 'end_time')] || '',
         teacherId: teacherId || '',
         teacherName: teachersMap.get(teacherId || '') || '',
-        type: type,
+        type: type || 'private', // Only fallback to 'private' if completely missing
         durationMin: fields[getField('weeklySlot', 'duration_min')],
         isFixed: isFixed,
-        reservedFor: reservedFor,
+        reservedFor: reservedFor, // Backward compatibility
+        reservedForIds: reservedForIds.length > 0 ? reservedForIds : undefined,
+        reservedForNames: reservedForNames.length > 0 ? reservedForNames : undefined,
         isReserved: fields[getField('weeklySlot', 'is_reserved')] === true || fields[getField('weeklySlot', 'is_reserved')] === 1,
         hasOverlap: fields[getField('weeklySlot', 'has_overlap')] === true || fields[getField('weeklySlot', 'has_overlap')] === 1,
         overlapWith: overlapWith,
@@ -1106,6 +1335,9 @@ export const nexusApi = {
       const escapedTeacherId = escapeAirtableString(teacherId);
       filterFormula = `AND(${filterFormula}, FIND("${escapedTeacherId}", ARRAYJOIN({${teacherIdField}})) > 0)`;
     }
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1164',message:'getSlotInventory: filter formula',data:{start,end,startDate,endDate,teacherId,filterFormula,dateField},timestamp:Date.now(),sessionId:'debug-session',runId:'run3',hypothesisId:'C'})}).catch(()=>{});
+    // #endregion
     
     // Fetch all records with pagination, sorted by date then start time
     const params: Record<string, string | undefined> = {
@@ -1117,9 +1349,90 @@ export const nexusApi = {
       'sort[1][direction]': 'asc',
     };
     const records = await listAllAirtableRecords(tableId, params);
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1181',message:'getSlotInventory: fetched records',data:{recordsCount:records.length,requestedStartDate:startDate,requestedEndDate:endDate,teacherId,sampleDates:records.slice(0,5).map(r=>r.fields[dateField])},timestamp:Date.now(),sessionId:'debug-session',runId:'run3',hypothesisId:'C'})}).catch(()=>{});
+    // #endregion
     
-    // Map Airtable records to SlotInventory objects
-    const inventory = records.map(record => {
+    // PART 1: DEV logging to PROVE duplicates source
+    if (import.meta.env?.DEV) {
+      const recordIds = records.map(r => r.id);
+      const uniqueIds = new Set(recordIds);
+      const duplicateById = recordIds.length !== uniqueIds.size;
+      
+      // Log raw Airtable records
+      console.log(`[getSlotInventory] PART 1 - Raw fetch analysis:`);
+      console.log(`  Total raw Airtable records: ${records.length}`);
+      console.log(`  Unique record.id count: ${uniqueIds.size}`);
+      console.log(`  First 10 record IDs:`, recordIds.slice(0, 10));
+      
+      if (duplicateById) {
+        const duplicates = recordIds.filter((id, idx) => recordIds.indexOf(id) !== idx);
+        console.warn(`  ⚠️ DUPLICATE record.id detected: ${duplicates.length} duplicates`);
+        console.warn(`  Duplicate IDs:`, duplicates.slice(0, 10));
+      }
+      
+      // Check duplicates by natural_key
+      const naturalKeys = records.map(r => r.fields?.natural_key || '');
+      const naturalKeyMap = new Map<string, string[]>();
+      naturalKeys.forEach((key, idx) => {
+        if (key) {
+          if (!naturalKeyMap.has(key)) {
+            naturalKeyMap.set(key, []);
+          }
+          naturalKeyMap.get(key)!.push(records[idx].id);
+        }
+      });
+      const duplicateByNaturalKey = Array.from(naturalKeyMap.entries())
+        .filter(([_, ids]) => ids.length > 1);
+      
+      if (duplicateByNaturalKey.length > 0) {
+        console.warn(`  ⚠️ DUPLICATE natural_key detected: ${duplicateByNaturalKey.length} keys with duplicates`);
+        duplicateByNaturalKey.slice(0, 5).forEach(([key, ids]) => {
+          console.warn(`    natural_key "${key}": ${ids.length} records (${ids.slice(0, 3).join(', ')}...)`);
+        });
+      }
+      
+      // Check duplicates by composite key
+      const compositeKeys = records.map(r => {
+        const fields = r.fields || {};
+        const date = fields[dateField] || '';
+        const startTime = fields[startTimeField] || '';
+        const endTime = fields[getField('slotInventory', 'שעת_סיום')] || '';
+        const teacherIdValue = fields[teacherIdField];
+        const extractedTeacherId = Array.isArray(teacherIdValue) 
+          ? (typeof teacherIdValue[0] === 'string' ? teacherIdValue[0] : teacherIdValue[0]?.id || '')
+          : (typeof teacherIdValue === 'string' ? teacherIdValue : teacherIdValue?.id || '');
+        return `${date}|${startTime}|${endTime}|${extractedTeacherId || 'none'}`;
+      });
+      const compositeKeyMap = new Map<string, string[]>();
+      compositeKeys.forEach((key, idx) => {
+        if (!compositeKeyMap.has(key)) {
+          compositeKeyMap.set(key, []);
+        }
+        compositeKeyMap.get(key)!.push(records[idx].id);
+      });
+      const duplicateByCompositeKey = Array.from(compositeKeyMap.entries())
+        .filter(([_, ids]) => ids.length > 1);
+      
+      if (duplicateByCompositeKey.length > 0) {
+        console.warn(`  ⚠️ DUPLICATE composite key detected: ${duplicateByCompositeKey.length} keys with duplicates`);
+        duplicateByCompositeKey.slice(0, 5).forEach(([key, ids]) => {
+          console.warn(`    composite "${key}": ${ids.length} records (${ids.slice(0, 3).join(', ')}...)`);
+        });
+      }
+      
+      // Summary
+      console.log(`[getSlotInventory] PART 1 Summary:`);
+      console.log(`  Duplicates by record.id: ${duplicateById ? 'YES' : 'NO'}`);
+      console.log(`  Duplicates by natural_key: ${duplicateByNaturalKey.length > 0 ? `YES (${duplicateByNaturalKey.length} keys)` : 'NO'}`);
+      console.log(`  Duplicates by composite key: ${duplicateByCompositeKey.length > 0 ? `YES (${duplicateByCompositeKey.length} keys)` : 'NO'}`);
+    }
+    
+    // Keep records as-is for now (will dedupe in Part 2)
+    const deduplicatedRecords = records;
+    
+    // Map Airtable records to SlotInventory objects (before dedupe)
+    const mappedInventory = deduplicatedRecords.map(record => {
       const fields = record.fields || {};
       
       // Extract teacher ID from linked record array
@@ -1148,13 +1461,26 @@ export const nexusApi = {
       
       // Extract status
       const statusField = getField('slotInventory', 'סטטוס');
-      const statusValue = fields[statusField] || 'open';
-      // Map 'booked' or 'סגור' to 'closed' for internal consistency with types.ts
-      const status = (statusValue === 'booked' || statusValue === 'closed' || statusValue === 'סגור'
-        ? 'closed' 
-        : statusValue === 'blocked' || statusValue === 'canceled' || statusValue === 'מבוטל'
-        ? 'canceled'
-        : 'open') as 'open' | 'closed' | 'canceled';
+      const rawStatusValue = fields[statusField] || 'open';
+      // Normalize status value: trim whitespace and handle both Hebrew and English
+      const statusValue = typeof rawStatusValue === 'string' ? rawStatusValue.trim() : String(rawStatusValue).trim();
+      // Map status values (Hebrew and English) to internal enum for consistency
+      // Hebrew: "פתוח" → 'open', "סגור" → 'closed', "חסום ע"י מנהל" → 'blocked', "מבוטל" → 'canceled'
+      // English: "open" → 'open', "closed"/"booked" → 'closed', "blocked" → 'blocked', "canceled" → 'canceled'
+      const status = (
+        statusValue === 'פתוח' || statusValue === 'open'
+          ? 'open'
+          : statusValue === 'סגור' || statusValue === 'closed' || statusValue === 'booked'
+          ? 'closed'
+          : statusValue === 'חסום ע"י מנהל' || statusValue === 'חסום' || statusValue === 'blocked'
+          ? 'blocked'
+          : statusValue === 'מבוטל' || statusValue === 'canceled'
+          ? 'canceled'
+          : 'open' // Default to 'open' for unknown values
+      ) as 'open' | 'closed' | 'canceled' | 'blocked';
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1180',message:'getSlotInventory: status mapping',data:{recordId:record.id,rawStatusValue:statusValue,mappedStatus:status,statusField},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+      // #endregion
       
       const occupied = fields[getField('slotInventory', 'תפוסה_נוכחית' as any)] as number || 0;
       const capacity = fields[getField('slotInventory', 'קיבולת_כוללת' as any)] as number || 1;
@@ -1165,6 +1491,17 @@ export const nexusApi = {
       let studentIds: string[] = [];
       if (Array.isArray(studentVal)) {
         studentIds = studentVal.map((s: any) => typeof s === 'string' ? s : s.id).filter(Boolean);
+      }
+
+      // Extract lesson IDs from linked record field (for filtering slots with lessons)
+      const lessonsField = getField('slotInventory', 'lessons');
+      const lessonsVal = fields[lessonsField] || fields.lessons;
+      let lessonIds: string[] = [];
+      if (Array.isArray(lessonsVal)) {
+        lessonIds = lessonsVal.map((l: any) => typeof l === 'string' ? l : l.id).filter(Boolean);
+      } else if (lessonsVal) {
+        // Handle single linked record (shouldn't happen but be safe)
+        lessonIds = [typeof lessonsVal === 'string' ? lessonsVal : lessonsVal.id].filter(Boolean);
       }
 
       return {
@@ -1182,6 +1519,7 @@ export const nexusApi = {
         occupied,
         capacityOptional: capacity,
         students: studentIds,
+        lessons: lessonIds, // Include linked lessons for filtering
         dayOfWeek: fields.day_of_week,
         startDT: fields.StartDT,
         endDT: fields.EndDT,
@@ -1202,8 +1540,105 @@ export const nexusApi = {
       };
     });
     
-    console.log(`[nexusApi] Fetched ${inventory.length} slot inventory records from ${records.length} records`);
-    return inventory as SlotInventory[];
+    // PART 2: Deterministic deduplication by natural_key or composite key
+    // Status priority: blocked > closed > open > canceled
+    const statusPriority: Record<string, number> = {
+      'blocked': 4,
+      'closed': 3,
+      'open': 2,
+      'canceled': 1,
+    };
+    
+    // Helper to get dedupe key for a slot
+    const getDedupeKey = (slot: SlotInventory & { naturalKey?: string }): string => {
+      if (slot.naturalKey && slot.naturalKey.trim() !== '') {
+        return `natural_key:${slot.naturalKey}`;
+      }
+      const teacherId = slot.teacherId || 'none';
+      return `composite:${slot.date}|${slot.startTime}|${slot.endTime}|${teacherId}`;
+    };
+    
+    // Helper to select winner between two slots
+    const selectWinner = (
+      slot1: SlotInventory & { naturalKey?: string; lessons?: string[]; students?: string[] },
+      slot2: SlotInventory & { naturalKey?: string; lessons?: string[]; students?: string[] }
+    ): SlotInventory & { naturalKey?: string } => {
+      // 1. Prefer by status priority
+      const priority1 = statusPriority[slot1.status] || 0;
+      const priority2 = statusPriority[slot2.status] || 0;
+      if (priority1 !== priority2) {
+        return priority1 > priority2 ? slot1 : slot2;
+      }
+      
+      // 2. If same status, prefer record with linked lessons or students
+      const hasLinks1 = (slot1.lessons && slot1.lessons.length > 0) || (slot1.students && slot1.students.length > 0);
+      const hasLinks2 = (slot2.lessons && slot2.lessons.length > 0) || (slot2.students && slot2.students.length > 0);
+      if (hasLinks1 !== hasLinks2) {
+        return hasLinks1 ? slot1 : slot2;
+      }
+      
+      // 3. If still tie, prefer most recently created (by id lexicographically - Airtable IDs are time-ordered)
+      return slot1.id > slot2.id ? slot1 : slot2;
+    };
+    
+    // Dedupe by key
+    const dedupeMap = new Map<string, SlotInventory & { naturalKey?: string }>();
+    const beforeCount = mappedInventory.length;
+    
+    for (const slot of mappedInventory) {
+      const key = getDedupeKey(slot);
+      const existing = dedupeMap.get(key);
+      
+      if (!existing) {
+        dedupeMap.set(key, slot);
+      } else {
+        // Select winner deterministically
+        const winner = selectWinner(existing, slot);
+        dedupeMap.set(key, winner);
+        
+        if (import.meta.env?.DEV) {
+          const loser = winner.id === existing.id ? slot : existing;
+          console.log(`[getSlotInventory] PART 2 - Dedupe: key "${key}" had ${existing.id === winner.id ? 'existing' : 'new'} winner (${winner.id}), removed ${loser.id}`);
+        }
+      }
+    }
+    
+    const deduplicatedInventory = Array.from(dedupeMap.values());
+    const afterCount = deduplicatedInventory.length;
+    
+    // DEV: Log deduplication results
+    if (import.meta.env?.DEV) {
+      console.log(`[getSlotInventory] PART 2 - Deduplication results:`);
+      console.log(`  Before: ${beforeCount} slots`);
+      console.log(`  After: ${afterCount} slots`);
+      console.log(`  Removed: ${beforeCount - afterCount} duplicates`);
+      
+      if (beforeCount !== afterCount) {
+        // Show which keys had duplicates
+        const keyCounts = new Map<string, number>();
+        mappedInventory.forEach(slot => {
+          const key = getDedupeKey(slot);
+          keyCounts.set(key, (keyCounts.get(key) || 0) + 1);
+        });
+        const duplicateKeys = Array.from(keyCounts.entries()).filter(([_, count]) => count > 1);
+        if (duplicateKeys.length > 0) {
+          console.log(`  Duplicate keys found: ${duplicateKeys.length}`);
+          duplicateKeys.slice(0, 5).forEach(([key, count]) => {
+            console.log(`    "${key}": ${count} records`);
+          });
+        }
+      }
+    }
+    
+    // Sort deterministically: by date, then startTime
+    deduplicatedInventory.sort((a, b) => {
+      const dateCompare = a.date.localeCompare(b.date);
+      if (dateCompare !== 0) return dateCompare;
+      return a.startTime.localeCompare(b.startTime);
+    });
+    
+    console.log(`[nexusApi] Fetched ${deduplicatedInventory.length} slot inventory records (from ${records.length} raw records)`);
+    return deduplicatedInventory as SlotInventory[];
   },
 
   updateWeeklySlot: async (id: string, updates: Partial<WeeklySlot>): Promise<WeeklySlot> => {
@@ -1236,17 +1671,30 @@ export const nexusApi = {
       fields[getField('weeklySlot', 'end_time')] = updates.endTime;
     }
     if (updates.type !== undefined) {
-      fields[getField('weeklySlot', 'type')] = updates.type;
+      // Map English type values to Hebrew for Airtable
+      const typeMap: Record<'private' | 'group' | 'pair', string> = {
+        'private': 'פרטי',
+        'group': 'קבוצתי',
+        'pair': 'זוגי',
+      };
+      fields[getField('weeklySlot', 'type')] = typeMap[updates.type] || updates.type;
     }
     if (updates.durationMin !== undefined) {
       fields[getField('weeklySlot', 'duration_min')] = updates.durationMin;
     }
     if (updates.isFixed !== undefined) {
-      fields[getField('weeklySlot', 'קבוע' as any)] = updates.isFixed ? 1 : 0;
+      fields[getField('weeklySlot', 'קבוע' as any)] = updates.isFixed ? true : false;
     }
     if (updates.reservedFor !== undefined) {
       // Handle link field: array of record IDs, or empty array to clear
       fields[getField('weeklySlot', 'reserved_for')] = updates.reservedFor ? [updates.reservedFor] : [];
+    }
+    // Handle reservedForIds (array of student IDs)
+    if (updates.reservedForIds !== undefined) {
+      const reservedForField = getField('weeklySlot', 'reserved_for');
+      fields[reservedForField] = Array.isArray(updates.reservedForIds) && updates.reservedForIds.length > 0
+        ? updates.reservedForIds
+        : [];
     }
     // Handle additional fields that might be in updates (even if not in WeeklySlot interface)
     if ((updates as any).isReserved !== undefined) {
@@ -1315,8 +1763,26 @@ export const nexusApi = {
     const fixedField = getField('weeklySlot', 'קבוע' as any);
     const isFixed = responseFields[fixedField] === true || responseFields[fixedField] === 1;
     
+    // Extract type - NO FALLBACK, use actual value from Airtable
+    // Type values in Airtable are in Hebrew: "פרטי", "זוגי", "קבוצתי"
     const typeField = getField('weeklySlot', 'type');
-    const type = (responseFields[typeField] || 'private') as 'private' | 'group' | 'pair';
+    const rawTypeValue = responseFields[typeField];
+    // Map Hebrew values to English for internal use
+    let type: 'private' | 'group' | 'pair' | undefined;
+    if (rawTypeValue) {
+      const typeStr = String(rawTypeValue).trim();
+      if (typeStr === 'פרטי' || typeStr.toLowerCase() === 'private') {
+        type = 'private';
+      } else if (typeStr === 'קבוצתי' || typeStr.toLowerCase() === 'group') {
+        type = 'group';
+      } else if (typeStr === 'זוגי' || typeStr.toLowerCase() === 'pair') {
+        type = 'pair';
+      } else {
+        // Unknown value - keep as-is for debugging
+        type = rawTypeValue as any;
+      }
+    }
+    const finalType = type || 'private'; // Only fallback to 'private' if completely missing
     
     const updatedSlot: WeeklySlot = {
       id: response.id || id,
@@ -1325,7 +1791,7 @@ export const nexusApi = {
       endTime: responseFields[getField('weeklySlot', 'end_time')] || '',
       teacherId: teacherId || '',
       teacherName: teachersMap.get(teacherId || '') || '',
-      type: type,
+      type: finalType as 'private' | 'group' | 'pair',
       durationMin: responseFields[getField('weeklySlot', 'duration_min')],
       isFixed: isFixed,
       reservedFor: reservedFor,
@@ -1441,6 +1907,69 @@ export const nexusApi = {
       let statusValue = updates.status as string;
       if (statusValue === 'closed') statusValue = 'סגור';
       if (statusValue === 'canceled') statusValue = 'מבוטל';
+      if (statusValue === 'blocked') statusValue = 'חסום ע"י מנהל';
+      
+      // DATA LAYER: Prevent opening slot if lessons overlap
+      // If trying to set status to "open", check for overlapping lessons first
+      if (statusValue === 'open' || statusValue === 'פתוח') {
+        try {
+          // Fetch current slot to get date/time/teacher if not in updates
+          const currentSlot = await (async () => {
+            const currentRecord = await airtableRequest<{ id: string; fields: any }>(`/${tableId}/${id}`);
+            const currentFields = currentRecord.fields || {};
+            const currentTeacherIdValue = currentFields[teacherIdField];
+            const currentTeacherId = Array.isArray(currentTeacherIdValue) 
+              ? (typeof currentTeacherIdValue[0] === 'string' ? currentTeacherIdValue[0] : currentTeacherIdValue[0]?.id || '')
+              : (typeof currentTeacherIdValue === 'string' ? currentTeacherIdValue : currentTeacherIdValue?.id || '');
+            
+            return {
+              teacherId: currentTeacherId,
+              date: currentFields[getField('slotInventory', 'תאריך_שיעור')] || '',
+              startTime: currentFields[getField('slotInventory', 'שעת_התחלה')] || '',
+              endTime: currentFields[getField('slotInventory', 'שעת_סיום')] || '',
+            };
+          })();
+
+          const slotTeacherId = updates.teacherId || currentSlot.teacherId;
+          const slotDate = updates.date || currentSlot.date;
+          const slotStartTime = updates.startTime || currentSlot.startTime;
+          const slotEndTime = updates.endTime || currentSlot.endTime;
+
+          if (slotTeacherId && slotDate && slotStartTime && slotEndTime) {
+            const { preventSlotOpeningIfLessonsOverlap } = await import('./conflictValidationService');
+            const { canOpen, conflictingLessons } = await preventSlotOpeningIfLessonsOverlap(
+              slotTeacherId,
+              slotDate,
+              slotStartTime,
+              slotEndTime,
+              id
+            );
+
+            if (!canOpen) {
+              // Prevent opening - set status to "closed" instead
+              statusValue = 'סגור';
+              if (import.meta.env.DEV) {
+                console.warn(`[updateSlotInventory] Cannot open slot ${id} - ${conflictingLessons.length} overlapping lesson(s) found. Setting status to "סגור" instead.`);
+              }
+              // Throw error to inform UI
+              throw {
+                message: `לא ניתן לפתוח חלון - יש ${conflictingLessons.length} שיעור${conflictingLessons.length > 1 ? 'ים' : ''} חופף${conflictingLessons.length > 1 ? 'ים' : ''} בזמן זה`,
+                code: 'CONFLICT_ERROR',
+                status: 409,
+                conflicts: conflictingLessons,
+              };
+            }
+          }
+        } catch (preventError: any) {
+          // If it's our conflict error, re-throw it
+          if (preventError.code === 'CONFLICT_ERROR') {
+            throw preventError;
+          }
+          // Otherwise log and continue (don't fail the update)
+          console.warn(`[updateSlotInventory] Failed to check for lesson overlaps:`, preventError);
+        }
+      }
+      
       fields[getField('slotInventory', 'סטטוס')] = statusValue;
     }
     if ((updates as any).isLocked !== undefined) {
@@ -1450,6 +1979,12 @@ export const nexusApi = {
     // Update record in Airtable
     // Use typecast: true to allow Airtable to automatically add new options to Single Select fields
     // This enables adding new time values like "18:05" to the select field options
+    const requestBody = { 
+      fields,
+      typecast: true // Enable automatic option creation for Single Select fields
+    };
+    const requestBodyString = JSON.stringify(requestBody);
+    
     let response: { id: string; fields: any };
     try {
       response = await airtableRequest<{ id: string; fields: any }>(
@@ -1517,9 +2052,28 @@ export const nexusApi = {
     const dateField = getField('slotInventory', 'תאריך_שיעור');
     const statusField = getField('slotInventory', 'סטטוס');
     const statusValue = responseFields[statusField] || 'open';
-    const status = (statusValue === 'booked' || statusValue === 'blocked' 
-      ? statusValue 
-      : 'open') as 'open' | 'booked' | 'blocked';
+    // Normalize status: handle Hebrew values and map to internal enum
+    const status = (
+      statusValue === 'open' || statusValue === 'פתוח'
+        ? 'open'
+        : statusValue === 'closed' || statusValue === 'סגור' || statusValue === 'booked'
+        ? 'closed'
+        : statusValue === 'canceled' || statusValue === 'מבוטל'
+        ? 'canceled'
+        : statusValue === 'blocked' || statusValue === 'חסום ע"י מנהל' || statusValue === 'חסום'
+        ? 'blocked'
+        : 'open' // Default to 'open' for unknown values
+    ) as 'open' | 'closed' | 'canceled' | 'blocked';
+    
+    // Extract lesson IDs from linked record field
+    const lessonsField = getField('slotInventory', 'lessons');
+    const lessonsVal = responseFields[lessonsField] || responseFields.lessons;
+    let lessonIds: string[] = [];
+    if (Array.isArray(lessonsVal)) {
+      lessonIds = lessonsVal.map((l: any) => typeof l === 'string' ? l : l.id).filter(Boolean);
+    } else if (lessonsVal) {
+      lessonIds = [typeof lessonsVal === 'string' ? lessonsVal : lessonsVal.id].filter(Boolean);
+    }
     
     const updatedInventory: SlotInventory = {
       id: response.id || id,
@@ -1529,6 +2083,7 @@ export const nexusApi = {
       startTime: responseFields[getField('slotInventory', 'שעת_התחלה')] || '',
       endTime: responseFields[getField('slotInventory', 'שעת_סיום')] || '',
       status: status,
+      lessons: lessonIds, // Include linked lessons for filtering
     };
     
     console.log(`[nexusApi] Updated slot inventory ${id}`);
@@ -1565,12 +2120,26 @@ export const nexusApi = {
       type: slot.type,
       isFixed: slot.isFixed,
       reservedFor: slot.reservedFor,
+      reservedForIds: slot.reservedForIds,
       durationMin: slot.durationMin,
     });
   },
 
   deleteWeeklySlot: async (id: string): Promise<void> => {
     return deleteWeeklySlotService(id);
+  },
+
+  /**
+   * Open a week - create slot inventory and fixed lessons from weekly_slot templates
+   * @param weekStart - The start date of the week (Sunday)
+   * @returns Object with counts of created slots and lessons
+   */
+  openWeekSlots: async (weekStart: Date): Promise<{
+    slotInventoryCount: number;
+    fixedLessonsCount: number;
+  }> => {
+    console.log(`[nexusApi] openWeekSlots called for week starting ${weekStart.toISOString()}`);
+    return openNewWeekService(weekStart);
   },
 
   getHomeworkLibrary: async (): Promise<HomeworkLibraryItem[]> => {
@@ -1615,15 +2184,76 @@ export const nexusApi = {
     } as HomeworkAssignment);
   },
 
-  getSystemErrors: (): Promise<SystemError[]> => {
-    // Use mock data only
-    return mockData.getSystemErrors();
-  },
-
   updateLesson: async (id: string, updates: Partial<Lesson>): Promise<Lesson> => {
     // Update in Airtable - no fallback
     if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
       throw new Error('Airtable API Key or Base ID not configured');
+    }
+
+    // PREVENT DUPLICATES: Check for overlapping open slots BEFORE updating lesson
+    // This prevents duplicate windows (open slot + lesson for same time)
+    if (updates.date && updates.startTime && (updates.duration || updates.teacherId)) {
+      try {
+        // Fetch current lesson to get teacherId if not in updates
+        const currentLesson = await (async () => {
+          const lessonsTableId = getTableId('lessons');
+          const record = await airtableRequest<{ id: string; fields: any }>(`/${lessonsTableId}/${id}`);
+          return mapAirtableToLesson({ id: record.id, fields: record.fields });
+        })();
+
+        const teacherId = updates.teacherId || currentLesson.teacherId;
+        const duration = updates.duration || currentLesson.duration || 60;
+
+        if (teacherId && updates.date && updates.startTime) {
+          // Check for overlapping open slots first
+          const { validateConflicts } = await import('./conflictValidationService');
+          const validationResult = await validateConflicts({
+            teacherId: teacherId,
+            date: updates.date,
+            startTime: updates.startTime,
+            endTime: duration, // duration in minutes
+            excludeLessonId: id, // Exclude current lesson from conflict check
+          });
+
+          // If there are overlapping open slots, prevent lesson update
+          if (validationResult.conflicts.openSlots.length > 0) {
+            const slotDetails = validationResult.conflicts.openSlots.map(s => 
+              `${s.date} ${s.startTime}-${s.endTime}`
+            ).join(', ');
+            
+            const conflictError: any = {
+              message: `לא ניתן לעדכן שיעור - יש חלון פתוח חופף בזמן זה: ${slotDetails}. אנא סגור את החלון הפתוח תחילה או בחר זמן אחר.`,
+              code: 'CONFLICT_ERROR',
+              status: 409,
+              conflicts: {
+                lessons: [],
+                openSlots: validationResult.conflicts.openSlots,
+              },
+            };
+            throw conflictError;
+          }
+
+          // Auto-close overlapping open slots (should be empty after check above, but keep for safety)
+          const { autoCloseOverlappingSlots } = await import('./conflictValidationService');
+          const closedSlots = await autoCloseOverlappingSlots(
+            teacherId,
+            updates.date,
+            updates.startTime,
+            duration,
+            id // Link lesson to closed slots
+          );
+          if (closedSlots.length > 0 && import.meta.env.DEV) {
+            console.log(`[updateLesson] Auto-closed ${closedSlots.length} overlapping open slot(s)`);
+          }
+        }
+      } catch (conflictError: any) {
+        // Re-throw conflict errors (they should prevent lesson update)
+        if (conflictError.code === 'CONFLICT_ERROR') {
+          throw conflictError;
+        }
+        // Log but don't fail lesson update if other errors occur
+        console.warn(`[updateLesson] Failed to check/close overlapping slots:`, conflictError);
+      }
     }
 
     const airtableFields = mapLessonToAirtable(updates);
@@ -2214,6 +2844,30 @@ export const nexusApi = {
     }
   },
 
+  getStudentByRecordId: async (recordId: string): Promise<Student | null> => {
+    if (!recordId || !recordId.startsWith('rec')) return null;
+    
+    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
+      throw new Error('Airtable API Key or Base ID not configured');
+    }
+
+    try {
+      const studentsTableId = getTableId('students');
+      const response = await airtableRequest<{ id: string; fields: any }>(`/${studentsTableId}/${recordId}`);
+      
+      if (import.meta.env.DEV) {
+        console.log('[nexusApi.getStudentByRecordId] Fetched student:', recordId, response.fields?.[getField('students', 'full_name')]);
+      }
+      
+      return mapAirtableToStudent(response);
+    } catch (err: any) {
+      if (import.meta.env.DEV) {
+        console.error('[nexusApi.getStudentByRecordId] Failed to fetch student:', recordId, err);
+      }
+      return null;
+    }
+  },
+
   // Check for lesson conflicts (overlaps)
   checkLessonConflicts: async (
     startDatetime: string,
@@ -2296,6 +2950,9 @@ export const nexusApi = {
 
   // Create a new lesson with server-side validation
   createLesson: async (lesson: Partial<Lesson>): Promise<Lesson> => {
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:2478',message:'createLesson: entry with params',data:{teacherId:lesson.teacherId,date:lesson.date,startTime:lesson.startTime,duration:lesson.duration,studentId:lesson.studentId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+    // #endregion
     if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
       throw new Error('Airtable API Key or Base ID not configured');
     }
@@ -2471,6 +3128,72 @@ export const nexusApi = {
       throw conflictError;
     }
 
+    // PREVENT DUPLICATES: Check for overlapping open slots BEFORE creating lesson
+    // This prevents duplicate windows (open slot + lesson for same time)
+    // Check even if teacherId is missing - we'll check all slots for that date/time
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:2653',message:'createLesson: checking if conflict check should run',data:{teacherId:lesson.teacherId,date:lesson.date,startTime:lesson.startTime,hasAllRequired:!!(lesson.date && lesson.startTime)},timestamp:Date.now(),sessionId:'debug-session',runId:'run2',hypothesisId:'B'})}).catch(()=>{});
+    // #endregion
+    if (lesson.date && lesson.startTime) {
+      try {
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:2656',message:'createLesson: resolving teacherId',data:{originalTeacherId:lesson.teacherId,teacherIdIsRecordId:lesson.teacherId?.startsWith('rec'),date:lesson.date,startTime:lesson.startTime,duration:lesson.duration || 60},timestamp:Date.now(),sessionId:'debug-session',runId:'run3',hypothesisId:'B'})}).catch(()=>{});
+        // #endregion
+        // Resolve teacherId: convert number (e.g., "1") to record ID if needed
+        const resolvedTeacherId = await resolveTeacherRecordId(lesson.teacherId);
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:2660',message:'createLesson: resolved teacherId',data:{originalTeacherId:lesson.teacherId,resolvedTeacherId,date:lesson.date,startTime:lesson.startTime,duration:lesson.duration || 60},timestamp:Date.now(),sessionId:'debug-session',runId:'run3',hypothesisId:'B'})}).catch(()=>{});
+        // #endregion
+        const { validateConflicts } = await import('./conflictValidationService');
+        const validationResult = await validateConflicts({
+          teacherId: resolvedTeacherId, // undefined means check all teachers
+          date: lesson.date,
+          startTime: lesson.startTime,
+          endTime: lesson.duration || 60, // duration in minutes
+        });
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:2664',message:'createLesson: validateConflicts result',data:{openSlotsCount:validationResult.conflicts.openSlots.length,lessonsCount:validationResult.conflicts.lessons.length,openSlots:validationResult.conflicts.openSlots.map(s=>({id:s.id,status:s.status,date:s.date,startTime:s.startTime,endTime:s.endTime,teacherId:s.teacherId}))},timestamp:Date.now(),sessionId:'debug-session',runId:'run2',hypothesisId:'B,D,E'})}).catch(()=>{});
+        // #endregion
+
+        // If there are overlapping open slots, prevent lesson creation
+        if (validationResult.conflicts.openSlots.length > 0) {
+          const slotDetails = validationResult.conflicts.openSlots.map(s => 
+            `${s.date} ${s.startTime}-${s.endTime}`
+          ).join(', ');
+          
+          const conflictError: any = {
+            message: `לא ניתן לקבוע שיעור - יש חלון פתוח חופף בזמן זה: ${slotDetails}. אנא סגור את החלון הפתוח תחילה או בחר זמן אחר.`,
+            code: 'CONFLICT_ERROR',
+            status: 409,
+            conflicts: {
+              lessons: [],
+              openSlots: validationResult.conflicts.openSlots,
+            },
+          };
+          throw conflictError;
+        }
+
+        // Auto-close overlapping open slots (should be empty after check above, but keep for safety)
+        const { autoCloseOverlappingSlots } = await import('./conflictValidationService');
+        const closedSlots = await autoCloseOverlappingSlots(
+          lesson.teacherId,
+          lesson.date,
+          lesson.startTime,
+          lesson.duration || 60
+        );
+        if (closedSlots.length > 0 && import.meta.env.DEV) {
+          console.log(`[createLesson] Auto-closed ${closedSlots.length} overlapping open slot(s)`);
+        }
+      } catch (conflictError: any) {
+        // Re-throw conflict errors (they should prevent lesson creation)
+        if (conflictError.code === 'CONFLICT_ERROR') {
+          throw conflictError;
+        }
+        // Log but don't fail lesson creation if other errors occur
+        console.warn(`[createLesson] Failed to check/close overlapping slots:`, conflictError);
+      }
+    }
+
     // Prepare Airtable fields - ONLY use mapped fields from fieldMap
     const airtableFields: any = { fields: {} };
 
@@ -2509,10 +3232,22 @@ export const nexusApi = {
     // Note: According to the report, the field is 'full_name' (linked record to students)
     const studentFieldName = getField('lessons', 'full_name');
     
+    // Support multiple students if studentIds array is provided
+    let studentIdsToLink: string[] = [studentRecordId];
+    if (lesson.studentIds && Array.isArray(lesson.studentIds) && lesson.studentIds.length > 0) {
+      // Validate all student IDs
+      const validStudentIds = lesson.studentIds.filter(id => 
+        id && typeof id === 'string' && id.startsWith('rec')
+      );
+      if (validStudentIds.length > 0) {
+        studentIdsToLink = validStudentIds;
+      }
+    }
+    
     // Write to the mapped field name (discovered from getLessons logs)
     // Format: array of record ID strings for linked record fields
-    airtableFields.fields[studentFieldName] = [studentRecordId];
-    console.log(`[DEBUG createLesson] PART B - Writing student to field "${studentFieldName}" = ["${studentRecordId}"]`);
+    airtableFields.fields[studentFieldName] = studentIdsToLink;
+    console.log(`[DEBUG createLesson] PART B - Writing student(s) to field "${studentFieldName}" = ${JSON.stringify(studentIdsToLink)}`);
 
     // Add source if available
     try {
@@ -2558,12 +3293,19 @@ export const nexusApi = {
     //   addFieldIfMapped('lessonSubject', lesson.subject, airtableFields);
     // }
 
-    // Lesson type - REMOVED (not in config, will cause "Unknown field name" error)
-    // DO NOT add lesson.lessonType - field name must be discovered from existing records first
-    // Once discovered, add to config as lessonType: 'actual_field_name', then uncomment:
-    // if (lesson.lessonType) {
-    //   addFieldIfMapped('lessonType', lesson.lessonType, airtableFields);
-    // }
+    // Lesson type - map English values to Hebrew for Airtable
+    if (lesson.lessonType) {
+      const lessonTypeField = getField('lessons', 'lesson_type');
+      // Map English to Hebrew
+      const typeMap: Record<string, string> = {
+        'private': 'פרטי',
+        'pair': 'זוגי',
+        'group': 'קבוצתי',
+      };
+      const hebrewType = typeMap[lesson.lessonType] || lesson.lessonType;
+      airtableFields.fields[lessonTypeField] = hebrewType;
+      console.log(`[DEBUG createLesson] Added lesson type field "${lessonTypeField}" = "${hebrewType}"`);
+    }
 
     console.log(`[DEBUG createLesson] Final payload fields:`, Object.keys(airtableFields.fields));
     console.log(`[DEBUG createLesson] All fields are from config mapping - no hardcoded field names`);
@@ -2671,6 +3413,159 @@ export const nexusApi = {
       throw {
         message: `Failed to delete bill: ${error.message || 'Unknown error'}`,
         code: 'DELETE_BILL_ERROR',
+        status: error.status || 500,
+        details: error,
+      };
+    }
+  },
+
+  // Entity (Bot Users) API functions
+  // Field mapping from Airtable:
+  // - ext_id: auto-generated record ID (primary)
+  // - role: permission type (parent, admin, student, teacher)
+  // - full_name: full name
+  // - phone_normalized: phone number
+  // - email: email address
+  // - הערות: notes
+  getEntities: async (): Promise<Entity[]> => {
+    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
+      throw new Error('Airtable API Key or Base ID not configured');
+    }
+
+    const entitiesTableId = AIRTABLE_CONFIG.tables.entities;
+    
+    const records = await listAllAirtableRecords<any>(entitiesTableId, {
+      pageSize: '100',
+    });
+
+    const entities: Entity[] = records.map((record: any) => {
+      const fields = record.fields || {};
+      
+      // Map role from Airtable to our EntityPermission type
+      const rawRole = fields['role'] || 'student';
+      
+      return {
+        id: record.id,
+        name: fields['full_name'] || '',
+        phone: fields['phone_normalized'] || '',
+        permission: rawRole as EntityPermission,
+        email: fields['email'] || undefined,
+        notes: fields['הערות'] || undefined,
+        createdAt: undefined, // Not available in schema
+        updatedAt: undefined, // Not available in schema
+      };
+    });
+
+    console.log(`[Airtable] Fetched ${entities.length} entities`);
+    return entities;
+  },
+
+  createEntity: async (data: Partial<Entity>): Promise<Entity> => {
+    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
+      throw new Error('Airtable API Key or Base ID not configured');
+    }
+
+    const entitiesTableId = AIRTABLE_CONFIG.tables.entities;
+
+    const airtableFields: any = {
+      typecast: true,
+      fields: {
+        full_name: data.name || '',
+        phone_normalized: data.phone || '',
+        role: data.permission || 'student',
+      },
+    };
+
+    try {
+      const response = await airtableRequest<{ id: string; fields: any }>(
+        `/${entitiesTableId}`,
+        {
+          method: 'POST',
+          body: JSON.stringify(airtableFields),
+        }
+      );
+
+      const newEntity: Entity = {
+        id: response.id,
+        name: response.fields.full_name || data.name || '',
+        phone: response.fields.phone_normalized || data.phone || '',
+        permission: (response.fields.role || data.permission || 'student') as EntityPermission,
+      };
+
+      console.log(`[Airtable] Created entity ${response.id}`);
+      return newEntity;
+    } catch (error: any) {
+      console.error('[nexusApi.createEntity] Failed to create entity:', error);
+      throw {
+        message: `Failed to create entity: ${error.message || 'Unknown error'}`,
+        code: 'CREATE_ENTITY_ERROR',
+        status: error.status || 500,
+        details: error,
+      };
+    }
+  },
+
+  updateEntity: async (entityId: string, data: Partial<Entity>): Promise<Entity> => {
+    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
+      throw new Error('Airtable API Key or Base ID not configured');
+    }
+
+    const entitiesTableId = AIRTABLE_CONFIG.tables.entities;
+
+    const updateFields: any = {};
+    if (data.phone !== undefined) updateFields.phone_normalized = data.phone;
+    if (data.permission !== undefined) updateFields.role = data.permission;
+    // name is typically not editable, but include if needed
+    if (data.name !== undefined) updateFields.full_name = data.name;
+
+    try {
+      const response = await airtableRequest<{ id: string; fields: any }>(
+        `/${entitiesTableId}/${entityId}`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ fields: updateFields, typecast: true }),
+        }
+      );
+
+      const updatedEntity: Entity = {
+        id: response.id,
+        name: response.fields.full_name || '',
+        phone: response.fields.phone_normalized || '',
+        permission: (response.fields.role || 'student') as EntityPermission,
+      };
+
+      console.log(`[Airtable] Updated entity ${entityId}`);
+      return updatedEntity;
+    } catch (error: any) {
+      console.error('[nexusApi.updateEntity] Failed to update entity:', error);
+      throw {
+        message: `Failed to update entity: ${error.message || 'Unknown error'}`,
+        code: 'UPDATE_ENTITY_ERROR',
+        status: error.status || 500,
+        details: error,
+      };
+    }
+  },
+
+  deleteEntity: async (entityId: string): Promise<void> => {
+    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
+      throw new Error('Airtable API Key or Base ID not configured');
+    }
+
+    const entitiesTableId = AIRTABLE_CONFIG.tables.entities;
+
+    try {
+      await airtableRequest<{ id: string; deleted: boolean }>(
+        `/${entitiesTableId}/${entityId}`,
+        { method: 'DELETE' }
+      );
+
+      console.log(`[Airtable] Deleted entity ${entityId}`);
+    } catch (error: any) {
+      console.error('[nexusApi.deleteEntity] Failed to delete entity:', error);
+      throw {
+        message: `Failed to delete entity: ${error.message || 'Unknown error'}`,
+        code: 'DELETE_ENTITY_ERROR',
         status: error.status || 500,
         details: error,
       };

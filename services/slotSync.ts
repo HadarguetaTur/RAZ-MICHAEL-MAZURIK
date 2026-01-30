@@ -9,6 +9,7 @@
 import { WeeklySlotAirtableFields, SlotInventoryAirtableFields, LinkedRecord } from '../contracts/types';
 import { formatDate, getWeekStart, getDateForDayOfWeek, addWeeks } from './dateUtils';
 import { getField } from '../contracts/fieldMap';
+import { preventSlotOpeningIfLessonsOverlap } from './conflictValidationService';
 
 /**
  * ============================================================================
@@ -252,7 +253,8 @@ function parseTime(timeStr: string): number {
  * Protected if: is_locked=true OR lessons is not empty OR is_block=true
  */
 export function isSlotProtected(slot: ExistingSlotInventory): boolean {
-  if (slot.isLocked === true || slot.isLocked === 1) {
+  // Airtable can return boolean true or number 1 for boolean fields
+  if (slot.isLocked === true || slot.isLocked === (1 as any)) {
     return true;
   }
   if (slot.hasLessons === true) {
@@ -285,13 +287,37 @@ export function diffInventory(
     existingByKey.set(slot.naturalKey, slot);
   }
 
+  // Build map of existing inventory by createdFrom+date for duplicate prevention
+  // This handles cases where weekly_slot template start time changes, causing naturalKey mismatch
+  // but we still want to update the existing slot instead of creating a duplicate
+  const existingByCreatedFromDate = new Map<string, ExistingSlotInventory>();
+  for (const slot of existingInventory) {
+    if (slot.createdFrom && slot.date) {
+      const key = `${slot.createdFrom}|${slot.date}`;
+      // Only add if not already in map (prefer first occurrence)
+      if (!existingByCreatedFromDate.has(key)) {
+        existingByCreatedFromDate.set(key, slot);
+      }
+    }
+  }
+
   // Build set of generated natural keys
   const generatedKeys = new Set(generated.map(g => g.naturalKey));
 
   // Find slots to create (in generated but not in existing)
   for (const gen of generated) {
     if (!existingByKey.has(gen.naturalKey)) {
-      result.toCreate.push(gen);
+      // Check if there's an existing slot with same createdFrom+date (template time changed)
+      const createdFromDateKey = `${gen.createdFrom}|${gen.date}`;
+      const existingByCreatedFrom = existingByCreatedFromDate.get(createdFromDateKey);
+      
+      if (existingByCreatedFrom && !isSlotProtected(existingByCreatedFrom)) {
+        // Update existing slot instead of creating duplicate
+        result.toUpdate.push({ existing: existingByCreatedFrom, generated: gen });
+      } else {
+        // No existing match, create new slot
+        result.toCreate.push(gen);
+      }
     }
   }
 
@@ -516,9 +542,46 @@ export async function syncSlots(options: SyncSlotsOptions = {}): Promise<{
           'נוצר_מתוך': [gen.createdFrom],
         };
 
+        // Always set סוג שיעור if type exists
         if (gen.type) {
           fields['סוג שיעור'] = gen.type;
         }
+
+        // Business rule: סטטוס="פתוח" ONLY when סוג שיעור="פרטי", otherwise "סגור"
+        // Bot can schedule ONLY private lessons, so only private slots are open
+        let intendedStatus = (gen.type === "פרטי") ? "פתוח" : "סגור";
+
+        // PREVENT DUPLICATES: Check for overlapping lessons before creating open slot
+        if (intendedStatus === "פתוח") {
+          try {
+            const { canOpen, conflictingLessons } = await preventSlotOpeningIfLessonsOverlap(
+              gen.teacherId,
+              gen.date,
+              gen.startTime,
+              gen.endTime
+            );
+
+            if (!canOpen) {
+              // Cannot open slot - there are overlapping lessons
+              intendedStatus = "סגור";
+              // Log warning in development mode
+              try {
+                if ((globalThis as any).import?.meta?.env?.DEV) {
+                  console.warn(`[slotSync] Cannot create open slot ${gen.naturalKey} - ${conflictingLessons.length} overlapping lesson(s) found. Setting status to "סגור" instead.`);
+                }
+              } catch {
+                // Ignore if import.meta is not available
+              }
+            }
+          } catch (preventError: any) {
+            // Log but don't fail slot creation if overlap check fails
+            console.warn(`[slotSync] Failed to check for lesson overlaps before creating slot ${gen.naturalKey}:`, preventError);
+            // Default to "סגור" if check fails (safer - prevents duplicates)
+            intendedStatus = "סגור";
+          }
+        }
+
+        fields['סטטוס'] = intendedStatus;
 
         await airtableClient.createRecord<SlotInventoryAirtableFields>(
           slotInventoryTableId,
@@ -546,8 +609,48 @@ export async function syncSlots(options: SyncSlotsOptions = {}): Promise<{
           'נוצר_מתוך': [gen.createdFrom],
         };
 
+        // Always set סוג שיעור if type exists (use exact field name 'סוג שיעור')
         if (gen.type) {
-          fields['סוג_שיעור'] = gen.type;
+          fields['סוג שיעור'] = gen.type;
+        }
+
+        // Business rule: סטטוס="פתוח" ONLY when סוג שיעור="פרטי", otherwise "סגור"
+        // BUT: do not override סטטוס if existing slot is protected (has lessons, locked, or blocked)
+        if (!isSlotProtected(existing)) {
+          let intendedStatus = (gen.type === "פרטי") ? "פתוח" : "סגור";
+
+          // PREVENT DUPLICATES: Check for overlapping lessons before updating to open status
+          if (intendedStatus === "פתוח") {
+            try {
+              const { canOpen, conflictingLessons } = await preventSlotOpeningIfLessonsOverlap(
+                gen.teacherId,
+                gen.date,
+                gen.startTime,
+                gen.endTime,
+                existing.id // Exclude current slot from check
+              );
+
+              if (!canOpen) {
+                // Cannot open slot - there are overlapping lessons
+                intendedStatus = "סגור";
+                // Log warning in development mode
+                try {
+                  if ((globalThis as any).import?.meta?.env?.DEV) {
+                    console.warn(`[slotSync] Cannot update slot ${existing.naturalKey} to open - ${conflictingLessons.length} overlapping lesson(s) found. Setting status to "סגור" instead.`);
+                  }
+                } catch {
+                  // Ignore if import.meta is not available
+                }
+              }
+            } catch (preventError: any) {
+              // Log but don't fail slot update if overlap check fails
+              console.warn(`[slotSync] Failed to check for lesson overlaps before updating slot ${existing.naturalKey}:`, preventError);
+              // Default to "סגור" if check fails (safer - prevents duplicates)
+              intendedStatus = "סגור";
+            }
+          }
+
+          fields['סטטוס'] = intendedStatus;
         }
 
         await airtableClient.updateRecord<SlotInventoryAirtableFields>(

@@ -14,9 +14,16 @@ export interface Student {
   id: string;
   name: string;
   parentName?: string;
+  parentPhone?: string;
   email: string;
   phone: string;
   grade?: string;
+  level?: string;
+  subjectFocus?: string;
+  weeklyLessonsLimit?: number;
+  paymentStatus?: string;
+  registrationDate?: string;
+  lastActivity?: string;
   status: 'active' | 'on_hold' | 'inactive';
   subscriptionType: string;
   balance: number;
@@ -59,8 +66,11 @@ export interface WeeklySlot {
   type: 'private' | 'group' | 'pair';
   status: 'active' | 'paused';
   isFixed?: boolean; // Whether this slot is fixed/recurring (from 'קבוע' field)
-  reservedFor?: string; // Student ID if reserved (from 'reserved_for' field)
+  reservedFor?: string; // Student ID if reserved (from 'reserved_for' field) - DEPRECATED: use reservedForIds
+  reservedForIds?: string[]; // Array of student IDs (from 'reserved_for' field)
+  reservedForNames?: string[]; // Array of student names (from lookup field 'full_name (from reserved_for)')
   durationMin?: number; // Duration in minutes
+  hasOverlap?: boolean; // Whether this slot overlaps with other weekly slots
 }
 
 export interface SlotInventory {
@@ -70,7 +80,11 @@ export interface SlotInventory {
   date: string;
   startTime: string;
   endTime: string;
-  status: 'open' | 'booked' | 'blocked';
+  status: 'open' | 'closed' | 'canceled' | 'blocked';
+  occupied?: number;
+  capacityOptional?: number;
+  students?: string[];
+  lessons?: string[]; // Linked lesson record IDs (from slot_inventory.lessons field)
 }
 
 export interface HomeworkLibraryItem {
@@ -91,15 +105,6 @@ export interface HomeworkAssignment {
   status: 'assigned' | 'done' | 'reviewed';
   dueDate: string;
   assignedDate: string;
-}
-
-export interface SystemError {
-  id: string;
-  timestamp: string;
-  message: string;
-  code: string;
-  signature: string;
-  details: string;
 }
 
 export interface Teacher {
@@ -132,12 +137,22 @@ export interface MonthlyBill {
   id: string;
   studentId: string;
   studentName: string;
+  parentName?: string;
+  parentPhone?: string;
   month: string;
-  lessonsAmount: number;
-  subscriptionsAmount: number;
+  lessonsAmount?: number;
+  lessonsCount?: number;
+  subscriptionsAmount?: number;
+  cancellationsAmount?: number;
   adjustmentAmount: number;
+  manualAdjustmentAmount?: number;
+  manualAdjustmentReason?: string;
+  manualAdjustmentDate?: string;
   totalAmount: number;
   status: 'draft' | 'pending_approval' | 'link_sent' | 'paid' | 'overdue' | 'partial';
+  approved: boolean;
+  linkSent: boolean;
+  paid: boolean;
   sentAt?: string;
   paidAt?: string;
   lineItems?: BillLineItem[];
@@ -148,4 +163,17 @@ export interface ApiError {
   message: string;
   code: string;
   details?: any;
+}
+
+// Entity types for bot authorization
+export type EntityPermission = 'parent' | 'admin' | 'student' | 'teacher';
+
+export interface Entity {
+  id: string;
+  name: string;           // Airtable: full_name
+  phone: string;          // Airtable: phone_normalized
+  permission: EntityPermission;  // Airtable: role
+  email?: string;         // Airtable: email
+  notes?: string;         // Airtable: הערות
+  studentIds?: string[];  // Airtable: full_name_ (relation to students)
 }

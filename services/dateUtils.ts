@@ -79,32 +79,17 @@ export function formatDate(date: Date): string {
  * @returns Duration in minutes
  */
 export function calculateDuration(startTime: string, endTime: string): number {
-  // #region agent log
-  fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'dateUtils.ts:81',message:'calculateDuration entry',data:{startTime:startTime,startTimeType:typeof startTime,startTimeIsUndefined:startTime===undefined,startTimeIsNull:startTime===null,endTime:endTime,endTimeType:typeof endTime,endTimeIsUndefined:endTime===undefined,endTimeIsNull:endTime===null},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
-  // #endregion
-  
   if (!startTime || !endTime) {
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'dateUtils.ts:85',message:'calculateDuration missing params',data:{startTime:startTime,endTime:endTime},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'F'})}).catch(()=>{});
-    // #endregion
     throw new Error(`calculateDuration: missing startTime or endTime. startTime=${startTime}, endTime=${endTime}`);
   }
   
   const [startHours, startMinutes] = startTime.split(':').map(Number);
   const [endHours, endMinutes] = endTime.split(':').map(Number);
   
-  // #region agent log
-  fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'dateUtils.ts:90',message:'calculateDuration after split',data:{startHours:startHours,startMinutes:startMinutes,endHours:endHours,endMinutes:endMinutes},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'G'})}).catch(()=>{});
-  // #endregion
-  
   const startTotal = startHours * 60 + startMinutes;
   const endTotal = endHours * 60 + endMinutes;
   
   const duration = endTotal - startTotal;
-  
-  // #region agent log
-  fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'dateUtils.ts:97',message:'calculateDuration result',data:{duration:duration},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H'})}).catch(()=>{});
-  // #endregion
   
   return duration;
 }
@@ -124,3 +109,4 @@ export function generateNaturalKey(teacherId: string, date: Date, startTime: str
   const dateStr = formatDate(date);
   return `${teacherId}_${dateStr}_${startTime}`;
 }
+

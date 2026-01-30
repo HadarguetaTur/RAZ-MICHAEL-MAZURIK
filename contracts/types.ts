@@ -42,9 +42,42 @@ export interface StudentsAirtableFields {
   
   /** Phone number */
   phone_number: string;
+
+  /** Parent phone number */
+  parent_phone?: string;
+
+  /** Parent name */
+  parent_name?: string;
+
+  /** Grade level */
+  grade_level?: string;
+
+  /** Subject focus */
+  subject_focus?: string;
+
+  /** Lesson type preference */
+  lesson_type?: string;
+
+  /** Level */
+  level?: string;
+
+  /** Weekly lessons limit */
+  weekly_lessons_limit?: number;
+
+  /** Payment status */
+  payment_status?: string;
+
+  /** Tazman customer ID */
+  tazman_customer_id?: string;
   
   /** Active status (boolean or 0/1) */
   is_active: boolean | 0 | 1;
+
+  /** Registration date */
+  registration_date?: string;
+
+  /** Last activity date */
+  last_activity?: string;
   
   /** Linked records to lessons table */
   lessons?: LinkedRecord;
@@ -196,8 +229,20 @@ export interface BillingAirtableFields {
   /** Approved for billing (boolean) - Hebrew: "מאושר לחיוב" */
   'מאושר לחיוב': boolean;
   
-  /** Linked to students table - Hebrew: "תלמיד" */
-  'תלמיד': LinkedRecord;
+  /** Linked to students table */
+  'full_name': LinkedRecord;
+
+  /** Calculated amounts (Snapshot) */
+  lessons_amount?: number;
+  subscriptions_amount?: number;
+  cancellations_amount?: number;
+  total_amount?: number;
+  lessons_count?: number;
+
+  /** Manual adjustments */
+  manual_adjustment_amount?: number;
+  manual_adjustment_reason?: string;
+  manual_adjustment_date?: string;
 }
 
 export type BillingRecord = AirtableRecord<BillingAirtableFields>;

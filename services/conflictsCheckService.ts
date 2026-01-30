@@ -35,7 +35,8 @@ export interface ConflictsCheckFetchers {
 /** Request body for conflicts check. */
 export interface CheckConflictsParams {
   entity: 'lesson' | 'slot_inventory';
-  recordId?: string;
+  recordId?: string; // For self-exclusion (editing existing record)
+  linkedLessonIds?: string[]; // For slot_inventory: exclude lessons already linked to this slot
   teacherId: string | number;
   date: string; // YYYY-MM-DD
   start: string; // "HH:mm" or ISO datetime
@@ -71,6 +72,7 @@ export function buildConflictSummary(conflicts: ConflictItem[]): string {
 }
 
 const CANCELLED_STATUS = LessonStatus.CANCELLED; // 'בוטל' — from existing code
+const PENDING_CANCEL_STATUS = LessonStatus.PENDING_CANCEL; // 'ממתין לאישור ביטול' — from existing code
 
 function toISO(date: string, timeOrIso: string): string {
   const s = String(timeOrIso).trim();
@@ -79,9 +81,22 @@ function toISO(date: string, timeOrIso: string): string {
   return new Date(`${date}T${timePart}`).toISOString();
 }
 
-function lessonToInterval(l: LessonLike, excludeRecordId?: string): ExistingInterval | null {
-  if (l.status === CANCELLED_STATUS) return null;
+function lessonToInterval(
+  l: LessonLike, 
+  excludeRecordId?: string,
+  excludeLinkedLessonIds?: string[]
+): ExistingInterval | null {
+  // Exclude cancelled lessons: 'בוטל' (CANCELLED) and 'ממתין לאישור ביטול' (PENDING_CANCEL)
+  if (l.status === CANCELLED_STATUS || l.status === PENDING_CANCEL_STATUS) return null;
+  
+  // PART 4A: Exclude self if editing existing lesson
   if (excludeRecordId && l.id === excludeRecordId) return null;
+  
+  // PART 4A: Exclude linked lessons (lessons already linked to the slot being edited)
+  if (excludeLinkedLessonIds && excludeLinkedLessonIds.length > 0 && excludeLinkedLessonIds.includes(l.id)) {
+    return null;
+  }
+  
   const startStr = l.startTime.length >= 8 ? l.startTime.slice(0, 8) : (l.startTime.length === 5 ? `${l.startTime}:00` : l.startTime);
   const start = new Date(`${l.date}T${startStr}`);
   const end = new Date(start.getTime() + (l.duration ?? 60) * 60 * 1000);
@@ -126,7 +141,7 @@ export async function checkConflicts(
   params: CheckConflictsParams,
   fetchers: ConflictsCheckFetchers
 ): Promise<CheckConflictsResult> {
-  const { entity, recordId, teacherId, date, start, end } = params;
+  const { entity, recordId, linkedLessonIds, teacherId, date, start, end } = params;
   const proposedStartISO = toISO(date, start);
   const proposedEndISO = toISO(date, end);
   const teacherIdStr = typeof teacherId === 'number' ? String(teacherId) : String(teacherId);
@@ -137,13 +152,16 @@ export async function checkConflicts(
 
   try {
     const [lessons, openSlots] = await Promise.all([
-      fetchers.getLessons(date, date, teacherIdStr || undefined),
+      fetchers.getLessons(dayStartISO, dayEndISO, teacherIdStr || undefined),
       fetchers.getOpenSlots(dayStartISO, dayEndISO, teacherIdStr || undefined),
     ]);
 
+    // PART 4A: Exclude linked lessons when editing slot_inventory
     const lessonIntervals = lessons
-      .map((l) => lessonToInterval(l, recordId))
+      .map((l) => lessonToInterval(l, recordId, linkedLessonIds))
       .filter((x): x is ExistingInterval => x !== null);
+    
+    // PART 4B: Self-exclusion for slot_inventory (already implemented in slotToInterval)
     const slotIntervals = openSlots
       .map((s) => slotToInterval(s, recordId))
       .filter((x): x is ExistingInterval => x !== null);
@@ -153,12 +171,13 @@ export async function checkConflicts(
     console.error('[conflictsCheckService] fetcher error', {
       entity,
       date,
-      teacherId: teacherIdStr?.slice(0, 6) + '…',
+      teacherId: teacherIdStr ? (teacherIdStr.length > 6 ? teacherIdStr.slice(0, 6) + '…' : teacherIdStr) : undefined,
     });
     throw new Error('שגיאה בבדיקת חפיפות. נסה שוב.');
   }
 
-  const conflicts = findConflicts(proposedStartISO, proposedEndISO, existing);
+  // Pass recordId to exclude self from conflicts (for slot_inventory internal comparisons)
+  const conflicts = findConflicts(proposedStartISO, proposedEndISO, existing, recordId);
   return {
     hasConflicts: conflicts.length > 0,
     conflicts: conflicts.map(toConflictItem),

@@ -49,15 +49,22 @@ export interface Conflict {
 /**
  * Returns existing intervals that overlap the proposed [proposedStart, proposedEnd),
  * sorted by start (asc). Touching edges (proposedEnd === ex.start or proposedStart === ex.end) are not conflicts.
+ * Excludes the record with excludeRecordId if provided (for edit mode).
  */
 export function findConflicts(
   proposedStart: DateTimeLike,
   proposedEnd: DateTimeLike,
-  existing: ExistingInterval[]
+  existing: ExistingInterval[],
+  excludeRecordId?: string
 ): Conflict[] {
-  const conflicts = existing.filter((ex) =>
-    isOverlapping(proposedStart, proposedEnd, ex.start, ex.end)
-  );
+  const conflicts = existing.filter((ex) => {
+    // Exclude self if excludeRecordId is provided
+    if (excludeRecordId && ex.recordId === excludeRecordId) {
+      return false;
+    }
+    // Check overlap: startA < endB && startB < endA (strict, no <=)
+    return isOverlapping(proposedStart, proposedEnd, ex.start, ex.end);
+  });
   conflicts.sort((a, b) => toMs(a.start) - toMs(b.start));
   return conflicts.map((ex) => ({
     recordId: ex.recordId,

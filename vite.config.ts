@@ -24,7 +24,6 @@ export default defineConfig(({ mode }) => {
               });
             },
           },
-          '/api/inbox': { target: 'http://localhost:3001', changeOrigin: true },
           '/api/conflicts': { target: 'http://localhost:3001', changeOrigin: true },
         },
       },

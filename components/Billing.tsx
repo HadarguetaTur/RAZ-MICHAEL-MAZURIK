@@ -8,8 +8,12 @@ import { updateBillStatus, createMonthlyCharges as createMonthlyChargesMutation,
 import { generateBillingPdf } from '../services/pdfGenerator';
 import { openWhatsApp, normalizePhoneToE164 } from '../services/whatsappUtils';
 import { AirtableClient } from '../services/airtableClient';
+import { useToast } from '../hooks/useToast';
+import { useConfirmDialog } from '../hooks/useConfirmDialog';
 
 const Billing: React.FC = () => {
+  const toast = useToast();
+  const { confirm } = useConfirmDialog();
   const [bills, setBills] = useState<MonthlyBill[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedMonth, setSelectedMonth] = useState('2024-03');
@@ -216,7 +220,7 @@ const Billing: React.FC = () => {
       setBills(data);
     } catch (err) {
       console.error('[Billing] Error loading bills:', err);
-      alert(parseApiError(err));
+      toast.error(parseApiError(err));
       setBills([]); // Set empty array on error
     } finally {
       setLoading(false);
@@ -371,7 +375,7 @@ const Billing: React.FC = () => {
       URL.revokeObjectURL(url);
     } catch (error) {
       console.error('[Billing] Failed to generate PDF:', error);
-      alert(`שגיאה ביצירת PDF: ${error instanceof Error ? error.message : 'שגיאה לא ידועה'}`);
+      toast.error(`שגיאה ביצירת PDF: ${error instanceof Error ? error.message : 'שגיאה לא ידועה'}`);
     }
   };
 
@@ -389,13 +393,13 @@ const Billing: React.FC = () => {
     const message = `היי ${parentName} מצורף קישור לתשלום, ופירוט החיוב, הסכום לתשלום החודש הוא ₪${totalAmount} אודה להסדרת התשלום בהקדם.`;
 
     if (!phone) {
-      alert('לא נמצא מספר טלפון להורה. אנא עדכן את פרטי התלמיד.');
+      toast.error('לא נמצא מספר טלפון להורה. אנא עדכן את פרטי התלמיד.');
       return;
     }
 
     const normalizedPhone = normalizePhoneToE164(phone);
     if (!normalizedPhone) {
-      alert('מספר הטלפון של ההורה לא תקין.');
+      toast.error('מספר הטלפון של ההורה לא תקין.');
       return;
     }
 
@@ -412,19 +416,24 @@ const Billing: React.FC = () => {
       ? currentMonth  // במהלך החודש - עד עכשיו
       : selectedMonth; // חודש שעבר - כל החודש
     
-    if (!confirm(`האם ליצור חיובים חודשיים לחודש ${targetMonth}?`)) {
-      return;
-    }
+    const confirmed = await confirm({
+      title: 'יצירת חיובים חודשיים',
+      message: `האם ליצור חיובים חודשיים לחודש ${targetMonth}?`,
+      variant: 'info',
+      confirmLabel: 'צור חיובים',
+      cancelLabel: 'ביטול'
+    });
+    if (!confirmed) return;
     
     setIsCreatingCharges(true);
     try {
       const result = await createMonthlyChargesMutation(targetMonth);
-      alert(`נוצרו ${result.createdCount} חיובים חדשים. ${result.skippedCount} חיובים כבר קיימים.${result.errors && result.errors.length > 0 ? `\n\nשגיאות: ${result.errors.length}` : ''}`);
+      toast.success(`נוצרו ${result.createdCount} חיובים חדשים. ${result.skippedCount} חיובים כבר קיימים.`);
       // רענון הרשימה
       await loadBills();
       await loadKPIs();
     } catch (err) {
-      alert(parseApiError(err));
+      toast.error(parseApiError(err));
     } finally {
       setIsCreatingCharges(false);
     }
@@ -464,7 +473,7 @@ const Billing: React.FC = () => {
       }
       
       const apiErr = parseApiError(err);
-      alert(`נכשל בעדכון הסטטוס בארטייבל.\nשגיאה: ${apiErr}\n\nהשינוי בוטל.`);
+      toast.error(`נכשל בעדכון הסטטוס - ${apiErr}`);
     } finally {
       setUpdatingIds(prev => {
         const next = new Set(prev);
@@ -478,9 +487,14 @@ const Billing: React.FC = () => {
     const bill = bills.find(b => b.id === billId);
     const billDisplayName = bill?.studentName || 'החיוב';
     
-    if (!confirm(`האם אתה בטוח שברצונך למחוק את החיוב של ${billDisplayName}?\n\nפעולה זו לא ניתנת לביטול.`)) {
-      return;
-    }
+    const confirmed = await confirm({
+      title: 'מחיקת חיוב',
+      message: `האם אתה בטוח שברצונך למחוק את החיוב של ${billDisplayName}? פעולה זו לא ניתנת לביטול.`,
+      variant: 'danger',
+      confirmLabel: 'מחק חיוב',
+      cancelLabel: 'ביטול'
+    });
+    if (!confirmed) return;
 
     setDeletingIds(prev => new Set(prev).add(billId));
     
@@ -498,11 +512,11 @@ const Billing: React.FC = () => {
       
       // Refresh KPIs to reflect the change
       await loadKPIs();
-      console.log(`[Billing] Bill deleted successfully`);
+      toast.success('החיוב נמחק בהצלחה');
     } catch (err) {
       console.error('[Billing] Failed to delete bill:', err);
       const apiErr = parseApiError(err);
-      alert(`נכשל במחיקת החיוב.\nשגיאה: ${apiErr}`);
+      toast.error(`נכשל במחיקת החיוב - ${apiErr}`);
     } finally {
       setDeletingIds(prev => {
         const next = new Set(prev);
@@ -1085,7 +1099,7 @@ const Billing: React.FC = () => {
                                 // Refresh KPIs to reflect the change
                                 await loadKPIs();
                               } catch (err) {
-                                alert(parseApiError(err));
+                                toast.error(parseApiError(err));
                               } finally {
                                 setSavingAdjustment(false);
                               }

@@ -1202,11 +1202,8 @@ function discoverLookupFields(sampleRecord: any): ChargesLookupFields {
 
   // 4. Total Amount (The bottom line)
   result.totalAmountField = fields.find(f => 
-    f === 'כולל מע״מ ומנויים' || 
     f === 'כולל מע"מ ומנויים' || 
-    f === 'כולל מע״מ ומנויים (from תלמיד)' || 
-    f === 'כולל מע"מ ומנויים (from תלמיד)' ||
-    f === 'כולל מע״מ ומנויים (from full_name)' ||
+    f === 'כולל מע"מ ומנויים (from תלמיד)' || 
     f === 'כולל מע"מ ומנויים (from full_name)'
   );
 

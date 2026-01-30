@@ -1,18 +1,86 @@
 
 import React from 'react';
+import { useDashboardData } from '../data/hooks/useDashboardData';
 
 const Dashboard: React.FC = () => {
-  const dailyKpis = [
-    { label: 'שיעורים היום', value: '14', detail: '8 הושלמו / 2 בוטלו', color: 'blue' },
-    { label: 'ביטולי הרגע האחרון', value: '3', detail: 'מתחת ל-24 שעות (השבוע)', color: 'rose' },
-    { label: 'אישורי נוכחות חסרים', value: '7', detail: 'שיעורי עבר ללא אישור', color: 'amber' },
-    { label: 'תזכורות נשלחו', value: '100%', detail: 'לכל שיעורי מחר', color: 'emerald' },
+  const { metrics, isLoading, refresh } = useDashboardData();
+
+  if (isLoading) {
+    return (
+      <div className="space-y-8 animate-pulse pb-12">
+        <div className="flex items-center justify-between">
+          <div className="space-y-2">
+            <div className="h-10 w-48 bg-slate-200 rounded-xl"></div>
+            <div className="h-4 w-64 bg-slate-100 rounded-lg"></div>
+          </div>
+          <div className="h-12 w-32 bg-slate-100 rounded-2xl"></div>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+          {[1, 2, 3, 4].map(i => (
+            <div key={i} className="h-40 bg-white rounded-[32px] border border-slate-100 shadow-sm"></div>
+          ))}
+        </div>
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+          <div className="lg:col-span-2 space-y-8">
+            <div className="h-80 bg-white rounded-[32px] border border-slate-100 shadow-sm"></div>
+            <div className="h-48 bg-white rounded-[32px] border border-slate-100 shadow-sm"></div>
+          </div>
+          <div className="space-y-8">
+            <div className="h-96 bg-slate-900/5 rounded-[40px]"></div>
+            <div className="h-64 bg-white rounded-[32px] border border-slate-100 shadow-sm"></div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Primary KPIs - Students & Daily Operations
+  const primaryKpis = [
+    { 
+      label: 'תלמידים פעילים', 
+      value: metrics.students.totalActive.toString(), 
+      detail: metrics.students.onHold > 0 ? `${metrics.students.onHold} מושהים` : 'כולם פעילים',
+      color: 'blue' 
+    },
+    { 
+      label: 'שיעורים היום', 
+      value: metrics.daily.lessonsToday.toString(), 
+      detail: `${metrics.daily.completedToday} הושלמו / ${metrics.daily.cancelledToday} בוטלו`, 
+      color: 'emerald' 
+    },
+    { 
+      label: 'אישורי נוכחות חסרים', 
+      value: metrics.daily.missingAttendance.toString(), 
+      detail: 'שיעורי עבר ללא אישור', 
+      color: metrics.daily.missingAttendance > 0 ? 'amber' : 'emerald'
+    },
+    { 
+      label: 'חובות בפיגור', 
+      value: metrics.billing.overdueCount.toString(), 
+      detail: metrics.billing.overdueCount > 0 ? `סה"כ ₪${metrics.billing.overdueTotal.toLocaleString()}` : 'אין חובות בפיגור',
+      color: metrics.billing.overdueCount > 0 ? 'rose' : 'emerald'
+    },
   ];
 
   const billingKpis = [
-    { label: 'סכום פתוח לתשלום', value: '₪4,250', detail: '32 חשבונות', color: 'slate' },
-    { label: 'שולם השבוע', value: '₪8,120', detail: '+15% משבוע שעבר', color: 'emerald' },
-    { label: 'חובות בפיגור', value: '5', detail: 'מעל 14 יום', color: 'rose' },
+    { 
+      label: 'סכום פתוח לתשלום', 
+      value: `₪${metrics.billing.openAmount.toLocaleString()}`, 
+      detail: `${metrics.billing.billsCount} תלמידים`, 
+      color: 'slate' 
+    },
+    { 
+      label: 'שולם החודש', 
+      value: `₪${metrics.billing.paidThisMonth.toLocaleString()}`, 
+      detail: `${metrics.billing.collectionRate.toFixed(1)}% גבייה`, 
+      color: 'emerald' 
+    },
+    { 
+      label: 'ממתינים לשליחה', 
+      value: metrics.billing.pendingLinkCount.toString(), 
+      detail: 'חשבונות מאושרים', 
+      color: metrics.billing.pendingLinkCount > 0 ? 'amber' : 'slate' 
+    },
   ];
 
   return (
@@ -23,14 +91,17 @@ const Dashboard: React.FC = () => {
           <h2 className="text-3xl font-black text-slate-800 tracking-tight">בוקר טוב, רז 👋</h2>
           <p className="text-slate-500 text-sm mt-1">סקירה תפעולית וצמיחה ליום {new Date().toLocaleDateString('he-IL', { weekday: 'long', day: 'numeric', month: 'long' })}</p>
         </div>
-        <button className="bg-white border border-slate-200 px-6 py-2.5 rounded-2xl text-sm font-black text-slate-600 hover:bg-slate-50 transition-all shadow-sm">
-          הורד דוח פעילות
+        <button 
+          onClick={refresh}
+          className="bg-white border border-slate-200 px-6 py-2.5 rounded-2xl text-sm font-black text-slate-600 hover:bg-slate-50 transition-all shadow-sm"
+        >
+          רענן נתונים
         </button>
       </div>
 
       {/* Primary KPI Row */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-        {dailyKpis.map((kpi, idx) => (
+        {primaryKpis.map((kpi, idx) => (
           <div key={idx} className="bg-white p-7 rounded-[32px] border border-slate-200 shadow-sm hover:shadow-md transition-shadow group">
             <div className="flex items-center justify-between mb-4">
               <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest">{kpi.label}</div>
@@ -64,20 +135,20 @@ const Dashboard: React.FC = () => {
             </div>
             
             <div className="h-64 flex items-end justify-around gap-6">
-              {[8, 12, 15, 10, 18, 5, 2].map((val, i) => (
+              {metrics.charts.weeklyVolume.map((item, i) => (
                 <div key={i} className="flex flex-col items-center gap-3 flex-1">
                   <div className="w-full flex flex-col justify-end gap-1 h-full">
                     {/* Previous Week Ghost Bar */}
-                    <div style={{ height: `${(val * 0.7) * 4}%` }} className="w-full bg-slate-50 rounded-t-lg"></div>
+                    <div style={{ height: `${(item.previous * 4)}%` }} className="w-full bg-slate-50 rounded-t-lg"></div>
                     {/* Current Week Bar */}
-                    <div style={{ height: `${val * 4}%` }} className="w-full bg-blue-600 rounded-t-lg relative group">
+                    <div style={{ height: `${(item.current * 4)}%` }} className="w-full bg-blue-600 rounded-t-lg relative group">
                        <div className="absolute -top-8 left-1/2 -translate-x-1/2 bg-slate-900 text-white text-[10px] px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap">
-                         {val} שיעורים
+                         {item.current} שיעורים
                        </div>
                     </div>
                   </div>
                   <span className="text-[11px] font-black text-slate-400">
-                    {['א', 'ב', 'ג', 'ד', 'ה', 'ו', 'ש'][i]}
+                    {item.day}
                   </span>
                 </div>
               ))}
@@ -107,53 +178,36 @@ const Dashboard: React.FC = () => {
           <div className="bg-slate-900 rounded-[40px] p-8 text-white shadow-2xl shadow-slate-200">
             <h3 className="text-lg font-black mb-6">משימות דחופות</h3>
             <div className="space-y-4">
-              <div className="flex items-center justify-between p-4 bg-white/5 rounded-2xl hover:bg-white/10 transition-colors cursor-pointer group border border-white/5">
-                <div className="flex items-center gap-4">
-                  <div className="w-10 h-10 bg-rose-500/20 text-rose-500 rounded-xl flex items-center justify-center text-lg">⚠️</div>
-                  <div>
-                    <div className="text-sm font-bold">2 בקשות ביטול</div>
-                    <div className="text-[10px] text-white/40">ממתין לאישור מנהל</div>
+              {metrics.urgentTasks.length > 0 ? (
+                metrics.urgentTasks.map((task, idx) => (
+                  <div key={idx} className="flex items-center justify-between p-4 bg-white/5 rounded-2xl hover:bg-white/10 transition-colors cursor-pointer group border border-white/5">
+                    <div className="flex items-center gap-4">
+                      <div className={`w-10 h-10 ${
+                        task.type === 'warning' ? 'bg-rose-500/20 text-rose-500' : 
+                        task.type === 'payment' ? 'bg-amber-500/20 text-amber-500' : 'bg-blue-500/20 text-blue-500'
+                      } rounded-xl flex items-center justify-center text-lg`}>
+                        {task.type === 'warning' ? '⚠️' : task.type === 'payment' ? '💳' : '⚡'}
+                      </div>
+                      <div>
+                        <div className="text-sm font-bold">{task.title}</div>
+                        <div className="text-[10px] text-white/40">{task.detail}</div>
+                      </div>
+                    </div>
+                    <span className="text-white/20 group-hover:translate-x-[-4px] transition-transform">←</span>
                   </div>
+                ))
+              ) : (
+                <div className="text-center py-8 text-white/40 text-sm italic">
+                  אין משימות דחופות כרגע ✨
                 </div>
-                <span className="text-white/20 group-hover:translate-x-[-4px] transition-transform">←</span>
-              </div>
-
-              <div className="flex items-center justify-between p-4 bg-white/5 rounded-2xl hover:bg-white/10 transition-colors cursor-pointer group border border-white/5">
-                <div className="flex items-center gap-4">
-                  <div className="w-10 h-10 bg-amber-500/20 text-amber-500 rounded-xl flex items-center justify-center text-lg">💳</div>
-                  <div>
-                    <div className="text-sm font-bold">חשבונות להפקה</div>
-                    <div className="text-[10px] text-white/40">3 תלמידים חדשים</div>
-                  </div>
-                </div>
-                <span className="text-white/20 group-hover:translate-x-[-4px] transition-transform">←</span>
-              </div>
-
-              <div className="flex items-center justify-between p-4 bg-white/5 rounded-2xl hover:bg-white/10 transition-colors cursor-pointer group border border-white/5">
-                <div className="flex items-center gap-4">
-                  <div className="w-10 h-10 bg-blue-500/20 text-blue-500 rounded-xl flex items-center justify-center text-lg">⚡</div>
-                  <div>
-                    <div className="text-sm font-bold">שגיאת אוטומציה</div>
-                    <div className="text-[10px] text-white/40">סינכרון יומן גוגל</div>
-                  </div>
-                </div>
-                <span className="text-white/20 group-hover:translate-x-[-4px] transition-transform">←</span>
-              </div>
+              )}
             </div>
-
-            <button className="w-full mt-8 py-4 bg-white text-slate-900 rounded-2xl font-black text-xs hover:bg-slate-100 transition-colors shadow-xl">
-              עבור לתיבת ההודעות (Inbox)
-            </button>
           </div>
 
           <div className="bg-white rounded-[32px] border border-slate-200 shadow-sm p-8">
             <h3 className="text-lg font-black text-slate-800 mb-6">מגמת הכנסות</h3>
             <div className="space-y-6">
-              {[
-                { month: 'מרץ', amount: 15400, trend: 'up' },
-                { month: 'פברואר', amount: 12100, trend: 'up' },
-                { month: 'ינואר', amount: 13500, trend: 'down' },
-              ].map((m, i) => (
+              {metrics.charts.revenueTrend.map((m, i) => (
                 <div key={i} className="flex items-center justify-between">
                   <div className="flex items-center gap-4">
                     <div className="w-1.5 h-1.5 rounded-full bg-blue-600"></div>

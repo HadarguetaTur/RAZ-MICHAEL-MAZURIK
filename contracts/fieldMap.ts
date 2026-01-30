@@ -53,7 +53,7 @@ export const TABLES = {
     primaryField: 'natural_key',
     displayNameHe: 'cancellations',
   },
-  charges: {
+  monthlyBills: {
     id: 'tblyEsDpiRkw8doxQ',
     primaryField: 'id',
     displayNameHe: 'חיובים',
@@ -104,6 +104,8 @@ export const FIELDS = {
     level: 'level',
     weekly_lessons_limit: 'weekly_lessons_limit',
     payment_status: 'payment_status',
+    notes: 'Notes',
+    email: 'Email',
     tazman_customer_id: 'tazman_customer_id',
     is_active: 'is_active',
     registration_date: 'registration_date',
@@ -115,7 +117,7 @@ export const FIELDS = {
     eligibility_this_week: 'eligibility_this_week', // Formula
     eligibility_next_week: 'eligibility_next_week', // Formula
     Subscription_Monthly_Amount: 'Subscription Monthly Amount', // Formula
-    'כולל_מע״מ_ומנויים': 'כולל מע״מ ומנויים', // Formula
+    'כולל_מעמ_ומנויים': 'כולל מע"מ ומנויים', // Formula - total including VAT and subscriptions
   },
   lessons: {
     lesson_id: 'lesson_id',
@@ -232,11 +234,11 @@ export const FIELDS = {
     billing_month: 'billing_month', // Formula: YYYY-MM
     is_lt_24h: 'is_lt_24h', // Formula
   },
-  charges: {
+  monthlyBills: {
     id: 'id',
     full_name: 'full_name', // Linked record to students
     'חודש_חיוב': 'חודש חיוב',
-    'כולל_מע״מ_ומנויים': 'כולל מע״מ ומנויים', // Lookup
+    'כולל_מעמ_ומנויים': 'כולל מע"מ ומנויים', // Lookup
     Subscription_Monthly_Amount: 'Subscription Monthly Amount', // Rollup
     Late_Cancellation_Dates: 'Late Cancellation Dates', // Lookup
     'מנוי_קבוצתי': 'מנוי קבוצתי', // Lookup
@@ -250,6 +252,11 @@ export const FIELDS = {
     manual_adjustment_amount: 'manual_adjustment_amount',
     manual_adjustment_reason: 'manual_adjustment_reason',
     manual_adjustment_date: 'manual_adjustment_date',
+    lessons_amount: 'lessons_amount',
+    subscriptions_amount: 'subscriptions_amount',
+    cancellations_amount: 'cancellations_amount',
+    total_amount: 'total_amount',
+    lessons_count: 'lessons_count',
   },
   subscriptions: {
     id: 'id',
@@ -317,7 +324,7 @@ export const COMPUTED_FIELDS = {
     'eligibility_this_week',
     'eligibility_next_week',
     'Subscription Monthly Amount',
-    'כולל מע״מ ומנויים',
+    'כולל מע"מ ומנויים',
   ]),
   lessons: new Set([
     'פרטי השיעור',
@@ -352,8 +359,8 @@ export const COMPUTED_FIELDS = {
     'billing_month',
     'is_lt_24h',
   ]),
-  charges: new Set([
-    'כולל מע״מ ומנויים',
+  monthlyBills: new Set([
+    'כולל מע"מ ומנויים',
     'Subscription Monthly Amount',
     'Late Cancellation Dates',
     'מנוי קבוצתי',
@@ -393,7 +400,7 @@ export const REQUIRED_FIELDS = {
       'id',
       'full_name',
       'חודש חיוב',
-      'כולל מע״מ ומנויים',
+      'כולל מע"מ ומנויים',
       'שולם',
       'מאושר לחיוב',
     ],

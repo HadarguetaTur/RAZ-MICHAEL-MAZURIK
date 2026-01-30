@@ -1,28 +1,57 @@
 /**
- * Unified API server: /api/conflicts/check and /api/inbox/*.
+ * API server for conflicts checking: /api/conflicts/check
  * Run: npx tsx server/apiServer.ts
- * Env: AIRTABLE_API_KEY, AIRTABLE_BASE_ID; AIRTABLE_ADMIN_INBOX_TABLE for inbox.
- * Inbox proxy: add in vite.config proxy /api/inbox -> http://localhost:3001
+ * Env: AIRTABLE_API_KEY, AIRTABLE_BASE_ID, PORT (for cloud platforms)
+ * 
+ * Production deployment:
+ * - Render/Railway will set PORT automatically
+ * - Set ALLOWED_ORIGINS env var for CORS (comma-separated list)
  */
 
 import http from 'node:http';
-import { checkConflicts } from './services/conflictsCheckService';
+import { checkConflicts } from '../services/conflictsCheckService';
 import type {
   CheckConflictsParams,
   ConflictsCheckFetchers,
   LessonLike,
   OpenSlotLike,
-} from './services/conflictsCheckService';
-import { getTableId, getField } from './contracts/fieldMap';
-import {
-  handleGetInbox,
-  handlePostInbox,
-  handlePatchInbox,
-  handlePostInboxIdAction,
-} from './inbox/routes';
+} from '../services/conflictsCheckService';
+import { getTableId, getField } from '../contracts/fieldMap';
 
 const API_BASE = 'https://api.airtable.com/v0';
 const CANCELLED_STATUS = 'בוטל';
+const PENDING_CANCEL_STATUS = 'ממתין לאישור ביטול';
+
+// CORS configuration - add your production domains here or via ALLOWED_ORIGINS env var
+const DEFAULT_ALLOWED_ORIGINS = [
+  'http://localhost:3000',
+  'http://localhost:5173',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:5173',
+];
+
+function getAllowedOrigins(): string[] {
+  const envOrigins = process.env.ALLOWED_ORIGINS;
+  if (envOrigins) {
+    return [...DEFAULT_ALLOWED_ORIGINS, ...envOrigins.split(',').map(o => o.trim())];
+  }
+  return DEFAULT_ALLOWED_ORIGINS;
+}
+
+function setCorsHeaders(req: http.IncomingMessage, res: http.ServerResponse): boolean {
+  const origin = req.headers.origin || '';
+  const allowedOrigins = getAllowedOrigins();
+  
+  // Allow if origin matches or if no origin (same-origin request)
+  if (!origin || allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
+    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Max-Age', '86400'); // 24 hours
+    return true;
+  }
+  return false;
+}
 
 function env(name: string): string {
   const v =
@@ -66,7 +95,8 @@ async function getLessonsForConflicts(
   const teacherF = getField('lessons', 'teacher_id');
   const studentF = getField('lessons', 'full_name');
 
-  let formula = `AND({${statusF}} != "${escapeFormula(CANCELLED_STATUS)}", IS_AFTER({${startDtF}}, "${escapeFormula(startDate)}"), IS_BEFORE({${endDtF}}, "${escapeFormula(endDate)}"))`;
+  // Exclude cancelled lessons: 'בוטל' (CANCELLED) and 'ממתין לאישור ביטול' (PENDING_CANCEL)
+  let formula = `AND({${statusF}} != "${escapeFormula(CANCELLED_STATUS)}", {${statusF}} != "${escapeFormula(PENDING_CANCEL_STATUS)}", IS_AFTER({${startDtF}}, "${escapeFormula(startDate)}"), IS_BEFORE({${endDtF}}, "${escapeFormula(endDate)}"))`;
   if (teacherId && teacherId.startsWith('rec')) {
     formula = `AND(${formula}, FIND("${escapeFormula(teacherId)}", ARRAYJOIN({${teacherF}})) > 0)`;
   }
@@ -121,7 +151,8 @@ async function getOpenSlotsForConflicts(
   const statusF = getField('slotInventory', 'סטטוס');
   const teacherF = getField('slotInventory', 'מורה');
 
-  let formula = `AND({${startDtF}} < "${escapeFormula(endISO)}", {${endDtF}} > "${escapeFormula(startISO)}", {${statusF}} = "open")`;
+  // Only include open slots: 'open' (English) or 'פתוח' (Hebrew)
+  let formula = `AND({${startDtF}} < "${escapeFormula(endISO)}", {${endDtF}} > "${escapeFormula(startISO)}", OR({${statusF}} = "open", {${statusF}} = "פתוח"))`;
   if (teacherId && teacherId.startsWith('rec')) {
     formula = `AND(${formula}, FIND("${escapeFormula(teacherId)}", ARRAYJOIN({${teacherF}})) > 0)`;
   }
@@ -154,25 +185,27 @@ async function getOpenSlotsForConflicts(
   return list;
 }
 
-const PORT = Number(process.env.CONFLICTS_CHECK_PORT ?? process.env.INBOX_API_PORT ?? '3001');
+// PORT: Use PORT (cloud platforms like Render/Railway) or CONFLICTS_CHECK_PORT or default 3001
+const PORT = Number(process.env.PORT ?? process.env.CONFLICTS_CHECK_PORT ?? '3001');
 
 const server = http.createServer(async (req, res) => {
   const url = req.url ?? '';
 
-  // --- Inbox: /api/inbox* ---
-  if (url.startsWith('/api/inbox')) {
-    let handled = false;
-    if (req.method === 'GET') {
-      handled = await handleGetInbox(req, res, url);
-    }
-    if (!handled && req.method === 'POST') {
-      handled = await handlePostInboxIdAction(req, res, url);
-      if (!handled) handled = await handlePostInbox(req, res, url);
-    }
-    if (!handled && req.method === 'PATCH') {
-      handled = await handlePatchInbox(req, res, url);
-    }
-    if (handled) return;
+  // Set CORS headers for all requests
+  setCorsHeaders(req, res);
+
+  // Handle CORS preflight requests
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  // Health check endpoint for monitoring
+  if (req.method === 'GET' && (url === '/health' || url === '/api/health')) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }));
+    return;
   }
 
   // --- Conflicts: POST /api/conflicts/check ---
@@ -187,6 +220,19 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'Invalid JSON body' }));
       return;
     }
+    
+    // Validate required fields
+    if (!params.entity || (params.entity !== 'lesson' && params.entity !== 'slot_inventory')) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid entity. Must be "lesson" or "slot_inventory"' }));
+      return;
+    }
+    if (!params.teacherId || !params.date || !params.start || !params.end) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing required fields: teacherId, date, start, end' }));
+      return;
+    }
+    
     const baseId = env('AIRTABLE_BASE_ID') || env('VITE_AIRTABLE_BASE_ID');
     const token = env('AIRTABLE_API_KEY') || env('VITE_AIRTABLE_API_KEY');
     if (!baseId || !token) {
@@ -204,7 +250,11 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify(result));
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'שגיאה בבדיקת חפיפות. נסה שוב.';
-      console.error('[apiServer] conflicts', { entity: params?.entity, date: params?.date });
+      console.error('[apiServer] conflicts error', { 
+        entity: params?.entity, 
+        date: params?.date,
+        teacherId: typeof params?.teacherId === 'string' ? params.teacherId.slice(0, 6) + '…' : params?.teacherId
+      });
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ message: msg }));
     }
@@ -216,7 +266,10 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.info(`[apiServer] http://localhost:${PORT}`);
-  console.info(`  POST /api/conflicts/check`);
-  console.info(`  GET/POST/PATCH /api/inbox, POST /api/inbox/:id/close, POST /api/inbox/:id/snooze`);
+  console.info(`[apiServer] Server running on port ${PORT}`);
+  console.info(`  GET  /health - Health check`);
+  console.info(`  POST /api/conflicts/check - Conflicts checking`);
+  if (process.env.ALLOWED_ORIGINS) {
+    console.info(`  CORS origins: ${process.env.ALLOWED_ORIGINS}`);
+  }
 });

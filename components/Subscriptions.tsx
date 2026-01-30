@@ -10,8 +10,10 @@ import { useStudents } from '../hooks/useStudents';
 import { getStudentByRecordId } from '../data/resources/students';
 import Toast, { ToastType } from './Toast';
 import AppSidePanel from './ui/AppSidePanel';
+import { useConfirmDialog } from '../hooks/useConfirmDialog';
 
 const Subscriptions: React.FC = () => {
+  const { confirm } = useConfirmDialog();
   const subscriptionsHook = useSubscriptions();
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
   const [loading, setLoading] = useState(true);
@@ -492,7 +494,14 @@ const Subscriptions: React.FC = () => {
   };
 
   const handlePause = async (id: string, pauseDate?: string) => {
-    if (!confirm('האם אתה בטוח שברצונך להשהות מנוי זה?')) return;
+    const confirmed = await confirm({
+      title: 'השהיית מנוי',
+      message: 'האם אתה בטוח שברצונך להשהות מנוי זה?',
+      variant: 'warning',
+      confirmLabel: 'השהה מנוי',
+      cancelLabel: 'ביטול'
+    });
+    if (!confirmed) return;
     
     setProcessingId(id);
     try {
@@ -512,7 +521,14 @@ const Subscriptions: React.FC = () => {
   };
 
   const handleResume = async (id: string) => {
-    if (!confirm('האם אתה בטוח שברצונך לחדש מנוי זה?')) return;
+    const confirmed = await confirm({
+      title: 'חידוש מנוי',
+      message: 'האם אתה בטוח שברצונך לחדש מנוי זה?',
+      variant: 'info',
+      confirmLabel: 'חדש מנוי',
+      cancelLabel: 'ביטול'
+    });
+    if (!confirmed) return;
     
     setProcessingId(id);
     try {
@@ -531,7 +547,14 @@ const Subscriptions: React.FC = () => {
   };
 
   const handleEnd = async (id: string) => {
-    if (!confirm('האם אתה בטוח שברצונך לסיים מנוי זה? המנוי יסומן כפג תוקף.')) return;
+    const confirmed = await confirm({
+      title: 'סיום מנוי',
+      message: 'האם אתה בטוח שברצונך לסיים מנוי זה? המנוי יסומן כפג תוקף.',
+      variant: 'danger',
+      confirmLabel: 'סיים מנוי',
+      cancelLabel: 'ביטול'
+    });
+    if (!confirmed) return;
     
     setProcessingId(id);
     try {

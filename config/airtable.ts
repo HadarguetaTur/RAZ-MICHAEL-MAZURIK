@@ -1,7 +1,19 @@
 
+const getEnv = (name: string) => {
+  if (typeof process !== 'undefined' && process.env) {
+    return process.env[name] || process.env[`VITE_${name}`] || '';
+  }
+  // @ts-ignore
+  if (typeof import.meta !== 'undefined' && import.meta.env) {
+    // @ts-ignore
+    return import.meta.env[`VITE_${name}`] || '';
+  }
+  return '';
+};
+
 export const AIRTABLE_CONFIG = {
-  apiKey: import.meta.env.VITE_AIRTABLE_API_KEY || '',
-  baseId: import.meta.env.VITE_AIRTABLE_BASE_ID || '',
+  apiKey: getEnv('AIRTABLE_API_KEY'),
+  baseId: getEnv('AIRTABLE_BASE_ID'),
   // Use Table IDs instead of display names
   tables: {
     students: 'tblSEiCD3DrOfcnR8', // Display name: 'תלמידים'
@@ -13,6 +25,7 @@ export const AIRTABLE_CONFIG = {
     monthlyBills: 'tblyEsDpiRkw8doxQ', // Display name: 'חיובים'
     weekly_slot: 'tbloC7G7ixYDMtdK6', // Display name: 'weekly_slot'
     slot_inventory: 'tblqMt721kMMtRIWm', // Display name: 'slot_inventory'
+    entities: 'Entities', // Display name: 'Entities' - bot authorized users
   },
   fields: {
     // Students fields
@@ -28,6 +41,12 @@ export const AIRTABLE_CONFIG = {
     // Linked record fields (exact field names as they appear in Airtable)
     lessonStudent: 'Student', // Linked record field for student in lessons table
     lessonTeacher: 'Teacher', // Linked record field for teacher in lessons table
+    // Monthly Bills (חיובים) fields
+    billingStudent: 'full_name',
+    billingMonth: 'חודש חיוב',
+    billingApproved: 'מאושר לחיוב',
+    billingLinkSent: 'נשלח קישור',
+    billingPaid: 'שולם',
     // Optional fields - ONLY add if field exists in Airtable (discovered via getLessons logs)
     // lessonSubject: undefined, // TODO: Discover from existing records - DO NOT use until confirmed
     // lessonType: undefined, // TODO: Discover from existing records - DO NOT use until confirmed

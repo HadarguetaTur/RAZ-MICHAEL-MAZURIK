@@ -120,7 +120,7 @@ function generateHtmlContent(
   const lateCount = safeBreakdown.cancellations.filter(c => c?.isLate).length;
 
   return `
-    <div dir="rtl" lang="he" style="font-family: 'Arial', 'Helvetica', sans-serif; direction: rtl; padding: 40px; font-size: 10px; color: #000; background-color: #ffffff; width: 100%;">
+    <div dir="rtl" lang="he" style="font-family: 'Noto Sans Hebrew', 'Arial', 'Helvetica', sans-serif; direction: rtl; padding: 40px; font-size: 10px; color: #000; background-color: #ffffff; width: 100%;">
       <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         .header { margin-bottom: 30px; padding-bottom: 15px; border-bottom: 2px solid #000; }
@@ -214,14 +214,16 @@ export async function generateBillingPdf(
   const subscriptionsTotal = typeof breakdown?.totals?.subscriptionsTotal === 'number' ? breakdown.totals.subscriptionsTotal : 0;
   const cancellationsTotal = breakdown?.totals?.cancellationsTotal !== undefined ? breakdown.totals.cancellationsTotal : null;
   const manualAdjustmentTotal = typeof breakdown?.totals?.manualAdjustmentTotal === 'number' ? breakdown.totals.manualAdjustmentTotal : 0;
-  const calculatedGrandTotal = lessonsTotal + subscriptionsTotal + (cancellationsTotal || 0) + manualAdjustmentTotal;
+  
+  // Use the provided total from the table, or fallback to calculation if not provided
+  const grandTotal = typeof total === 'number' ? total : (lessonsTotal + subscriptionsTotal + (cancellationsTotal || 0) + manualAdjustmentTotal);
 
   const totals: BillingBreakdown['totals'] = {
     lessonsTotal,
     subscriptionsTotal,
     cancellationsTotal,
     manualAdjustmentTotal,
-    grandTotal: calculatedGrandTotal,
+    grandTotal: grandTotal,
   };
 
   const safeBreakdown: BillingBreakdown = {
@@ -238,7 +240,7 @@ export async function generateBillingPdf(
       subscriptionsTotal,
       cancellationsTotal,
       manualAdjustmentTotal,
-      grandTotal: calculatedGrandTotal,
+      grandTotal: grandTotal,
     },
   };
 

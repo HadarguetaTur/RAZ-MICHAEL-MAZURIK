@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { Student } from '../types';
-import { getStudents, getAllStudents, searchStudents as searchStudentsResource, invalidateStudents } from '../data/resources/students';
+import { getStudents, getAllStudents, searchStudents as searchStudentsResource, getStudentByRecordId, invalidateStudents } from '../data/resources/students';
 
 interface UseStudentsOptions {
   filterActiveOnly?: boolean;
@@ -16,7 +16,8 @@ interface UseStudentsReturn {
   error: Error | null;
   searchStudents: (query: string, limit?: number) => Promise<Student[]>;
   refreshStudents: () => Promise<void>;
-  getStudentById: (id: string) => Student | undefined;
+  getStudentById: (id: string) => Promise<Student | undefined>;
+  getStudentByIdSync: (id: string) => Student | undefined; // Synchronous version for immediate lookups
 }
 
 /**
@@ -33,23 +34,39 @@ export function useStudents(options: UseStudentsOptions = {}): UseStudentsReturn
 
   // Load all students using the new resource layer (with caching)
   const loadStudents = useCallback(async () => {
+    if (import.meta.env.DEV) {
+      console.log('[useStudents] Starting loadStudents, loadAllPages:', loadAllPages);
+    }
     setIsLoading(true);
     setError(null);
     try {
       // Use the new resource layer which handles caching automatically
       const fetched = loadAllPages ? await getAllStudents() : await getStudents(1);
       if (isMountedRef.current) {
+        if (import.meta.env.DEV) {
+          console.log('[useStudents] Loaded students:', {
+            count: fetched.length,
+            loadAllPages,
+            studentIds: fetched.slice(0, 5).map(s => s.id),
+          });
+        }
         setStudents(fetched);
         setError(null);
       }
     } catch (err: any) {
       const error = err instanceof Error ? err : new Error(err?.message || 'Failed to load students');
+      if (import.meta.env.DEV) {
+        console.error('[useStudents] Error loading students:', error);
+      }
       if (isMountedRef.current) {
         setError(error);
       }
     } finally {
       if (isMountedRef.current) {
         setIsLoading(false);
+        if (import.meta.env.DEV) {
+          console.log('[useStudents] Finished loading, isLoading set to false');
+        }
       }
     }
   }, [loadAllPages]);
@@ -101,10 +118,95 @@ export function useStudents(options: UseStudentsOptions = {}): UseStudentsReturn
     await loadStudents();
   }, [loadStudents]);
 
-  // Get student by ID
-  const getStudentById = useCallback((id: string): Student | undefined => {
+  // Get student by ID (synchronous) - only checks local cache
+  const getStudentByIdSync = useCallback((id: string): Student | undefined => {
     return students.find(s => s.id === id);
   }, [students]);
+
+  // Get student by ID - try local cache first, then fetch from resource if not found
+  const getStudentById = useCallback(async (id: string): Promise<Student | undefined> => {
+    // First try local cache
+    const localStudent = students.find(s => s.id === id);
+    if (localStudent) {
+      if (import.meta.env.DEV) {
+        console.log('[getStudentById] Found in local cache:', id, localStudent.name);
+      }
+      return localStudent;
+    }
+
+    // If still loading, wait a bit for initial load to complete
+    // Note: We check isLoading at the start, but don't use it in the loop to avoid stale closure
+    if (isLoading) {
+      if (import.meta.env.DEV) {
+        console.log('[getStudentById] Still loading, waiting for initial load...', id);
+      }
+      // Wait for load to complete (max 2 seconds, check every 100ms)
+      const maxWaitTime = 2000;
+      const checkInterval = 100;
+      let waited = 0;
+      
+      // Use a ref or check students.length instead of isLoading in the loop
+      while (waited < maxWaitTime) {
+        await new Promise(resolve => setTimeout(resolve, checkInterval));
+        waited += checkInterval;
+        
+        // Check again after wait - students array might have been updated
+        // We can't check isLoading here because it's a stale closure value
+        const studentAfterWait = students.find(s => s.id === id);
+        if (studentAfterWait) {
+          if (import.meta.env.DEV) {
+            console.log('[getStudentById] Found after waiting:', id, studentAfterWait.name);
+          }
+          return studentAfterWait;
+        }
+        
+        // If we've waited enough and students array is still empty, break
+        if (waited >= maxWaitTime || students.length > 0) {
+          break;
+        }
+      }
+      
+      // Final check after waiting
+      const finalCheck = students.find(s => s.id === id);
+      if (finalCheck) {
+        if (import.meta.env.DEV) {
+          console.log('[getStudentById] Found in final check:', id, finalCheck.name);
+        }
+        return finalCheck;
+      }
+    }
+
+    // If not found locally and we have an ID, try fetching from resource
+    if (id && id.startsWith('rec')) {
+      if (import.meta.env.DEV) {
+        console.log('[getStudentById] Not found in local cache, fetching from resource:', id);
+      }
+      try {
+        const fetched = await getStudentByRecordId(id);
+        if (fetched && isMountedRef.current) {
+          if (import.meta.env.DEV) {
+            console.log('[getStudentById] Successfully fetched from resource:', id, fetched.name);
+          }
+          // Add to local cache for future lookups
+          setStudents(prev => {
+            // Avoid duplicates
+            if (prev.find(s => s.id === id)) return prev;
+            return [...prev, fetched];
+          });
+          return fetched;
+        }
+      } catch (err) {
+        if (import.meta.env.DEV) {
+          console.warn('[getStudentById] Failed to fetch student:', id, err);
+        }
+      }
+    }
+
+    if (import.meta.env.DEV) {
+      console.warn('[getStudentById] Student not found:', id);
+    }
+    return undefined;
+  }, [students, isLoading]);
 
   // Auto-load on mount if enabled
   useEffect(() => {
@@ -132,5 +234,6 @@ export function useStudents(options: UseStudentsOptions = {}): UseStudentsReturn
     searchStudents,
     refreshStudents,
     getStudentById,
+    getStudentByIdSync,
   };
 }

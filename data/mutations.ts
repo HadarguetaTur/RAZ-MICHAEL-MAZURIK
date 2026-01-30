@@ -38,12 +38,13 @@ import { getApiStats } from './fetchWithCache';
 export async function createLesson(lesson: Partial<Lesson>): Promise<Lesson> {
   const result = await nexusApi.createLesson(lesson);
   
-  // Invalidate all lessons cache (since we don't know the exact range)
+  // Invalidate both lessons and slot inventory (slots may have been auto-closed)
   invalidateLessons();
+  invalidateSlotInventory();
   
   if (import.meta.env.DEV) {
     const stats = getApiStats();
-    console.log(`[Mutations] createLesson | invalidated: lessons:* | calls/min: ${stats.callsPerMinute}`);
+    console.log(`[Mutations] createLesson | invalidated: lessons:*, slot_inventory:* | calls/min: ${stats.callsPerMinute}`);
   }
   
   return result;
@@ -58,12 +59,13 @@ export async function updateLesson(
 ): Promise<Lesson> {
   const result = await nexusApi.updateLesson(id, updates);
   
-  // Invalidate all lessons cache
+  // Invalidate both lessons and slot inventory (slots may have been auto-closed)
   invalidateLessons();
+  invalidateSlotInventory();
   
   if (import.meta.env.DEV) {
     const stats = getApiStats();
-    console.log(`[Mutations] updateLesson | invalidated: lessons:* | calls/min: ${stats.callsPerMinute}`);
+    console.log(`[Mutations] updateLesson | invalidated: lessons:*, slot_inventory:* | calls/min: ${stats.callsPerMinute}`);
   }
   
   return result;
@@ -330,6 +332,25 @@ export async function updateStudent(
   if (import.meta.env.DEV) {
     const stats = getApiStats();
     console.log(`[Mutations] updateStudent | invalidated: students:* | calls/min: ${stats.callsPerMinute}`);
+  }
+  
+  return result;
+}
+
+/**
+ * Create a new student
+ */
+export async function createStudent(
+  student: Partial<Student>
+): Promise<Student> {
+  const result = await nexusApi.createStudent(student);
+  
+  // Invalidate students cache to refresh the list
+  invalidateStudents();
+  
+  if (import.meta.env.DEV) {
+    const stats = getApiStats();
+    console.log(`[Mutations] createStudent | created: ${result.id} | invalidated: students:* | calls/min: ${stats.callsPerMinute}`);
   }
   
   return result;

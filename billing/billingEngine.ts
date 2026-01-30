@@ -27,6 +27,7 @@ import {
   determineBillingStatus,
   extractStudentId,
   extractLessonId,
+  getAllStudentIds,
 } from './billingRules';
 import {
   LessonsAirtableFields,
@@ -36,6 +37,8 @@ import {
   StudentsAirtableFields,
   LinkedRecord,
 } from '../contracts/types';
+
+const isDev = typeof process !== 'undefined' ? process.env.NODE_ENV === 'development' : (typeof import.meta !== 'undefined' && (import.meta as any).env?.DEV);
 import {
   DomainError,
   MissingFieldsError,
@@ -47,6 +50,50 @@ import {
  */
 function generateRunId(): string {
   return `run_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+}
+
+/**
+ * Build filter formula for billing month field
+ * Handles both Date and Text field types
+ * @param fieldName - The field name (e.g., "חודש חיוב")
+ * @param billingMonth - Billing month in YYYY-MM format
+ * @returns Airtable filter formula that works for both Date and Text fields
+ */
+function buildBillingMonthFilter(fieldName: string, billingMonth: string): string {
+  const [year, month] = billingMonth.split('-').map(Number);
+  const yearNum = parseInt(year.toString());
+  const monthNum = parseInt(month.toString());
+  
+  // Handle both Date and Text fields:
+  // 1. For Date fields: check YEAR and MONTH separately, or check date range
+  // 2. For Text fields: exact match or starts with
+  // Note: Airtable Date fields store full dates, so we check if the date falls within the month
+  const monthStartDate = `${billingMonth}-01`;
+  // Get last day of month: new Date(year, month, 0) gives last day of (month-1), so use month+1
+  const lastDayOfMonth = new Date(yearNum, monthNum, 0).getDate();
+  const monthEndDate = `${billingMonth}-${String(lastDayOfMonth).padStart(2, '0')}`;
+  
+  return `OR(
+    AND(YEAR({${fieldName}}) = ${yearNum}, MONTH({${fieldName}}) = ${monthNum}),
+    AND(IS_AFTER({${fieldName}}, "${monthStartDate}"), IS_BEFORE({${fieldName}}, "${monthEndDate}T23:59:59")),
+    {${fieldName}} = "${billingMonth}"
+  )`;
+}
+
+/**
+ * Convert billing month (YYYY-MM) to value suitable for Airtable field
+ * Handles both Date and Text field types
+ * @param billingMonth - Billing month in YYYY-MM format
+ * @param isDateField - Whether the field is a Date field (default: try both)
+ * @returns Value to set in Airtable (Date string for Date fields, YYYY-MM for Text fields)
+ */
+function convertBillingMonthToAirtableValue(billingMonth: string, isDateField: boolean = false): string {
+  if (isDateField) {
+    // For Date fields, use first day of month (YYYY-MM-01 format)
+    return `${billingMonth}-01`;
+  }
+  // For Text fields, use YYYY-MM format
+  return billingMonth;
 }
 
 
@@ -117,7 +164,14 @@ export async function buildStudentMonth(
   client: AirtableClient,
   studentRecordId: string,
   billingMonth: string,
-  runId?: string
+  runId?: string,
+  prefetchedData?: {
+    student?: AirtableRecord<StudentsAirtableFields>;
+    lessons?: AirtableRecord<LessonsAirtableFields>[];
+    cancellations?: AirtableRecord<CancellationsAirtableFields>[];
+    subscriptions?: AirtableRecord<SubscriptionsAirtableFields>[];
+    existingBill?: AirtableRecord<BillingAirtableFields>;
+  }
 ): Promise<BillingResult | MissingFieldsError | DomainError> {
   const logRunId = runId || generateRunId();
   
@@ -143,70 +197,69 @@ export async function buildStudentMonth(
   const startDateStr = startDate.toISOString().split('T')[0];
   const endDateStr = endDate.toISOString().split('T')[0];
 
-  // Fetch student
+  // 1. Fetch student
   let student: AirtableRecord<StudentsAirtableFields>;
-  try {
-    student = await client.getRecord<StudentsAirtableFields>(studentsTableId, studentRecordId);
-  } catch (error: any) {
-    throw new DomainError(
-      `Student not found: ${studentRecordId}`,
-      'STUDENT_NOT_FOUND',
-      { studentRecordId }
+  if (prefetchedData?.student) {
+    student = prefetchedData.student;
+  } else {
+    try {
+      student = await client.getRecord<StudentsAirtableFields>(studentsTableId, studentRecordId);
+    } catch (error: any) {
+      throw new DomainError(
+        `Student not found: ${studentRecordId}`,
+        'STUDENT_NOT_FOUND',
+        { studentRecordId }
+      );
+    }
+  }
+
+  // 2. Fetch lessons
+  let lessons: AirtableRecord<LessonsAirtableFields>[];
+  if (prefetchedData?.lessons) {
+    lessons = prefetchedData.lessons;
+  } else {
+    const lessonsFilter = `AND(
+      {full_name} = "${studentRecordId}",
+      OR(
+        {billing_month} = "${billingMonth}",
+        AND(
+          IS_AFTER({start_datetime}, "${startDateStr}"),
+          IS_BEFORE({start_datetime}, "${endDateStr}T23:59:59")
+        )
+      )
+    )`;
+    lessons = await client.listRecords<LessonsAirtableFields>(
+      lessonsTableId,
+      { filterByFormula: lessonsFilter }
     );
   }
 
-  // Fetch lessons for this student AND billing month
-  // CRITICAL FIX: Filter by both student AND billing_month in the query
-  // Also try filtering by date range as fallback if billing_month field doesn't exist
-  const lessonsFilter = `AND(
-    {full_name} = "${studentRecordId}",
-    OR(
-      {billing_month} = "${billingMonth}",
-      AND(
-        IS_AFTER({start_datetime}, "${startDateStr}"),
-        IS_BEFORE({start_datetime}, "${endDateStr}T23:59:59")
-      )
-    )
-  )`;
-  
-  const lessons = await client.listRecords<LessonsAirtableFields>(
-    lessonsTableId,
-    { filterByFormula: lessonsFilter }
-  );
-
-  // Validate lessons have required fields
-  if (lessons.length > 0) {
-    const sampleLesson = lessons[0].fields;
-    const requiredFields = ['full_name', 'lesson_type', 'status'];
-    const missingFields: string[] = [];
-    
-    for (const field of requiredFields) {
-      if (!(field in sampleLesson)) {
-        missingFields.push(field);
-      }
-    }
-    
-    // Validation complete
+  // 3. Fetch cancellations
+  let cancellations: AirtableRecord<CancellationsAirtableFields>[];
+  if (prefetchedData?.cancellations) {
+    cancellations = prefetchedData.cancellations;
+  } else {
+    const cancellationsFilter = `AND(
+      {student} = "${studentRecordId}",
+      {billing_month} = "${billingMonth}"
+    )`;
+    cancellations = await client.listRecords<CancellationsAirtableFields>(
+      cancellationsTableId,
+      { filterByFormula: cancellationsFilter }
+    );
   }
 
-  // Fetch cancellations for this student AND billing month
-  const cancellationsFilter = `AND(
-    {student} = "${studentRecordId}",
-    {billing_month} = "${billingMonth}"
-  )`;
-  
-  const cancellations = await client.listRecords<CancellationsAirtableFields>(
-    cancellationsTableId,
-    { filterByFormula: cancellationsFilter }
-  );
-
-  // Fetch all subscriptions for this student (filtered by month in calculation logic)
-  const subscriptionsFilter = `{student_id} = "${studentRecordId}"`;
-  
-  const subscriptions = await client.listRecords<SubscriptionsAirtableFields>(
-    subscriptionsTableId,
-    { filterByFormula: subscriptionsFilter }
-  );
+  // 4. Fetch subscriptions
+  let subscriptions: AirtableRecord<SubscriptionsAirtableFields>[];
+  if (prefetchedData?.subscriptions) {
+    subscriptions = prefetchedData.subscriptions;
+  } else {
+    const subscriptionsFilter = `{student_id} = "${studentRecordId}"`;
+    subscriptions = await client.listRecords<SubscriptionsAirtableFields>(
+      subscriptionsTableId,
+      { filterByFormula: subscriptionsFilter }
+    );
+  }
 
   // Calculate lessons contribution
   const lessonsContribution = calculateLessonsContribution(
@@ -257,14 +310,38 @@ export async function buildStudentMonth(
     subscriptionsResult.subscriptionsTotal
   );
 
+  console.log(`[BillingEngine] Calculation for ${studentRecordId}:`, {
+    lessonsCount: lessonsContribution.lessonsCount,
+    lessonsTotal: lessonsContribution.lessonsTotal,
+    cancellationsCount: cancellationsResult.cancellationsCount,
+    cancellationsTotal: cancellationsResult.cancellationsTotal,
+    subscriptionsCount: subscriptionsResult.activeSubscriptionsCount,
+    subscriptionsTotal: subscriptionsResult.subscriptionsTotal,
+    total,
+    lessonsFetched: lessons.length,
+    cancellationsFetched: cancellations.length,
+    subscriptionsFetched: subscriptions.length
+  });
 
-  // CRITICAL FIX: Do not create/update charge record if total is 0 and there's no billable data
+  // CRITICAL: Create billing record if there's ANY billable data, even if total is 0
+  // This ensures students with lessons (but no subscription) get billed
   const hasBillableLessons = lessonsContribution.lessonsCount > 0;
   const hasBillableCancellations = cancellationsResult.cancellationsCount > 0;
-  const hasSubscriptions = subscriptionsResult.subscriptionsTotal > 0;
+  const hasSubscriptions = subscriptionsResult.activeSubscriptionsCount > 0;
   const hasAnyBillableData = hasBillableLessons || hasBillableCancellations || hasSubscriptions;
 
-  if (total === 0 && !hasAnyBillableData) {
+  console.log(`[BillingEngine] Billable data check for ${studentRecordId}:`, {
+    hasBillableLessons,
+    hasBillableCancellations,
+    hasSubscriptions,
+    hasAnyBillableData,
+    total,
+    willSkip: !hasAnyBillableData
+  });
+
+  // Only skip if there's NO billable data at all (no lessons, no cancellations, no subscriptions)
+  // If there's any billable data, create the record even if total is 0
+  if (!hasAnyBillableData) {
     // Return a special result indicating skip (but don't create record)
     // This allows the caller to distinguish between "skipped" and "created"
     throw new DomainError(
@@ -280,21 +357,22 @@ export async function buildStudentMonth(
     );
   }
 
-  // Check existing billing record
-  const billingKey = generateBillingKey(studentRecordId, billingMonth);
-  
-  // Try to find existing billing record
-  // Search by student (Hebrew field name) and billing month
-  // For linked record, use direct ID comparison
-  const billingFilter = `AND(
-    {תלמיד} = "${studentRecordId}",
-    {חודש חיוב} = "${billingMonth}"
-  )`;
-  
-  const matchingBills = await client.listRecords<BillingAirtableFields>(
-    billingTableId,
-    { filterByFormula: billingFilter }
-  );
+  // 5. Check existing billing record
+  let matchingBills: AirtableRecord<BillingAirtableFields>[];
+  if (prefetchedData?.existingBill) {
+    matchingBills = [prefetchedData.existingBill];
+  } else {
+    // Use helper function to handle both Date and Text field types
+    const billingMonthFilter = buildBillingMonthFilter('חודש חיוב', billingMonth);
+    const billingFilter = `AND(
+      {full_name} = "${studentRecordId}",
+      ${billingMonthFilter}
+    )`;
+    matchingBills = await client.listRecords<BillingAirtableFields>(
+      billingTableId,
+      { filterByFormula: billingFilter }
+    );
+  }
 
   // Check for duplicates - CRITICAL: Stop immediately if duplicates found
   if (matchingBills.length > 1) {
@@ -306,8 +384,12 @@ export async function buildStudentMonth(
     throw duplicateError;
   }
 
+  // Get existing bill if it exists (for preserving manual adjustments)
+  const existingBill = matchingBills.length === 1 ? matchingBills[0] : null;
+  const existingFields = existingBill?.fields;
+
   // Determine status
-  const isPaid = matchingBills.length === 1 ? matchingBills[0].fields['שולם'] === true : false;
+  const isPaid = existingBill ? existingBill.fields['שולם'] === true : false;
   const status = determineBillingStatus(
     cancellationsResult.pendingCancellationsCount,
     isPaid
@@ -317,11 +399,33 @@ export async function buildStudentMonth(
   // CRITICAL: Ensure student link field is properly set
   // The 'תלמיד' field expects a linked record (can be string ID or array)
   // Based on schema, it should be a single linked record (string)
+  // NOTE: 'חודש חיוב' field may be Date or Text - try Date format first (YYYY-MM-01)
+  // Airtable will accept this format for Date fields, and if it's Text, we'll handle it in error handling
+  const billingMonthValue = convertBillingMonthToAirtableValue(billingMonth, true);
+  
+  // Preserve manual adjustment fields if they exist in existing bill
+  // IMPORTANT: These fields are set manually by users and should NOT be overwritten
+  
   const billingFields: Partial<BillingAirtableFields> = {
-    'חודש חיוב': billingMonth,
+    'חודש חיוב': billingMonthValue as any, // Cast to any to allow both string and Date formats
     'שולם': isPaid,
     'מאושר לחיוב': status === 'approved' || status === 'paid',
-    'תלמיד': studentRecordId, // Linked record field - Airtable accepts record ID string
+    'full_name': [studentRecordId], // Linked record field - using full_name as per mapping
+    'lessons_amount': lessonsContribution.lessonsTotal,
+    'subscriptions_amount': subscriptionsResult.subscriptionsTotal,
+    'cancellations_amount': cancellationsResult.cancellationsTotal,
+    'total_amount': total,
+    'lessons_count': lessonsContribution.lessonsCount,
+    // Preserve manual adjustment fields if they exist (CRITICAL: don't overwrite user-set values)
+    ...(existingFields?.manual_adjustment_amount !== undefined && existingFields.manual_adjustment_amount !== null && {
+      manual_adjustment_amount: existingFields.manual_adjustment_amount,
+    }),
+    ...(existingFields?.manual_adjustment_reason !== undefined && existingFields.manual_adjustment_reason !== null && existingFields.manual_adjustment_reason !== '' && {
+      manual_adjustment_reason: existingFields.manual_adjustment_reason,
+    }),
+    ...(existingFields?.manual_adjustment_date !== undefined && existingFields.manual_adjustment_date !== null && existingFields.manual_adjustment_date !== '' && {
+      manual_adjustment_date: existingFields.manual_adjustment_date,
+    }),
   };
 
   // Validate that studentRecordId is a valid record ID format
@@ -401,6 +505,8 @@ export async function buildMonthForAllActiveStudents(
   const studentsTableId = client.getTableId('students');
   const lessonsTableId = client.getTableId('lessons');
   const cancellationsTableId = client.getTableId('cancellations');
+  const subscriptionsTableId = client.getTableId('subscriptions');
+  const billingTableId = client.getTableId('monthlyBills');
 
   // Calculate date range for the billing month
   const [year, month] = billingMonth.split('-').map(Number);
@@ -409,16 +515,19 @@ export async function buildMonthForAllActiveStudents(
   const startDateStr = startDate.toISOString().split('T')[0];
   const endDateStr = endDate.toISOString().split('T')[0];
 
+  if (isDev) {
+    console.log(`[BillingEngine] Starting bulk build for ${billingMonth}. Fetching all data...`);
+  }
 
-  // Fetch all active students
+  // 1. Fetch all active students
   const activeStudentsFilter = '{is_active} = 1';
   const students = await client.listRecords<StudentsAirtableFields>(
     studentsTableId,
     { filterByFormula: activeStudentsFilter }
   );
 
-
-  // Fetch all lessons for the billing month (for validation)
+  // 2. Fetch ALL lessons for the billing month
+  // 2. Fetch ALL lessons for the billing month
   const lessonsFilter = `OR(
     {billing_month} = "${billingMonth}",
     AND(
@@ -432,24 +541,73 @@ export async function buildMonthForAllActiveStudents(
     { filterByFormula: lessonsFilter }
   );
 
-
-  // Fetch all cancellations for the billing month
+  // 3. Fetch ALL cancellations for the billing month
   const cancellationsFilter = `{billing_month} = "${billingMonth}"`;
   const allCancellations = await client.listRecords<CancellationsAirtableFields>(
     cancellationsTableId,
     { filterByFormula: cancellationsFilter }
   );
 
+  // 4. Fetch ALL subscriptions (grouped by student)
+  const allSubscriptions = await client.listRecords<SubscriptionsAirtableFields>(
+    subscriptionsTableId
+  );
 
-  // Hard assertion: If UI shows lessons exist but we fetched 0, throw error
-  if (allLessons.length === 0 && import.meta.env?.DEV) {
-    // Try a broader query to see what lessons exist
-    const broaderLessons = await client.listRecords<LessonsAirtableFields>(
-      lessonsTableId,
-      { maxRecords: 5 }
-    );
-    
-    // No lessons found for this month
+  // 5. Fetch ALL existing bills for this month
+  // Use helper function to handle both Date and Text field types
+  const billsFilter = buildBillingMonthFilter('חודש חיוב', billingMonth);
+  const allExistingBills = await client.listRecords<BillingAirtableFields>(
+    billingTableId,
+    { filterByFormula: billsFilter }
+  );
+
+  console.log(`[BillingEngine] Data fetched: ${students.length} students, ${allLessons.length} lessons, ${allCancellations.length} cancellations, ${allSubscriptions.length} subscriptions, ${allExistingBills.length} existing bills.`);
+
+  // Group data by studentId for fast lookup
+  const lessonsByStudent = new Map<string, AirtableRecord<LessonsAirtableFields>[]>();
+  for (const lesson of allLessons) {
+    // Check multiple possible fields for student link
+    const studentLink = lesson.fields.full_name || (lesson.fields as any).Student || (lesson.fields as any).תלמיד;
+    const sIds = getAllStudentIds(studentLink);
+    for (const sId of sIds) {
+      if (!lessonsByStudent.has(sId)) lessonsByStudent.set(sId, []);
+      lessonsByStudent.get(sId)!.push(lesson);
+    }
+  }
+
+  const cancellationsByStudent = new Map<string, AirtableRecord<CancellationsAirtableFields>[]>();
+  for (const cancellation of allCancellations) {
+    if (!cancellation.fields.student) continue;
+    try {
+      const sId = extractStudentId(cancellation.fields.student);
+      if (!cancellationsByStudent.has(sId)) cancellationsByStudent.set(sId, []);
+      cancellationsByStudent.get(sId)!.push(cancellation);
+    } catch (e) {
+      console.warn(`[BillingEngine] Skipping cancellation ${cancellation.id} due to invalid student link`);
+    }
+  }
+
+  const subscriptionsByStudent = new Map<string, AirtableRecord<SubscriptionsAirtableFields>[]>();
+  for (const sub of allSubscriptions) {
+    if (!sub.fields.student_id) continue;
+    try {
+      const sId = extractStudentId(sub.fields.student_id);
+      if (!subscriptionsByStudent.has(sId)) subscriptionsByStudent.set(sId, []);
+      subscriptionsByStudent.get(sId)!.push(sub);
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  const billsByStudent = new Map<string, AirtableRecord<BillingAirtableFields>>();
+  for (const bill of allExistingBills) {
+    if (!bill.fields.full_name) continue;
+    try {
+      const sId = extractStudentId(bill.fields.full_name);
+      billsByStudent.set(sId, bill);
+    } catch (e) {
+      // ignore
+    }
   }
 
   const success: BillingResult[] = [];
@@ -460,20 +618,35 @@ export async function buildMonthForAllActiveStudents(
   let chargesUpdated = 0;
   let chargesSkipped = 0;
 
-  // Sample one student for detailed logging
-  const sampleStudentIndex = Math.min(2, students.length - 1);
-
   for (let i = 0; i < students.length; i++) {
     const student = students[i];
-    const isSampleStudent = i === sampleStudentIndex;
+    const sId = student.id;
 
+    if (isDev) {
+      console.log(`[BillingEngine] Processing student ${i+1}/${students.length}: ${student.fields.full_name} (${sId})`);
+    }
+    
+    // Always log progress in browser console during this debug phase
+    console.info(`[BillingEngine] Processing ${i+1}/${students.length}: ${student.fields.full_name}`);
 
     try {
-      const result = await buildStudentMonth(client, student.id, billingMonth, runId);
+      const result = await buildStudentMonth(
+        client, 
+        sId, 
+        billingMonth, 
+        runId,
+        {
+          student,
+          lessons: lessonsByStudent.get(sId) || [],
+          cancellations: cancellationsByStudent.get(sId) || [],
+          subscriptions: subscriptionsByStudent.get(sId) || [],
+          existingBill: billsByStudent.get(sId)
+        }
+      );
       
       if (result instanceof MissingFieldsError || result instanceof DomainError) {
         errors.push({
-          studentId: student.id,
+          studentId: sId,
           error: result,
         });
       } else {
@@ -483,26 +656,19 @@ export async function buildMonthForAllActiveStudents(
         } else {
           chargesUpdated++;
         }
-
       }
     } catch (error: any) {
       if (error instanceof DuplicateBillingRecordsError) {
-        // Don't process further for this student
-        errors.push({
-          studentId: student.id,
-          error,
-        });
+        errors.push({ studentId: sId, error });
       } else if (error instanceof DomainError && error.code === 'NO_BILLABLE_DATA') {
-        // This is expected - student has no billable data for this month
         chargesSkipped++;
         skipped.push({
-          studentId: student.id,
+          studentId: sId,
           reason: error.message || 'No billable data',
         });
-        
       } else {
         errors.push({
-          studentId: student.id,
+          studentId: sId,
           error: new DomainError(
             error.message || 'Unknown error',
             'UNKNOWN_ERROR',
@@ -521,34 +687,6 @@ export async function buildMonthForAllActiveStudents(
     chargesUpdated,
     chargesSkipped,
   };
-
-  if (dryRun) {
-    // In dry-run mode, print summary table
-    console.log('\n=== DRY RUN SUMMARY ===');
-    console.log(`Billing Month: ${billingMonth}`);
-    console.log(`Date Range: ${startDateStr} to ${endDateStr}`);
-    console.log(`\nStudents: ${summary.studentsFetched}`);
-    console.log(`Lessons: ${summary.lessonsFetched}`);
-    console.log(`Cancellations: ${summary.cancellationsFetched}`);
-    console.log(`\nCharges:`);
-    console.log(`  - Would Create: ${summary.chargesCreated}`);
-    console.log(`  - Would Update: ${summary.chargesUpdated}`);
-    console.log(`  - Would Skip: ${summary.chargesSkipped}`);
-    
-    if (success.length > 0) {
-      console.log(`\nSample Results (first 5):`);
-      success.slice(0, 5).forEach((result, idx) => {
-        const student = students.find(s => s.id === result.studentRecordId);
-        console.log(`\n${idx + 1}. ${student?.fields.full_name || result.studentRecordId}`);
-        console.log(`   Record ID: ${result.studentRecordId}`);
-        console.log(`   Lessons: ${result.lessonsCount} (₪${result.lessonsTotal})`);
-        console.log(`   Cancellations: ${result.cancellationsCount} (₪${result.cancellationsTotal})`);
-        console.log(`   Subscriptions: ₪${result.subscriptionsTotal}`);
-        console.log(`   Total: ₪${result.total}`);
-        console.log(`   Action: ${result.created ? 'CREATE' : 'UPDATE'}`);
-      });
-    }
-  }
 
   return { success, errors, skipped, summary };
 }

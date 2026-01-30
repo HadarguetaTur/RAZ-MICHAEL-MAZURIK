@@ -9,15 +9,13 @@ interface LayoutProps {
 
 const NAV_ITEMS = [
   { id: 'calendar', label: 'יומן שיעורים' },
-  { id: 'inbox', label: 'תיבת הודעות' },
   { id: 'dashboard', label: 'לוח בקרה' },
   { id: 'billing', label: 'חיובים ותשלומים' },
   { id: 'subscriptions', label: 'ניהול מנויים' },
   { id: 'homework', label: 'שיעורי בית' },
   { id: 'students', label: 'תלמידים' },
   { id: 'availability', label: 'ניהול זמינות' },
-  { id: 'errors', label: 'מרכז שגיאות' },
-  { id: 'settings', label: 'הגדרות' },
+  { id: 'users', label: 'ניהול משתמשים' },
 ];
 
 const Layout: React.FC<LayoutProps> = ({ children, activeTab, setActiveTab }) => {
@@ -52,9 +50,6 @@ const Layout: React.FC<LayoutProps> = ({ children, activeTab, setActiveTab }) =>
             }`}
           >
             <span className="text-[14px] font-semibold">{item.label}</span>
-            {item.id === 'inbox' && (
-              <span className={`text-[10px] px-2 py-0.5 rounded-full font-black ${activeTab === item.id ? 'bg-white text-blue-600' : 'bg-rose-500 text-white'}`}>3</span>
-            )}
           </button>
         ))}
       </nav>

@@ -57,14 +57,29 @@ export function extractLessonId(linkedRecord: LinkedRecord): string {
  * Check if lesson should be excluded (cancelled)
  */
 export function isLessonExcluded(status: string): boolean {
-  return status === 'בוטל' || status === 'בוטל ע"י מנהל';
+  if (!status) return false;
+  // Trim whitespace to handle cases with trailing spaces
+  const trimmedStatus = status.trim();
+  return trimmedStatus === 'בוטל' || trimmedStatus === 'בוטל ע"י מנהל';
+}
+
+/**
+ * Check if lesson status is billable (Completed or Scheduled)
+ */
+export function isBillableStatus(status: string): boolean {
+  if (!status) return false;
+  // Trim whitespace to handle cases like "מתוכנן " (with trailing space)
+  const trimmedStatus = status.trim();
+  return trimmedStatus === 'הסתיים' || trimmedStatus === 'מתוכנן' || trimmedStatus === 'בוצע' || trimmedStatus === 'אישר הגעה' || trimmedStatus === 'attended' || trimmedStatus === 'scheduled';
 }
 
 /**
  * Check if lesson type is private
  */
 export function isPrivateLesson(lessonType: string): boolean {
-  return lessonType === 'פרטי';
+  if (!lessonType) return false;
+  // Trim whitespace to handle cases with trailing spaces
+  return lessonType.trim() === 'פרטי';
 }
 
 /**
@@ -102,20 +117,54 @@ export function calculateLessonsContribution(
     example_values: string[];
   }> = [];
 
+  // Calculate date range for the billing month (for lessons without billing_month)
+  const [year, month] = billingMonth.split('-').map(Number);
+  const startDate = new Date(year, month - 1, 1, 0, 0, 0, 0);
+  // Get last day of month: new Date(year, month, 0) gives last day of (month-1)
+  const lastDayOfMonth = new Date(year, month, 0).getDate();
+  const endDate = new Date(year, month - 1, lastDayOfMonth, 23, 59, 59, 999);
+  const startDateStr = startDate.toISOString().split('T')[0];
+  const endDateStr = endDate.toISOString().split('T')[0];
+
+  console.log(`[calculateLessonsContribution] Processing ${lessons.length} lessons for student ${targetStudentId}, month ${billingMonth}`);
+  
   for (const lesson of lessons) {
-    // Only include if billing_month matches
-    if (lesson.billing_month !== billingMonth) {
+    // Check if lesson belongs to billing month
+    // First check billing_month field, then fallback to start_datetime
+    let belongsToMonth = false;
+    
+    if (lesson.billing_month === billingMonth) {
+      // billing_month matches exactly
+      belongsToMonth = true;
+    } else if (!lesson.billing_month && lesson.start_datetime) {
+      // billing_month not set, check by start_datetime
+      const lessonDate = new Date(lesson.start_datetime);
+      if (lessonDate >= startDate && lessonDate <= endDate) {
+        belongsToMonth = true;
+      }
+    }
+    
+    if (!belongsToMonth) {
+      console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} skipped: not in billing month (billing_month=${lesson.billing_month}, start_datetime=${lesson.start_datetime})`);
       continue;
     }
 
     // Exclude cancelled lessons
     if (isLessonExcluded(lesson.status)) {
+      console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} skipped: excluded status (${lesson.status})`);
+      continue;
+    }
+
+    // Only include billable statuses (Completed or Scheduled)
+    if (!isBillableStatus(lesson.status)) {
+      console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} skipped: not billable status (${lesson.status})`);
       continue;
     }
 
     // Check if lesson is for this student
     const studentIds = getAllStudentIds(lesson.full_name);
     if (!studentIds.includes(targetStudentId)) {
+      console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} skipped: not for this student (studentIds=${JSON.stringify(studentIds)}, target=${targetStudentId})`);
       continue; // Lesson not for this student
     }
 
@@ -123,6 +172,7 @@ export function calculateLessonsContribution(
     if (hasMultipleStudents(lesson.full_name)) {
       if (isPrivateLesson(lesson.lesson_type)) {
         // Private lesson with multiple students - need split rule
+        console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} skipped: private lesson with multiple students (need business rule)`);
         missingFields.push({
           table: 'lessons',
           field: 'full_name (multi-link)',
@@ -133,18 +183,24 @@ export function calculateLessonsContribution(
       }
       // For זוגי/קבוצתי: amount is 0, so no split needed
       // Continue to next lesson (these contribute 0 anyway)
+      console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} skipped: group/pair lesson (amount=0)`);
       continue;
     }
 
     // Only include private lessons
     if (!isPrivateLesson(lesson.lesson_type)) {
+      console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} skipped: not private lesson (lesson_type=${lesson.lesson_type})`);
       continue;
     }
+    
+    console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} INCLUDED: private lesson, status=${lesson.status}, amount=${calculateLessonAmount(lesson)}`);
 
     const amount = calculateLessonAmount(lesson);
     lessonsTotal += amount;
     lessonsCount++;
   }
+
+  console.log(`[calculateLessonsContribution] Final result for student ${targetStudentId}: lessonsCount=${lessonsCount}, lessonsTotal=${lessonsTotal}`);
 
   if (missingFields.length > 0) {
     return new MissingFieldsError(missingFields);

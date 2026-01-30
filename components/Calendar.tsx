@@ -1,50 +1,101 @@
 
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { Lesson, LessonStatus, Teacher, Student, LessonType, OpenSlotRecord, SlotInventory } from '../types';
+import { Lesson, LessonStatus, Teacher, Student, LessonType, SlotInventory } from '../types';
 import { nexusApi, parseApiError } from '../services/nexusApi';
-import { findOverlappingOpenSlots } from '../services/overlapDetection';
+import { getLessons } from '../data/resources/lessons';
+import { getSlotInventory } from '../data/resources/slotInventory';
 import LessonDetailsModal from './LessonDetailsModal';
+import SlotInventoryModal from './SlotInventoryModal';
 import StudentPicker from './StudentPicker';
 import StudentsPicker from './StudentsPicker';
-import SlotOverlapModal from './ui/SlotOverlapModal';
 import LessonOverlapWarningModal from './ui/LessonOverlapWarningModal';
-import SlotInventoryModal from './SlotInventoryModal';
-import Toast from './Toast';
-import { buildConflictSummary, type ConflictItem } from '../services/conflictsCheckService';
+import type { ConflictItem, CheckConflictsResult } from '../services/conflictsCheckService';
+import { buildConflictSummary } from '../services/conflictsCheckService';
+import { useOpenSlotModal } from '../hooks/useOpenSlotModal';
 import { logConflictOverride } from '../services/eventLog';
 import { isOverlapping } from '../utils/overlaps';
-
-/** Unified calendar row: lesson or open_slot. start/end are ISO strings; layout uses date + time. */
-type CalendarItem =
-  | { kind: 'lesson'; id: string; start: string; end: string; teacherId?: string; title: string; meta: { lesson: Lesson } }
-  | { kind: 'open_slot'; id: string; start: string; end: string; teacherId?: string; title: string; meta: { openSlot: OpenSlotRecord } };
-
-/** Distinct styling for open slots: subtle border/background + "חלון פתוח" tag. Reused in agenda and week/day grid. */
-const OPEN_SLOT_CARD_CLASS =
-  'border-2 border-dashed border-slate-300 bg-slate-50/80';
-const OPEN_SLOT_TAG_CLASS =
-  'text-[10px] font-bold text-slate-500 bg-slate-200/80 px-2 py-0.5 rounded-full border border-slate-300';
-/** Subtle overlap badges – not too prominent */
-const BADGE_OVERLAP_SLOT = 'text-[9px] font-bold text-amber-600/90 bg-amber-50/90 px-1.5 py-0.5 rounded-md border border-amber-200/80';
-const BADGE_OVERLAP_LESSON = 'text-[9px] font-bold text-amber-600/90 bg-amber-50/90 px-1.5 py-0.5 rounded-md border border-amber-200/80';
+import { apiUrl } from '../config/api';
+import { useToast } from '../hooks/useToast';
+import { useConfirmDialog } from '../hooks/useConfirmDialog';
 
 const HOURS = Array.from({ length: 14 }, (_, i) => i + 8); // 08:00 to 21:00
 const DAYS_HEBREW = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'];
 
-/** Compute end time "HH:mm" from start "HH:mm" and duration in minutes. */
-function endTimeFromDuration(startTime: string, durationMin: number): string {
-  const [h, m] = startTime.split(':').map(Number);
-  const total = (h * 60 + (m || 0) + durationMin) % (24 * 60);
-  const hh = Math.floor(total / 60);
-  const mm = total % 60;
-  return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+/**
+ * Helper: Determine if an open slot card should be rendered
+ * Returns false if:
+ * - Status is not "open" (e.g., "closed", "סגור", "blocked")
+ * - Slot has linked lessons (lessons array not empty)
+ * - A lesson exists for the same slot_inventory id (by date, time, teacher)
+ */
+function shouldRenderOpenSlot(
+  slot: SlotInventory,
+  allLessons: Lesson[]
+): boolean {
+  // Guard 1: Status must be "open" (strict check)
+  if (slot.status !== 'open') {
+    if (import.meta.env.DEV) {
+      console.log(`[shouldRenderOpenSlot] Slot ${slot.id} filtered out - status is "${slot.status}", not "open"`);
+    }
+    return false;
+  }
+  
+  // Guard 2: Check if slot has linked lessons (direct check from slot_inventory.lessons field)
+  if (slot.lessons && slot.lessons.length > 0) {
+    if (import.meta.env.DEV) {
+      console.log(`[shouldRenderOpenSlot] Slot ${slot.id} filtered out - has ${slot.lessons.length} linked lesson(s):`, slot.lessons);
+    }
+    return false;
+  }
+  
+  // Guard 3: Check if any lesson matches this slot (by date, time, teacher)
+  // This handles cases where lessons exist but aren't linked to slot_inventory yet
+  // Normalize dates and times for comparison
+  const slotDateNormalized = slot.date.trim();
+  const slotTimeNormalized = slot.startTime.trim().padStart(5, '0'); // Ensure HH:mm format
+  
+  const hasMatchingLesson = allLessons.some(lesson => {
+    const lessonDateNormalized = lesson.date.trim();
+    const lessonTimeNormalized = lesson.startTime.trim().padStart(5, '0');
+    
+    // Match by date, time, and teacher
+    const dateMatches = lessonDateNormalized === slotDateNormalized;
+    const timeMatches = lessonTimeNormalized === slotTimeNormalized;
+    const teacherMatches = lesson.teacherId === slot.teacherId;
+    
+    if (dateMatches && timeMatches && teacherMatches) {
+      if (import.meta.env.DEV) {
+        console.log(`[shouldRenderOpenSlot] Slot ${slot.id} matches lesson ${lesson.id}:`, {
+          slotDate: slotDateNormalized,
+          slotTime: slotTimeNormalized,
+          lessonDate: lessonDateNormalized,
+          lessonTime: lessonTimeNormalized,
+          teacherMatch: teacherMatches,
+        });
+      }
+      return true;
+    }
+    
+    return false;
+  });
+  
+  if (hasMatchingLesson) {
+    if (import.meta.env.DEV) {
+      console.log(`[shouldRenderOpenSlot] Suppressing slot ${slot.id} - has matching lesson`);
+    }
+    return false;
+  }
+  
+  return true;
 }
 
 const Calendar: React.FC = () => {
+  const toast = useToast();
+  const { confirm } = useConfirmDialog();
   const [currentDate, setCurrentDate] = useState(new Date());
   const [viewMode, setViewMode] = useState<'week' | 'day' | 'agenda' | 'recurring'>(window.innerWidth < 768 ? 'agenda' : 'week');
   const [lessons, setLessons] = useState<Lesson[]>([]);
-  const [openSlots, setOpenSlots] = useState<OpenSlotRecord[]>([]);
+  const [openSlots, setOpenSlots] = useState<SlotInventory[]>([]);
   const [rawRecords, setRawRecords] = useState<Map<string, any>>(new Map()); // Store raw Airtable records
   const [teachers, setTeachers] = useState<Teacher[]>([]);
   const [students, setStudents] = useState<Student[]>([]);
@@ -52,28 +103,25 @@ const Calendar: React.FC = () => {
   const [selectedLesson, setSelectedLesson] = useState<Lesson | null>(null);
   const [selectedRecord, setSelectedRecord] = useState<any>(null); // Raw Airtable record for modal
   const [isCreating, setIsCreating] = useState(false);
+  const [isOpeningWeek, setIsOpeningWeek] = useState(false);
+  const [openWeekMessage, setOpenWeekMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [editState, setEditState] = useState<Partial<Lesson & { endDate?: string }>>({ studentIds: [], lessonType: 'private' });
   const [isSaving, setIsSaving] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedStudent, setSelectedStudent] = useState<Student | null>(null);
   const [conflicts, setConflicts] = useState<Lesson[]>([]);
+  const [clickedSlot, setClickedSlot] = useState<SlotInventory | null>(null);
+  const slotModal = useOpenSlotModal();
   const [isCheckingConflicts, setIsCheckingConflicts] = useState(false);
   const conflictCheckTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [priceManuallyEdited, setPriceManuallyEdited] = useState(false);
-  const [showSlotOverlapModal, setShowSlotOverlapModal] = useState(false);
-  const [overlappingSlotsForModal, setOverlappingSlotsForModal] = useState<OpenSlotRecord[]>([]);
-  const [isOverlapActionLoading, setIsOverlapActionLoading] = useState(false);
-  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
-  const [editingSlot, setEditingSlot] = useState<OpenSlotRecord | null>(null);
-  const [slotEditForm, setSlotEditForm] = useState<{ date: string; startTime: string; endTime: string }>({ date: '', startTime: '', endTime: '' });
-  const [isSavingSlotEdit, setIsSavingSlotEdit] = useState(false);
-  const [showSlotEditOverlapModal, setShowSlotEditOverlapModal] = useState(false);
-  const [slotEditOverlapConflicts, setSlotEditOverlapConflicts] = useState<ConflictItem[]>([]);
-  const [isCheckingSlotConflictsApi, setIsCheckingSlotConflictsApi] = useState(false);
-  const [showLessonOverlapModal, setShowLessonOverlapModal] = useState(false);
-  const [lessonOverlapConflicts, setLessonOverlapConflicts] = useState<ConflictItem[]>([]);
-  const [isCheckingConflictsApi, setIsCheckingConflictsApi] = useState(false);
-  const [selectedSlot, setSelectedSlot] = useState<OpenSlotRecord | null>(null);
+  const [overlapConflicts, setOverlapConflicts] = useState<ConflictItem[]>([]);
+  const [showOverlapModal, setShowOverlapModal] = useState(false);
+  const [pendingSaveAction, setPendingSaveAction] = useState<(() => Promise<void>) | null>(null);
+  const [realtimeOverlapWarning, setRealtimeOverlapWarning] = useState<{
+    hasOverlap: boolean;
+    conflicts: Array<{ type: 'lesson' | 'slot'; label: string; time: string }>;
+  } | null>(null);
 
   const weekDates = useMemo(() => {
     const dates = [];
@@ -94,64 +142,42 @@ const Calendar: React.FC = () => {
   const startDate = weekDates[0].toISOString().split('T')[0];
   const endDateStr = weekDates[6].toISOString().split('T')[0];
 
-  /** Convert slot_inventory (by date range) to open-slots format. Uses StartDT/EndDT when present, else date+startTime/endTime. */
-  const inventoryToOpenSlots = useCallback((inventory: SlotInventory[]): OpenSlotRecord[] => {
-    return inventory
-      .filter((s) => s.status === 'open')
-      .map((s) => {
-        const slot = s as SlotInventory & { startDT?: string; endDT?: string };
-        const startPart = (slot.startTime || '').length >= 5 ? (slot.startTime || '').slice(0, 5) : (slot.startTime || '00:00');
-        const endPart = (slot.endTime || '').length >= 5 ? (slot.endTime || '').slice(0, 5) : (slot.endTime || '01:00');
-        const startDateTime = slot.startDT ?? new Date(`${slot.date}T${startPart}:00`).toISOString();
-        const endDateTime = slot.endDT ?? new Date(`${slot.date}T${endPart}:00`).toISOString();
-        return {
-          id: slot.id,
-          teacherId: slot.teacherId ?? '',
-          startDateTime,
-          endDateTime,
-          status: 'open' as const,
-        };
-      });
-  }, []);
-
   useEffect(() => {
     const fetchData = async () => {
       setLoading(true);
       try {
-        const [lessonsData, slotInventoryData, teachersData, studentsData] = await Promise.all([
-          nexusApi.getLessons(startDate, endDateStr),
-          nexusApi.getSlotInventory(startDate, endDateStr),
+        const [lessonsData, inventoryData, teachersData, studentsData] = await Promise.all([
+          getLessons({ start: `${startDate}T00:00:00.000Z`, end: `${endDateStr}T23:59:59.999Z` }),
+          getSlotInventory({ start: `${startDate}T00:00:00.000Z`, end: `${endDateStr}T23:59:59.999Z` }),
           nexusApi.getTeachers(),
           nexusApi.getStudents()
         ]);
         setLessons(lessonsData);
-        setOpenSlots(inventoryToOpenSlots(slotInventoryData));
-        // Store raw records if available
-        if ((lessonsData as any).rawRecords) {
-          setRawRecords((lessonsData as any).rawRecords);
+        // Show only OPEN slots in calendar (exclude slots with linked lessons)
+        const filteredOpenSlots = inventoryData.filter(slot => shouldRenderOpenSlot(slot, lessonsData));
+        setOpenSlots(filteredOpenSlots);
+        
+        if (import.meta.env.DEV) {
+          console.log(`[Calendar] Loaded data:`, {
+            lessonsCount: lessonsData.length,
+            inventoryCount: inventoryData.length,
+            openSlotsCount: filteredOpenSlots.length,
+            filteredOut: inventoryData.length - filteredOpenSlots.length,
+          });
         }
+        
+        // Note: rawRecords not available when using resources (only from direct nexusApi calls)
+        // This is fine as rawRecords are mainly used for detailed lesson info
         setTeachers(teachersData);
         setStudents(studentsData);
       } catch (err: any) {
-        if (import.meta.env?.DEV) console.error('[Calendar] Load error:', parseApiError(err));
+        console.error(parseApiError(err));
       } finally {
         setLoading(false);
       }
     };
     fetchData();
-  }, [startDate, endDateStr, inventoryToOpenSlots]);
-
-  const refreshCalendarData = useCallback(async () => {
-    const [lessonsData, slotInventoryData] = await Promise.all([
-      nexusApi.getLessons(startDate, endDateStr),
-      nexusApi.getSlotInventory(startDate, endDateStr),
-    ]);
-    setLessons(lessonsData);
-    setOpenSlots(inventoryToOpenSlots(slotInventoryData));
-    if ((lessonsData as any).rawRecords) {
-      setRawRecords((lessonsData as any).rawRecords);
-    }
-  }, [startDate, endDateStr, inventoryToOpenSlots]);
+  }, [startDate, endDateStr]);
 
   const filteredLessons = useMemo(() => {
     return lessons.filter(l => {
@@ -165,76 +191,101 @@ const Calendar: React.FC = () => {
     });
   }, [lessons, searchTerm, viewMode]);
 
-  const calendarItems = useMemo((): CalendarItem[] => {
-    const lessonItems: CalendarItem[] = filteredLessons.map(l => {
-      const start = `${l.date}T${l.startTime}:00`;
-      const endDt = new Date(start);
-      endDt.setMinutes(endDt.getMinutes() + (l.duration ?? 60));
-      return {
-        kind: 'lesson',
-        id: l.id,
-        start,
-        end: endDt.toISOString(),
-        teacherId: l.teacherId,
-        title: l.studentName,
-        meta: { lesson: l },
-      };
-    });
-    const slotItems: CalendarItem[] = openSlots.map(s => ({
-      kind: 'open_slot' as const,
-      id: s.id,
-      start: s.startDateTime,
-      end: s.endDateTime,
-      teacherId: s.teacherId,
-      title: 'חלון פתוח',
-      meta: { openSlot: s },
-    }));
-    return [...lessonItems, ...slotItems];
-  }, [filteredLessons, openSlots]);
-
-  /** Memoized overlap badges by day+teacher: which lessons overlap a slot, which slots overlap a lesson. No extra server calls. */
-  const overlapBadges = useMemo(() => {
-    const lessonIdsOverlappingSlot = new Set<string>();
-    const slotIdsOverlappingLesson = new Set<string>();
-    const slotDateStr = (s: OpenSlotRecord) => {
-      const d = new Date(s.startDateTime);
-      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    };
-    const lessonsByKey = new Map<string, Lesson[]>();
-    for (const l of filteredLessons) {
-      const k = `${l.date}|${l.teacherId ?? ''}`;
-      if (!lessonsByKey.has(k)) lessonsByKey.set(k, []);
-      lessonsByKey.get(k)!.push(l);
-    }
-    const slotsByKey = new Map<string, OpenSlotRecord[]>();
-    for (const s of openSlots) {
-      const k = `${slotDateStr(s)}|${s.teacherId ?? ''}`;
-      if (!slotsByKey.has(k)) slotsByKey.set(k, []);
-      slotsByKey.get(k)!.push(s);
-    }
-    for (const [key, lessonList] of lessonsByKey) {
-      const slotList = slotsByKey.get(key);
-      if (!slotList?.length) continue;
-      for (const l of lessonList) {
-        const lStart = `${l.date}T${l.startTime.length >= 5 ? l.startTime.slice(0, 5) : l.startTime}:00`;
-        const lEndMs = new Date(lStart).getTime() + (l.duration ?? 60) * 60 * 1000;
-        const lEnd = new Date(lEndMs);
-        for (const s of slotList) {
-          if (isOverlapping(lStart, lEnd, s.startDateTime, s.endDateTime)) {
-            lessonIdsOverlappingSlot.add(l.id);
-            slotIdsOverlappingLesson.add(s.id);
-          }
-        }
+  // Memoized overlap detection: check if a lesson overlaps with any open slot
+  // Logic: filter by teacherId only if both have teacherId; otherwise check all slots for same date
+  const lessonOverlapsSlot = useMemo(() => {
+    const overlapMap = new Map<string, boolean>();
+    
+    filteredLessons.forEach(lesson => {
+      if (!lesson.date || !lesson.startTime || !lesson.duration) {
+        return;
       }
-    }
-    return { lessonIdsOverlappingSlot, slotIdsOverlappingLesson };
+      
+      const key = `${lesson.id}`;
+      const lessonStartISO = new Date(`${lesson.date}T${lesson.startTime}:00`).toISOString();
+      const lessonEndISO = new Date(new Date(lessonStartISO).getTime() + lesson.duration * 60 * 1000).toISOString();
+      
+      const hasOverlap = openSlots.some(slot => {
+        // Must be open slot
+        if (slot.status !== 'open') {
+          return false;
+        }
+        
+        // Must be same date
+        if (slot.date !== lesson.date) {
+          return false;
+        }
+        
+        // Filter by teacherId only if both have teacherId (same logic as overlapDetection.ts)
+        if (
+          lesson.teacherId != null &&
+          lesson.teacherId !== '' &&
+          slot.teacherId != null &&
+          slot.teacherId !== '' &&
+          slot.teacherId !== lesson.teacherId
+        ) {
+          return false;
+        }
+        
+        const slotStartISO = new Date(`${slot.date}T${slot.startTime}:00`).toISOString();
+        const slotEndISO = new Date(`${slot.date}T${slot.endTime}:00`).toISOString();
+        
+        return isOverlapping(lessonStartISO, lessonEndISO, slotStartISO, slotEndISO);
+      });
+      
+      overlapMap.set(key, hasOverlap);
+    });
+    
+    return overlapMap;
   }, [filteredLessons, openSlots]);
 
-  /** Date string (YYYY-MM-DD) for grouping by day column. Uses local date for open_slot. */
-  const itemDate = (item: CalendarItem): string =>
-    item.kind === 'lesson'
-      ? item.meta.lesson.date
-      : (() => { const d = new Date(item.meta.openSlot.startDateTime); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; })();
+  // Memoized overlap detection: check if a slot overlaps with any lesson
+  // Logic: filter by teacherId only if both have teacherId; otherwise check all lessons for same date
+  const slotOverlapsLesson = useMemo(() => {
+    const overlapMap = new Map<string, boolean>();
+    
+    openSlots.forEach(slot => {
+      if (slot.status !== 'open' || !slot.date || !slot.startTime || !slot.endTime) {
+        return;
+      }
+      
+      const key = `${slot.id}`;
+      const slotStartISO = new Date(`${slot.date}T${slot.startTime}:00`).toISOString();
+      const slotEndISO = new Date(`${slot.date}T${slot.endTime}:00`).toISOString();
+      
+      const hasOverlap = filteredLessons.some(lesson => {
+        // Exclude cancelled lessons
+        if (lesson.status === LessonStatus.CANCELLED || lesson.status === LessonStatus.PENDING_CANCEL) {
+          return false;
+        }
+        
+        // Must be same date
+        if (lesson.date !== slot.date) {
+          return false;
+        }
+        
+        // Filter by teacherId only if both have teacherId (same logic as overlapDetection.ts)
+        if (
+          slot.teacherId != null &&
+          slot.teacherId !== '' &&
+          lesson.teacherId != null &&
+          lesson.teacherId !== '' &&
+          lesson.teacherId !== slot.teacherId
+        ) {
+          return false;
+        }
+        
+        const lessonStartISO = new Date(`${lesson.date}T${lesson.startTime}:00`).toISOString();
+        const lessonEndISO = new Date(new Date(lessonStartISO).getTime() + (lesson.duration || 60) * 60 * 1000).toISOString();
+        
+        return isOverlapping(slotStartISO, slotEndISO, lessonStartISO, lessonEndISO);
+      });
+      
+      overlapMap.set(key, hasOverlap);
+    });
+    
+    return overlapMap;
+  }, [openSlots, filteredLessons]);
 
   // Check for conflicts using Airtable API
   const checkConflicts = useCallback(async (
@@ -269,16 +320,17 @@ const Calendar: React.FC = () => {
         teacherId,
         excludeLessonId
       );
+      
       setConflicts(conflictLessons);
     } catch (err: any) {
-      if (import.meta.env?.DEV) console.error('[Calendar] Conflict check error:', err);
+      console.error('Conflict check error:', err);
       setConflicts([]);
     } finally {
       setIsCheckingConflicts(false);
     }
   }, []);
 
-  // Debounced conflict check
+  // Debounced conflict check for lessons
   useEffect(() => {
     if (conflictCheckTimeoutRef.current) {
       clearTimeout(conflictCheckTimeoutRef.current);
@@ -305,6 +357,101 @@ const Calendar: React.FC = () => {
       }
     };
   }, [editState.date, editState.startTime, editState.duration, selectedStudent, editState.teacherId, isCreating, selectedLesson, checkConflicts]);
+
+  // Real-time overlap detection for both lessons and slots (client-side, debounced)
+  // Shows warning in the form before save
+  useEffect(() => {
+    const timeoutId = setTimeout(() => {
+      // Only check if form is open and has required fields
+      if (!(isCreating || selectedLesson) || !editState.date || !editState.startTime || !editState.duration) {
+        setRealtimeOverlapWarning(null);
+        return;
+      }
+
+      const proposedStartISO = new Date(`${editState.date}T${editState.startTime}:00`).toISOString();
+      const proposedEndISO = new Date(new Date(proposedStartISO).getTime() + (editState.duration || 60) * 60 * 1000).toISOString();
+      
+      const conflicts: Array<{ type: 'lesson' | 'slot'; label: string; time: string }> = [];
+
+      // Check overlapping lessons (exclude cancelled and current lesson)
+      filteredLessons.forEach(lesson => {
+        if (lesson.status === LessonStatus.CANCELLED || lesson.status === LessonStatus.PENDING_CANCEL) {
+          return;
+        }
+        if (selectedLesson && lesson.id === selectedLesson.id) {
+          return;
+        }
+        if (lesson.date !== editState.date) {
+          return;
+        }
+        
+        // Filter by teacherId only if both have teacherId
+        if (
+          editState.teacherId != null &&
+          editState.teacherId !== '' &&
+          lesson.teacherId != null &&
+          lesson.teacherId !== '' &&
+          lesson.teacherId !== editState.teacherId
+        ) {
+          return;
+        }
+
+        const existingLessonStartISO = new Date(`${lesson.date}T${lesson.startTime}:00`).toISOString();
+        const existingLessonEndISO = new Date(new Date(existingLessonStartISO).getTime() + (lesson.duration || 60) * 60 * 1000).toISOString();
+        
+        if (isOverlapping(proposedStartISO, proposedEndISO, existingLessonStartISO, existingLessonEndISO)) {
+          conflicts.push({
+            type: 'lesson',
+            label: lesson.studentName || 'שיעור',
+            time: `${lesson.startTime} (${lesson.duration || 60} דק׳)`,
+          });
+        }
+      });
+
+      // Check overlapping open slots
+      openSlots.forEach(slot => {
+        if (slot.status !== 'open') {
+          return;
+        }
+        if (slot.date !== editState.date) {
+          return;
+        }
+        
+        // Filter by teacherId only if both have teacherId
+        if (
+          editState.teacherId != null &&
+          editState.teacherId !== '' &&
+          slot.teacherId != null &&
+          slot.teacherId !== '' &&
+          slot.teacherId !== editState.teacherId
+        ) {
+          return;
+        }
+
+        const slotStartISO = new Date(`${slot.date}T${slot.startTime}:00`).toISOString();
+        const slotEndISO = new Date(`${slot.date}T${slot.endTime}:00`).toISOString();
+        
+        if (isOverlapping(proposedStartISO, proposedEndISO, slotStartISO, slotEndISO)) {
+          conflicts.push({
+            type: 'slot',
+            label: 'חלון פתוח',
+            time: `${slot.startTime}–${slot.endTime}`,
+          });
+        }
+      });
+
+      if (conflicts.length > 0) {
+        setRealtimeOverlapWarning({
+          hasOverlap: true,
+          conflicts,
+        });
+      } else {
+        setRealtimeOverlapWarning(null);
+      }
+    }, 500); // 500ms debounce
+
+    return () => clearTimeout(timeoutId);
+  }, [editState.date, editState.startTime, editState.duration, editState.teacherId, filteredLessons, openSlots, selectedLesson, isCreating]);
 
   // Auto-update price when duration or lessonType changes (only if not manually edited)
   useEffect(() => {
@@ -334,204 +481,201 @@ const Calendar: React.FC = () => {
     });
   };
 
-  /** Performs create or update using current editState/selectedStudent/selectedLesson. Used by handleSave and overlap-modal actions. */
-  const performLessonSave = useCallback(async (): Promise<Lesson> => {
+  const refreshData = async () => {
+    try {
+      if (import.meta.env.DEV) {
+        console.log(`[Calendar.refreshData] Refreshing data for ${startDate} to ${endDateStr}`);
+      }
+      
+      // Use resources that respect cache invalidation
+      const [lessonsData, inventoryData] = await Promise.all([
+        getLessons({ start: `${startDate}T00:00:00.000Z`, end: `${endDateStr}T23:59:59.999Z` }),
+        getSlotInventory({ start: `${startDate}T00:00:00.000Z`, end: `${endDateStr}T23:59:59.999Z` }),
+      ]);
+      
+      setLessons(lessonsData);
+      
+      // Show only OPEN slots in calendar (exclude slots with linked lessons)
+      // Filter aggressively: only show slots that are truly open AND have no matching lessons
+      const filteredOpenSlots = inventoryData.filter(slot => {
+        const shouldRender = shouldRenderOpenSlot(slot, lessonsData);
+        if (!shouldRender && import.meta.env.DEV) {
+          // Log why slot was filtered out
+          const matchingLesson = lessonsData.find(lesson => {
+            const slotDateNormalized = slot.date.trim();
+            const slotTimeNormalized = slot.startTime.trim().padStart(5, '0');
+            const lessonDateNormalized = lesson.date.trim();
+            const lessonTimeNormalized = lesson.startTime.trim().padStart(5, '0');
+            return lessonDateNormalized === slotDateNormalized &&
+                   lessonTimeNormalized === slotTimeNormalized &&
+                   lesson.teacherId === slot.teacherId;
+          });
+          if (matchingLesson) {
+            console.log(`[Calendar.refreshData] Filtered out slot ${slot.id} (${slot.date} ${slot.startTime}) - has matching lesson ${matchingLesson.id}`);
+          }
+        }
+        return shouldRender;
+      });
+      setOpenSlots(filteredOpenSlots);
+      
+      if (import.meta.env.DEV) {
+        console.log(`[Calendar.refreshData] Refreshed data:`, {
+          lessonsCount: lessonsData.length,
+          inventoryCount: inventoryData.length,
+          openSlotsCount: filteredOpenSlots.length,
+          filteredOut: inventoryData.length - filteredOpenSlots.length,
+          inventoryStatuses: inventoryData.map(s => ({ 
+            id: s.id, 
+            status: s.status,
+            date: s.date,
+            startTime: s.startTime,
+            teacherId: s.teacherId,
+          })),
+          lessons: lessonsData.map(l => ({
+            id: l.id,
+            date: l.date,
+            startTime: l.startTime,
+            teacherId: l.teacherId,
+            studentName: l.studentName,
+          })),
+        });
+      }
+    } catch (err) {
+      console.error('Error refreshing calendar data:', err);
+    }
+  };
+
+  // Check conflicts via API endpoint
+  const checkConflictsViaAPI = async (
+    teacherId: string | undefined,
+    date: string,
+    startTime: string,
+    duration: number,
+    recordId?: string
+  ): Promise<CheckConflictsResult | null> => {
+    if (!teacherId || !date || !startTime || !duration) {
+      return null;
+    }
+
+    try {
+      // Calculate end time
+      const startTimeStr = startTime.length === 5 ? `${startTime}:00` : startTime;
+      const startDate = new Date(`${date}T${startTimeStr}`);
+      const endDate = new Date(startDate.getTime() + duration * 60 * 1000);
+      const endTime = `${endDate.getHours().toString().padStart(2, '0')}:${endDate.getMinutes().toString().padStart(2, '0')}`;
+
+      const response = await fetch(apiUrl('/api/conflicts/check'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          entity: 'lesson',
+          recordId: recordId,
+          teacherId: teacherId,
+          date: date,
+          start: startTime,
+          end: endTime,
+        }),
+      });
+
+      if (!response.ok) {
+        console.error('[Calendar] Conflicts check failed:', response.status, response.statusText);
+        return null;
+      }
+
+      const result: CheckConflictsResult = await response.json();
+      return result;
+    } catch (err) {
+      console.error('[Calendar] Conflicts check error:', err);
+      return null;
+    }
+  };
+
+  const performSave = async () => {
     const studentId = selectedStudent?.id || editState.studentId || editState.studentIds?.[0];
-    if (!studentId || typeof studentId !== 'string' || !studentId.startsWith('rec') || !editState.date || !editState.startTime) {
-      throw new Error('חסרים שדות חובה');
-    }
-    if (selectedLesson) {
-      return await nexusApi.updateLesson(selectedLesson.id, {
-        ...editState,
-        studentId,
-        studentName: selectedStudent?.name || editState.studentName,
-      });
-    }
-    return await nexusApi.createLesson({
-      studentId,
-      date: editState.date,
-      startTime: editState.startTime,
-      duration: editState.duration || 60,
-      status: LessonStatus.SCHEDULED,
-      subject: editState.subject || 'מתמטיקה',
-      teacherId: editState.teacherId,
-      notes: editState.notes || '',
-      isPrivate: editState.lessonType === 'private',
-      lessonType: editState.lessonType || 'private',
-      price: editState.price !== undefined ? editState.price : (editState.lessonType === 'private' ? Math.round((editState.duration || 60) * 2.92 * 100) / 100 : undefined),
-    });
-  }, [editState, selectedStudent, selectedLesson]);
-
-  const handleOverlapAction = useCallback(
-    async (action: 'save_anyway' | 'save_and_close' | 'reserve_slot' | 'cancel', selectedSlotId: string) => {
-      if (action === 'cancel') {
-        setShowSlotOverlapModal(false);
-        setOverlappingSlotsForModal([]);
-        return;
-      }
-      setIsOverlapActionLoading(true);
-      try {
-        if (action === 'save_anyway') {
-          await performLessonSave();
-          await refreshCalendarData();
-          setShowSlotOverlapModal(false);
-          setOverlappingSlotsForModal([]);
-          setSelectedLesson(null);
-          setSelectedStudent(null);
-          setIsCreating(false);
-          setConflicts([]);
-          setPriceManuallyEdited(false);
-          return;
-        }
-        if (action === 'save_and_close') {
-          const saved = await performLessonSave();
-          await nexusApi.closeSlotForLesson(selectedSlotId, saved.id);
-          await refreshCalendarData();
-          setShowSlotOverlapModal(false);
-          setOverlappingSlotsForModal([]);
-          setSelectedLesson(null);
-          setSelectedStudent(null);
-          setIsCreating(false);
-          setConflicts([]);
-          setPriceManuallyEdited(false);
-          return;
-        }
-        if (action === 'reserve_slot') {
-          await nexusApi.reserveSlot(selectedSlotId);
-          await refreshCalendarData();
-          setShowSlotOverlapModal(false);
-          setOverlappingSlotsForModal([]);
-          setSelectedLesson(null);
-          setSelectedStudent(null);
-          setIsCreating(false);
-          setConflicts([]);
-          setPriceManuallyEdited(false);
-          return;
-        }
-      } catch (err: any) {
-        setToast({ message: parseApiError(err), type: 'error' });
-      } finally {
-        setIsOverlapActionLoading(false);
-      }
-    },
-    [performLessonSave, refreshCalendarData]
-  );
-
-  const handleEditOpenSlot = useCallback((slot: OpenSlotRecord) => {
-    const start = new Date(slot.startDateTime);
-    const end = new Date(slot.endDateTime);
-    const date = `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}-${String(start.getDate()).padStart(2, '0')}`;
-    const startTime = `${start.getHours().toString().padStart(2, '0')}:${start.getMinutes().toString().padStart(2, '0')}`;
-    const endTime = `${end.getHours().toString().padStart(2, '0')}:${end.getMinutes().toString().padStart(2, '0')}`;
-    setEditingSlot(slot);
-    setSlotEditForm({ date, startTime, endTime });
-    setShowSlotEditOverlapModal(false);
-    setSlotEditOverlapConflicts([]);
-  }, []);
-
-  const handleSlotEditOverlapContinue = useCallback(async () => {
-    if (!editingSlot || !slotEditForm.date || !slotEditForm.startTime || !slotEditForm.endTime) return;
-    const conflictSummary = buildConflictSummary(slotEditOverlapConflicts);
-    logConflictOverride({
-      recordId: editingSlot.id,
-      entity: 'slot_inventory',
-      teacherId: editingSlot.teacherId ?? '',
-      date: slotEditForm.date,
-      conflictSummary: conflictSummary || undefined,
-    });
-    setIsSavingSlotEdit(true);
-    try {
-      await nexusApi.updateSlotInventory(editingSlot.id, {
-        date: slotEditForm.date,
-        startTime: slotEditForm.startTime,
-        endTime: slotEditForm.endTime,
-      });
-      await refreshCalendarData();
-      setShowSlotEditOverlapModal(false);
-      setSlotEditOverlapConflicts([]);
-      setEditingSlot(null);
-      setSlotEditForm({ date: '', startTime: '', endTime: '' });
-    } catch (err: any) {
-      setToast({ message: parseApiError(err), type: 'error' });
-    } finally {
-      setIsSavingSlotEdit(false);
-    }
-  }, [editingSlot, slotEditForm, slotEditOverlapConflicts, refreshCalendarData]);
-
-  const handleSlotEditSave = useCallback(async () => {
-    if (!editingSlot || !slotEditForm.date || !slotEditForm.startTime || !slotEditForm.endTime) return;
-    setIsCheckingSlotConflictsApi(true);
-    let checkResult: { hasConflicts: boolean; conflicts: ConflictItem[] };
-    try {
-      checkResult = await nexusApi.checkConflicts({
-        entity: 'slot_inventory',
-        recordId: editingSlot.id,
-        teacherId: editingSlot.teacherId ?? '',
-        date: slotEditForm.date,
-        start: slotEditForm.startTime,
-        end: slotEditForm.endTime,
-      });
-    } catch (err: any) {
-      setIsCheckingSlotConflictsApi(false);
-      setToast({ message: parseApiError(err), type: 'error' });
-      return;
-    }
-    setIsCheckingSlotConflictsApi(false);
-    if (checkResult.hasConflicts && checkResult.conflicts.length > 0) {
-      setSlotEditOverlapConflicts(checkResult.conflicts);
-      setShowSlotEditOverlapModal(true);
-      return;
-    }
-    setIsSavingSlotEdit(true);
-    try {
-      await nexusApi.updateSlotInventory(editingSlot.id, {
-        date: slotEditForm.date,
-        startTime: slotEditForm.startTime,
-        endTime: slotEditForm.endTime,
-      });
-      await refreshCalendarData();
-      setEditingSlot(null);
-      setSlotEditForm({ date: '', startTime: '', endTime: '' });
-    } catch (err: any) {
-      setToast({ message: parseApiError(err), type: 'error' });
-    } finally {
-      setIsSavingSlotEdit(false);
-    }
-  }, [editingSlot, slotEditForm, refreshCalendarData]);
-
-  const handleLessonOverlapContinue = useCallback(async () => {
-    const conflictSummary = buildConflictSummary(lessonOverlapConflicts);
-    const teacherId = editState.teacherId ?? selectedLesson?.teacherId ?? '';
-    const date = editState.date ?? selectedLesson?.date ?? '';
-    logConflictOverride({
-      recordId: selectedLesson?.id,
-      entity: 'lesson',
-      teacherId: typeof teacherId === 'string' ? teacherId : '',
-      date: typeof date === 'string' ? date : '',
-      conflictSummary: conflictSummary || undefined,
-    });
+    
     setIsSaving(true);
     try {
-      await performLessonSave();
-      await refreshCalendarData();
-      setShowLessonOverlapModal(false);
-      setLessonOverlapConflicts([]);
+      if (selectedLesson) {
+        // Update existing lesson
+        const updated = await nexusApi.updateLesson(selectedLesson.id, {
+          ...editState,
+          studentId: studentId,
+          studentName: selectedStudent?.name || editState.studentName
+        });
+        // Refresh both lessons and slots (slots may have been auto-closed)
+        await refreshData();
+        setSelectedLesson(null);
+        setIsCreating(false);
+      } else {
+        // Create new lesson with server-side validation
+        const newLesson = await nexusApi.createLesson({
+          studentId: studentId,
+          date: editState.date!,
+          startTime: editState.startTime!,
+          duration: editState.duration || 60,
+          status: LessonStatus.SCHEDULED,
+          subject: editState.subject || 'מתמטיקה',
+          teacherId: editState.teacherId,
+          notes: editState.notes || '',
+          isPrivate: editState.lessonType === 'private',
+          lessonType: editState.lessonType || 'private',
+          price: editState.price !== undefined ? editState.price : (editState.lessonType === 'private' ? Math.round((editState.duration || 60) * 2.92 * 100) / 100 : undefined),
+        });
+        
+        // Refresh both lessons and slots to get updated data (slots may have been auto-closed)
+        await refreshData();
+      }
       setSelectedLesson(null);
       setSelectedStudent(null);
       setIsCreating(false);
       setConflicts([]);
       setPriceManuallyEdited(false);
+      setShowOverlapModal(false);
+      setOverlapConflicts([]);
+      setPendingSaveAction(null);
     } catch (err: any) {
-      setToast({ message: parseApiError(err), type: 'error' });
+      if (err.code === 'CONFLICT_ERROR' || err.status === 409) {
+        // Handle conflicts structure: { lessons: Lesson[], openSlots: SlotInventory[] }
+        const conflicts = err.conflicts || {};
+        const lessonConflicts = conflicts.lessons || (Array.isArray(conflicts) ? conflicts : []);
+        const openSlotConflicts = conflicts.openSlots || [];
+        
+        let conflictDetails = '';
+        
+        // Format lesson conflicts
+        if (lessonConflicts.length > 0) {
+          const lessonDetails = lessonConflicts.map((c: Lesson) => 
+            `• ${c.studentName || 'ללא שם'} - ${c.date} ${c.startTime} (${c.duration || 60} דקות)`
+          ).join('\n');
+          conflictDetails += `שיעורים חופפים:\n${lessonDetails}\n\n`;
+        }
+        
+        // Format open slot conflicts
+        if (openSlotConflicts.length > 0) {
+          const slotDetails = openSlotConflicts.map((s: SlotInventory) => 
+            `• חלון פתוח - ${s.date} ${s.startTime}-${s.endTime}${s.teacherName ? ` (${s.teacherName})` : ''}`
+          ).join('\n');
+          conflictDetails += `חלונות פתוחים חופפים:\n${slotDetails}\n\n`;
+        }
+        
+        toast.error(`לא ניתן לקבוע שיעורים חופפים - ${err.message || 'שיעור זה חופף עם שיעור קיים או חלון פתוח'}`);
+      } else {
+        toast.error(parseApiError(err));
+      }
     } finally {
       setIsSaving(false);
     }
-  }, [performLessonSave, refreshCalendarData, lessonOverlapConflicts, editState.teacherId, editState.date, selectedLesson?.id, selectedLesson?.teacherId, selectedLesson?.date]);
+  };
 
   const handleSave = async () => {
+    // Prevent double-submit
+    if (isSaving || isCheckingConflicts) {
+      return;
+    }
+
     // For new lessons, require selectedStudent
     if (isCreating && !selectedStudent) {
-      alert('נא לבחור תלמיד');
+      toast.error('נא לבחור תלמיד');
       return;
     }
 
@@ -539,80 +683,114 @@ const Calendar: React.FC = () => {
     
     // Validate studentId is a valid Airtable record ID (must start with "rec")
     if (!studentId || typeof studentId !== 'string' || !studentId.startsWith('rec')) {
-      alert('שגיאה: יש לבחור תלמיד מהרשימה. נא לנסות שוב.');
-      if (import.meta.env?.DEV) console.error('[Calendar] Invalid studentId:', studentId, 'selectedStudent:', selectedStudent);
+      toast.error('שגיאה: יש לבחור תלמיד מהרשימה. נא לנסות שוב.');
+      console.error('[Calendar] Invalid studentId:', studentId, 'selectedStudent:', selectedStudent);
       return;
     }
     
     if (!editState.date || !editState.startTime) {
-      alert('נא למלא את כל שדות החובה ולבחור תלמיד');
+      toast.error('נא למלא את כל שדות החובה ולבחור תלמיד');
       return;
     }
     
     if (editState.lessonType === 'recurring' && !editState.endDate) {
-      alert('נא להזין תאריך סיום לשיעור מחזורי');
+      toast.error('נא להזין תאריך סיום לשיעור מחזורי');
       return;
     }
 
-    // Non-blocking overlap check via API (lessons + slot_inventory)
-    const duration = editState.duration ?? 60;
-    const endTime = endTimeFromDuration(editState.startTime!, duration);
-    setIsCheckingConflictsApi(true);
-    let checkResult: { hasConflicts: boolean; conflicts: ConflictItem[] };
-    try {
-      checkResult = await nexusApi.checkConflicts({
-        entity: 'lesson',
-        recordId: selectedLesson?.id,
-        teacherId: editState.teacherId ?? '',
-        date: editState.date!,
-        start: editState.startTime!,
-        end: endTime,
-      });
-    } catch (err: any) {
-      setIsCheckingConflictsApi(false);
-      setToast({ message: parseApiError(err), type: 'error' });
-      return;
-    }
-    setIsCheckingConflictsApi(false);
-    if (checkResult.hasConflicts && checkResult.conflicts.length > 0) {
-      setLessonOverlapConflicts(checkResult.conflicts);
-      setShowLessonOverlapModal(true);
+    // Check for conflicts (server-side validation will also happen)
+    if (conflicts.length > 0) {
+      toast.error(`לא ניתן לקבוע שיעורים חופפים - שיעור זה חופף עם ${conflicts.length} שיעור${conflicts.length > 1 ? 'ים' : ''} קיים${conflicts.length > 1 ? 'ים' : ''}`);
       return;
     }
 
-    setIsSaving(true);
+    // Check conflicts via API endpoint before saving
+    setIsCheckingConflicts(true);
     try {
-      await performLessonSave();
-      await refreshCalendarData();
-      setSelectedLesson(null);
-      setSelectedStudent(null);
-      setIsCreating(false);
-      setConflicts([]);
-      setPriceManuallyEdited(false);
-    } catch (err: any) {
-      if (err.code === 'CONFLICT_ERROR' || err.status === 409) {
-        const conflictDetails = err.conflicts?.map((c: Lesson) => 
-          `• ${c.studentName || 'ללא שם'} - ${c.date} ${c.startTime} (${c.duration || 60} דקות)`
-        ).join('\n') || '';
-        alert(`לא ניתן לקבוע שיעורים חופפים!\n\n${err.message || 'שיעור זה חופף עם שיעור קיים'}\n\n${conflictDetails ? `שיעורים חופפים:\n${conflictDetails}\n\n` : ''}אנא בחר זמן אחר.`);
-      } else {
-        alert(parseApiError(err));
+      const conflictsResult = await checkConflictsViaAPI(
+        editState.teacherId,
+        editState.date,
+        editState.startTime,
+        editState.duration || 60,
+        selectedLesson?.id
+      );
+
+      if (conflictsResult && conflictsResult.hasConflicts && conflictsResult.conflicts.length > 0) {
+        // Show overlap warning modal
+        setOverlapConflicts(conflictsResult.conflicts);
+        setPendingSaveAction(() => performSave);
+        setShowOverlapModal(true);
+        setIsCheckingConflicts(false);
+        return;
       }
+    } catch (err) {
+      console.error('[Calendar] Failed to check conflicts:', err);
+      // Continue with save if conflict check fails (non-blocking)
     } finally {
-      setIsSaving(false);
+      setIsCheckingConflicts(false);
     }
+
+    // No conflicts or check failed - proceed with save
+    await performSave();
+  };
+
+  const handleOverlapContinue = async () => {
+    if (pendingSaveAction) {
+      // Log conflict override event
+      const conflictSummary = buildConflictSummary(overlapConflicts);
+      const recordId = selectedLesson?.id;
+      const teacherId = editState.teacherId || selectedLesson?.teacherId || '';
+      const date = editState.date || selectedLesson?.date || '';
+      
+      if (teacherId && date) {
+        logConflictOverride({
+          recordId,
+          entity: 'lesson',
+          teacherId,
+          date,
+          conflictSummary,
+        });
+        
+        if (import.meta.env.DEV) {
+          console.log('[Calendar] Conflict override logged:', {
+            recordId,
+            entity: 'lesson',
+            teacherId: teacherId.slice(0, 8) + '…',
+            date,
+            conflictSummary,
+          });
+        }
+      }
+      
+      await pendingSaveAction();
+    }
+  };
+
+  const handleOverlapBack = () => {
+    setShowOverlapModal(false);
+    setOverlapConflicts([]);
+    setPendingSaveAction(null);
   };
 
   const handleCancel = async () => {
     if (!selectedLesson) return;
-    if (!confirm('האם אתה בטוח שברצונך לבטל את השיעור?')) return;
+    
+    const confirmed = await confirm({
+      title: 'ביטול שיעור',
+      message: 'האם אתה בטוח שברצונך לבטל את השיעור?',
+      variant: 'warning',
+      confirmLabel: 'בטל שיעור',
+      cancelLabel: 'חזור'
+    });
+    if (!confirmed) return;
+    
     setIsSaving(true);
     try {
       const updated = await nexusApi.updateLesson(selectedLesson.id, { status: LessonStatus.CANCELLED });
       setLessons(prev => prev.map(l => l.id === selectedLesson.id ? updated : l));
       setSelectedLesson(null);
     } catch (err: any) {
-      alert(parseApiError(err));
+      toast.error(parseApiError(err));
     } finally {
       setIsSaving(false);
     }
@@ -644,6 +822,42 @@ const Calendar: React.FC = () => {
     setCurrentDate(newDate);
   };
 
+  // Handler for opening a week - creates slots and fixed lessons from weekly_slot templates
+  const handleOpenWeek = async () => {
+    if (isOpeningWeek) return;
+    
+    setIsOpeningWeek(true);
+    setOpenWeekMessage(null);
+    
+    try {
+      // weekDates[0] is Sunday (first day of the displayed week)
+      const weekStart = weekDates[0];
+      console.log(`[Calendar] Opening week starting ${weekStart.toISOString()}`);
+      
+      const result = await nexusApi.openWeekSlots(weekStart);
+      
+      console.log(`[Calendar] Week opened successfully:`, result);
+      setOpenWeekMessage({
+        type: 'success',
+        text: `נפתחו ${result.slotInventoryCount} חלונות ו-${result.fixedLessonsCount} שיעורים קבועים`
+      });
+      
+      // Refresh data after opening week
+      await refreshData();
+      
+      // Auto-dismiss success message after 5 seconds
+      setTimeout(() => setOpenWeekMessage(null), 5000);
+    } catch (error: any) {
+      console.error('[Calendar] Error opening week:', error);
+      setOpenWeekMessage({
+        type: 'error',
+        text: `שגיאה בפתיחת שבוע: ${error.message || 'שגיאה לא ידועה'}`
+      });
+    } finally {
+      setIsOpeningWeek(false);
+    }
+  };
+
   return (
     <div className="flex flex-col h-full gap-6 animate-in fade-in duration-500 w-full overflow-visible">
       <div className="bg-white p-5 rounded-3xl border border-slate-200 shadow-sm flex flex-col lg:flex-row items-center justify-between gap-6 w-full">
@@ -657,6 +871,17 @@ const Calendar: React.FC = () => {
             className="bg-blue-600 text-white px-8 py-3 rounded-2xl font-bold text-sm shadow-md hover:bg-blue-700 transition-all w-full sm:w-auto text-center"
           >
             שיעור חדש
+          </button>
+          <button 
+            onClick={handleOpenWeek}
+            disabled={isOpeningWeek}
+            className={`bg-emerald-600 text-white px-6 py-3 rounded-2xl font-bold text-sm shadow-md transition-all w-full sm:w-auto text-center ${
+              isOpeningWeek 
+                ? 'opacity-60 cursor-not-allowed' 
+                : 'hover:bg-emerald-700'
+            }`}
+          >
+            {isOpeningWeek ? 'פותח שבוע...' : 'פתיחת שבוע'}
           </button>
           <div className="flex items-center bg-slate-50 p-1.5 rounded-2xl border border-slate-100 w-full sm:w-auto">
             <button onClick={() => navigate(-1)} className="px-3 py-2 hover:bg-white rounded-xl transition-all text-slate-400">←</button>
@@ -693,84 +918,116 @@ const Calendar: React.FC = () => {
         </div>
       </div>
 
+      {/* Toast message for open week operation */}
+      {openWeekMessage && (
+        <div 
+          className={`px-6 py-3 rounded-2xl text-sm font-bold shadow-md transition-all ${
+            openWeekMessage.type === 'success' 
+              ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' 
+              : 'bg-red-50 text-red-700 border border-red-200'
+          }`}
+        >
+          <div className="flex items-center justify-between gap-4">
+            <span>{openWeekMessage.text}</span>
+            <button 
+              onClick={() => setOpenWeekMessage(null)}
+              className="text-current opacity-60 hover:opacity-100 transition-opacity"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="flex-1 bg-white rounded-[32px] border border-slate-200 shadow-sm flex flex-col w-full overflow-hidden">
         {(viewMode === 'agenda' || viewMode === 'recurring') ? (
           <div className="flex-1 overflow-y-auto p-6 space-y-6 custom-scrollbar">
             {weekDates.map((date, dayIdx) => {
-              const dateStr = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-              const dayItems = calendarItems.filter(item => itemDate(item) === dateStr);
-              const dayLessons = dayItems.filter((it): it is CalendarItem & { kind: 'lesson' } => it.kind === 'lesson').map(it => it.meta.lesson);
-              const dayOpenSlots = dayItems.filter((it): it is CalendarItem & { kind: 'open_slot' } => it.kind === 'open_slot');
-              if (dayLessons.length === 0 && dayOpenSlots.length === 0) return null;
+              const dayLessons = filteredLessons.filter(l => new Date(l.date).toDateString() === date.toDateString());
+              // Filter slots by date AND ensure they should be rendered (double-check with shouldRenderOpenSlot)
+              const daySlots = openSlots
+                .filter(s => new Date(s.date).toDateString() === date.toDateString())
+                .filter(slot => shouldRenderOpenSlot(slot, lessons));
+              
+              if (dayLessons.length === 0 && daySlots.length === 0) return null;
+              
               return (
                 <div key={dayIdx} className="space-y-3">
                   <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest pt-2 px-2">
                     {DAYS_HEBREW[date.getDay()]}, {date.toLocaleDateString('he-IL', { day: 'numeric', month: 'short' })}
                   </h3>
-                  {dayLessons.map(lesson => (
-                    <button
-                      key={lesson.id}
-                      onClick={() => { 
-                        setSelectedLesson(lesson);
-                        const student = students.find(s => s.id === lesson.studentId);
-                        setSelectedStudent(student || null);
-                        setEditState({ ...lesson, studentIds: lesson.studentIds || [lesson.studentId] }); 
-                      }}
-                      className={`w-full bg-white p-5 rounded-2xl border border-slate-100 shadow-sm flex items-center justify-between text-right hover:border-blue-200 transition-all ${lesson.status === LessonStatus.CANCELLED ? 'opacity-50' : ''}`}
-                    >
-                      <div className="flex items-center gap-6">
-                         <div className="w-12 h-12 bg-slate-50 text-slate-900 rounded-xl flex items-center justify-center border border-slate-100">
-                            <span className="text-xs font-bold">{lesson.startTime}</span>
-                         </div>
-                         <div className="text-right">
-                            <div className="font-bold text-slate-900">{lesson.studentName}</div>
-                            <div className="text-[10px] font-medium text-slate-400">{lesson.subject} • {lesson.duration} דק׳ • {
-                              lesson.lessonType === 'private' ? 'פרטי' : 
-                              lesson.lessonType === 'pair' ? 'זוגי' : 
-                              lesson.lessonType === 'recurring' ? 'מחזורי' : 'קבוצתי'
-                            }</div>
-                         </div>
-                      </div>
-                      <div className="flex items-center gap-1.5">
-                        {overlapBadges.lessonIdsOverlappingSlot.has(lesson.id) && (
-                          <span className={BADGE_OVERLAP_LESSON}>חופף לחלון</span>
-                        )}
-                        <span className={`px-3 py-1 rounded-full text-[10px] font-bold border ${
+                  {dayLessons.map(lesson => {
+                    const hasOverlapWithSlot = lessonOverlapsSlot.get(lesson.id) || false;
+                    return (
+                      <button
+                        key={lesson.id}
+                        onClick={() => { 
+                          setSelectedLesson(lesson);
+                          const student = students.find(s => s.id === lesson.studentId);
+                          setSelectedStudent(student || null);
+                          setEditState({ ...lesson, studentIds: lesson.studentIds || [lesson.studentId] }); 
+                        }}
+                        className={`w-full bg-white p-5 rounded-2xl border border-slate-100 shadow-sm flex items-center justify-between text-right hover:border-blue-200 transition-all ${lesson.status === LessonStatus.CANCELLED ? 'opacity-50' : ''}`}
+                      >
+                        <div className="flex items-center gap-6">
+                           <div className="w-12 h-12 bg-slate-50 text-slate-900 rounded-xl flex items-center justify-center border border-slate-100">
+                              <span className="text-xs font-bold">{lesson.startTime}</span>
+                           </div>
+                           <div className="text-right flex-1">
+                              <div className="flex items-center gap-2">
+                                <div className="font-bold text-slate-900">{lesson.studentName}</div>
+                                {hasOverlapWithSlot && (
+                                  <span className="text-[9px] font-bold text-amber-600 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded-full">
+                                    חופף לחלון
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-[10px] font-medium text-slate-400">{lesson.subject} • {lesson.duration} דק׳ • {
+                                lesson.lessonType === 'private' ? 'פרטי' : 
+                                lesson.lessonType === 'pair' ? 'זוגי' : 
+                                lesson.lessonType === 'recurring' ? 'מחזורי' : 'קבוצתי'
+                              }</div>
+                           </div>
+                        </div>
+                        <div className={`px-3 py-1 rounded-full text-[10px] font-bold border ${
                           lesson.status === LessonStatus.COMPLETED ? 'bg-emerald-50 text-emerald-600 border-emerald-100' : 
                           lesson.status === LessonStatus.CANCELLED ? 'bg-slate-50 text-slate-400 border-slate-200' : 
                           'bg-blue-50 text-blue-600 border-blue-100'
                         }`}>
                           {lesson.status}
-                        </span>
-                      </div>
-                    </button>
-                  ))}
-                  {dayOpenSlots.map(item => {
-                    const s = item.meta.openSlot;
-                    const start = new Date(s.startDateTime);
-                    const end = new Date(s.endDateTime);
-                    const timeStr = `${start.getHours().toString().padStart(2, '0')}:${start.getMinutes().toString().padStart(2, '0')}–${end.getHours().toString().padStart(2, '0')}:${end.getMinutes().toString().padStart(2, '0')}`;
+                        </div>
+                      </button>
+                    );
+                  })}
+                  {daySlots.map(slot => {
+                    const hasOverlapWithLesson = slotOverlapsLesson.get(slot.id) || false;
                     return (
                       <button
-                        key={item.id}
-                        type="button"
-                        onClick={() => setSelectedSlot(s)}
-                        className={`w-full p-5 rounded-2xl flex items-center justify-between text-right group/slot ${OPEN_SLOT_CARD_CLASS} hover:border-slate-400 transition-all cursor-pointer`}
+                        key={slot.id}
+                        onClick={() => slotModal.open(slot.id, slot)}
+                        className="w-full bg-cyan-50/30 p-5 rounded-2xl border border-cyan-100 shadow-sm flex items-center justify-between text-right hover:border-cyan-300 transition-all group"
                       >
-                        <div className="flex items-center gap-6">
-                          <div className="w-12 h-12 bg-slate-100 text-slate-600 rounded-xl flex items-center justify-center border border-slate-200">
-                            <span className="text-xs font-bold">{timeStr.slice(0, 5)}</span>
-                          </div>
-                          <div className="text-right">
-                            <div className="font-bold text-slate-600">חלון פתוח</div>
-                            <div className="text-[10px] font-medium text-slate-400">{timeStr}</div>
-                          </div>
+                        <div className="flex items-center gap-6 flex-1 min-w-0">
+                           <div className="w-12 h-12 bg-cyan-50 text-cyan-700 rounded-xl flex items-center justify-center border border-cyan-100 shrink-0">
+                              <span className="text-xs font-black">{slot.startTime}</span>
+                           </div>
+                           <div className="text-right flex-1 min-w-0">
+                              <div className="flex items-center gap-2">
+                                <div className="font-black text-cyan-900 leading-tight">חלון פתוח</div>
+                                {hasOverlapWithLesson && (
+                                  <span className="text-[9px] font-bold text-amber-600 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded-full">
+                                    חופף
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-[10px] font-bold text-cyan-600/70 leading-tight mt-0.5">{slot.startTime}–{slot.endTime}</div>
+                              {slot.teacherName && (
+                                <div className="text-[9px] font-medium text-cyan-500/60 leading-tight mt-0.5">{slot.teacherName}</div>
+                              )}
+                           </div>
                         </div>
-                        <div className="flex items-center gap-2">
-                          {overlapBadges.slotIdsOverlappingLesson.has(s.id) && (
-                            <span className={BADGE_OVERLAP_SLOT}>חופף</span>
-                          )}
-                          <span className={OPEN_SLOT_TAG_CLASS}>חלון פתוח</span>
+                        <div className="px-3 py-1 rounded-full text-[10px] font-black border bg-white text-cyan-600 border-cyan-100 shadow-sm group-hover:bg-cyan-600 group-hover:text-white transition-all shrink-0">
+                          שריין עכשיו
                         </div>
                       </button>
                     );
@@ -802,12 +1059,7 @@ const Calendar: React.FC = () => {
                     </div>
                   ))}
                 </div>
-                {(viewMode === 'day' ? [currentDate] : weekDates).map((date, dayIdx) => {
-                  const dateStr = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-                  const dayItems = calendarItems.filter(item => itemDate(item) === dateStr);
-                  const dayOpenSlots = dayItems.filter((it): it is CalendarItem & { kind: 'open_slot' } => it.kind === 'open_slot');
-                  const dayLessons = dayItems.filter((it): it is CalendarItem & { kind: 'lesson' } => it.kind === 'lesson');
-                  return (
+                {(viewMode === 'day' ? [currentDate] : weekDates).map((date, dayIdx) => (
                   <div key={dayIdx} className="flex-1 border-l border-slate-100 last:border-l-0 relative min-h-[1344px]">
                     {HOURS.map(hour => (
                       <div 
@@ -816,56 +1068,38 @@ const Calendar: React.FC = () => {
                         onClick={() => handleSlotClick(date, hour)}
                       ></div>
                     ))}
-                    {dayOpenSlots.map(item => {
-                      const s = item.meta.openSlot;
-                      const startD = new Date(s.startDateTime);
-                      const endD = new Date(s.endDateTime);
-                      const topOffset = (startD.getHours() - 8) * 96 + (startD.getMinutes() / 60) * 96;
-                      const height = Math.max(24, ((endD.getTime() - startD.getTime()) / 60000) * (96 / 60));
-                      return (
-                        <button
-                          key={item.id}
-                          type="button"
-                          style={{ top: `${topOffset}px`, height: `${height}px` }}
-                          className={`absolute left-2 right-2 rounded-xl flex flex-col justify-center items-center gap-0.5 z-[1] hover:border-slate-400 hover:bg-slate-100/80 transition-colors cursor-pointer ${OPEN_SLOT_CARD_CLASS}`}
-                          title={`חלון פתוח ${s.startDateTime.slice(11, 16)}–${s.endDateTime.slice(11, 16)} — לחץ לפעולה`}
-                          onClick={() => setSelectedSlot(s)}
-                        >
-                          {overlapBadges.slotIdsOverlappingLesson.has(s.id) && (
-                            <span className={BADGE_OVERLAP_SLOT}>חופף</span>
-                          )}
-                          <span className={OPEN_SLOT_TAG_CLASS}>חלון פתוח</span>
-                        </button>
-                      );
-                    })}
-                    {dayLessons.map(item => {
-                      const lesson = item.meta.lesson;
-                      const hour = parseInt(lesson.startTime.split(':')[0]);
-                      const mins = parseInt(lesson.startTime.split(':')[1]);
-                      const topOffset = (hour - 8) * 96 + (mins / 60) * 96;
-                      const height = (lesson.duration / 60) * 96;
-                      const rawRecord = rawRecords.get(lesson.id);
-                      return (
+                    {filteredLessons
+                      .filter(l => new Date(l.date).toDateString() === date.toDateString())
+                      .map(lesson => {
+                        const hour = parseInt(lesson.startTime.split(':')[0]);
+                        const mins = parseInt(lesson.startTime.split(':')[1]);
+                        const topOffset = (hour - 8) * 96 + (mins / 60) * 96;
+                        const height = (lesson.duration / 60) * 96;
+                        const hasOverlapWithSlot = lessonOverlapsSlot.get(lesson.id) || false;
+                        return (
                           <button
                             key={lesson.id}
                             onClick={() => { 
                               setSelectedLesson(lesson);
                               setSelectedRecord(rawRecords.get(lesson.id) || null);
+                              // Set selected student from lesson
                               const student = students.find(s => s.id === lesson.studentId);
                               setSelectedStudent(student || null);
                               setEditState({ ...lesson, studentIds: lesson.studentIds || [lesson.studentId] }); 
                             }}
                             style={{ top: `${topOffset}px`, height: `${height}px` }}
-                            className={`absolute left-1.5 right-1.5 rounded-2xl p-4 text-right border-r-4 shadow-sm border border-slate-200 flex flex-col justify-between overflow-hidden bg-white hover:z-10 transition-all z-[5] ${
+                            className={`absolute left-1.5 right-1.5 rounded-2xl p-4 text-right border-r-4 shadow-sm border border-slate-200 flex flex-col justify-between overflow-hidden bg-white hover:z-10 transition-all ${
                               lesson.lessonType === 'recurring' ? 'border-indigo-600' : 
                               lesson.lessonType === 'group' ? 'border-amber-600' : 'border-blue-600'
                             }`}
                             title={lesson.notes ? `${lesson.studentName} - ${lesson.notes}` : lesson.studentName}
                           >
-                            <div className="flex items-start justify-between gap-1 min-w-0">
-                              <div className="font-bold text-sm leading-tight text-slate-900 line-clamp-1 min-w-0">{lesson.studentName}</div>
-                              {overlapBadges.lessonIdsOverlappingSlot.has(lesson.id) && (
-                                <span className={BADGE_OVERLAP_LESSON + ' shrink-0'}>חופף לחלון</span>
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="font-bold text-sm leading-tight text-slate-900 line-clamp-1 flex-1">{lesson.studentName}</div>
+                              {hasOverlapWithSlot && (
+                                <span className="text-[8px] font-bold text-amber-600 bg-amber-50 border border-amber-200 px-1 py-0.5 rounded-full shrink-0">
+                                  חופף לחלון
+                                </span>
                               )}
                             </div>
                             {lesson.notes && (
@@ -876,15 +1110,56 @@ const Calendar: React.FC = () => {
                                 {lesson.notes}
                               </div>
                             )}
-                            <div className="hidden sm:flex items-center justify-between mt-2 pt-2 border-t border-slate-50 gap-1">
+                            <div className="hidden sm:flex items-center justify-between mt-2 pt-2 border-t border-slate-50">
                                <div className="text-[10px] font-bold text-slate-400">{lesson.startTime}</div>
                                <div className="text-[10px] font-bold bg-slate-50 text-slate-500 px-2 py-0.5 rounded-full">{lesson.subject}</div>
                             </div>
                           </button>
                         );
-                      })}
+                      })
+                    }
+                    {openSlots
+                      .filter(s => new Date(s.date).toDateString() === date.toDateString())
+                      .filter(slot => shouldRenderOpenSlot(slot, lessons))
+                      .map(slot => {
+                        const hour = parseInt(slot.startTime.split(':')[0]);
+                        const mins = parseInt(slot.startTime.split(':')[1]);
+                        const topOffset = (hour - 8) * 96 + (mins / 60) * 96;
+                        
+                        const endHour = parseInt(slot.endTime.split(':')[0]);
+                        const endMins = parseInt(slot.endTime.split(':')[1]);
+                        const duration = (endHour * 60 + endMins) - (hour * 60 + mins);
+                        const height = (duration / 60) * 96;
+                        const hasOverlapWithLesson = slotOverlapsLesson.get(slot.id) || false;
+
+                        return (
+                          <button
+                            key={slot.id}
+                            onClick={() => {
+                              // Use shared hook to open slot modal with preloaded slot data
+                              slotModal.open(slot.id, slot);
+                            }}
+                            style={{ top: `${topOffset}px`, height: `${height}px` }}
+                            className="absolute left-1.5 right-1.5 rounded-2xl p-4 text-right border-r-4 border-cyan-500 shadow-sm border border-cyan-100 flex flex-col justify-start gap-1 overflow-hidden bg-cyan-50/50 hover:bg-cyan-50 hover:z-10 transition-all group"
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="font-black text-xs text-cyan-700 leading-tight">חלון פתוח</div>
+                              {hasOverlapWithLesson && (
+                                <span className="text-[8px] font-bold text-amber-600 bg-amber-50 border border-amber-200 px-1 py-0.5 rounded-full shrink-0">
+                                  חופף
+                                </span>
+                              )}
+                            </div>
+                            <div className="text-[10px] font-bold text-cyan-600/70 leading-tight">{slot.startTime}–{slot.endTime}</div>
+                            {slot.teacherName && (
+                              <div className="text-[9px] font-medium text-cyan-500/60 leading-tight mt-0.5">{slot.teacherName}</div>
+                            )}
+                          </button>
+                        );
+                      })
+                    }
                   </div>
-                ); })}
+                ))}
               </div>
             </div>
           </div>
@@ -1003,7 +1278,31 @@ const Calendar: React.FC = () => {
                 )}
               </div>
 
-              {/* Conflict Warning */}
+              {/* Real-time Overlap Warning */}
+              {realtimeOverlapWarning && realtimeOverlapWarning.hasOverlap && (
+                <div className="p-4 bg-amber-50 border border-amber-200 rounded-2xl">
+                  <div className="flex items-start gap-3">
+                    <span className="text-amber-600 text-xl">⚠️</span>
+                    <div className="flex-1">
+                      <div className="text-sm font-black text-amber-800 mb-2">
+                        נמצאה חפיפה בלו״ז
+                      </div>
+                      <div className="text-xs font-medium text-amber-700 mb-2">
+                        השיעור המבוקש חופף עם {realtimeOverlapWarning.conflicts.length} פריט{realtimeOverlapWarning.conflicts.length > 1 ? 'ים' : ''} קיים{realtimeOverlapWarning.conflicts.length > 1 ? 'ים' : ''}:
+                      </div>
+                      <div className="space-y-1">
+                        {realtimeOverlapWarning.conflicts.map((conflict, idx) => (
+                          <div key={idx} className="text-xs font-bold text-amber-700">
+                            • {conflict.label} - {conflict.time} {conflict.type === 'lesson' ? '(שיעור)' : '(חלון פתוח)'}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Conflict Warning (server-side check for lessons only) */}
               {isCreating && conflicts.length > 0 && (
                 <div className="p-4 bg-rose-50 border border-rose-200 rounded-2xl">
                   <div className="flex items-start gap-3">
@@ -1034,11 +1333,26 @@ const Calendar: React.FC = () => {
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-3">
                   <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{editState.lessonType === 'recurring' ? 'תאריך התחלה' : 'תאריך'}</label>
-                  <input type="date" className="w-full bg-slate-50 border border-slate-200 rounded-xl p-4 font-bold outline-none focus:bg-white focus:ring-2 focus:ring-blue-100 transition-all" value={editState.date || ''} onChange={(e) => setEditState(p => ({ ...p, date: e.target.value }))} />
+                  <input 
+                    type="date" 
+                    className={`w-full bg-slate-50 border rounded-xl p-4 font-bold outline-none focus:bg-white focus:ring-2 transition-all ${
+                      realtimeOverlapWarning?.hasOverlap ? 'border-amber-300 focus:ring-amber-100' : 'border-slate-200 focus:ring-blue-100'
+                    }`}
+                    value={editState.date || ''} 
+                    onChange={(e) => setEditState(p => ({ ...p, date: e.target.value }))} 
+                  />
                 </div>
                 <div className="space-y-3">
                   <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">שעת התחלה</label>
-                  <input type="time" step="900" className="w-full bg-slate-50 border border-slate-200 rounded-xl p-4 font-bold outline-none focus:bg-white focus:ring-2 focus:ring-blue-100 transition-all" value={editState.startTime || ''} onChange={(e) => setEditState(p => ({ ...p, startTime: e.target.value }))} />
+                  <input 
+                    type="time" 
+                    step="900" 
+                    className={`w-full bg-slate-50 border rounded-xl p-4 font-bold outline-none focus:bg-white focus:ring-2 transition-all ${
+                      realtimeOverlapWarning?.hasOverlap ? 'border-amber-300 focus:ring-amber-100' : 'border-slate-200 focus:ring-blue-100'
+                    }`}
+                    value={editState.startTime || ''} 
+                    onChange={(e) => setEditState(p => ({ ...p, startTime: e.target.value }))} 
+                  />
                 </div>
               </div>
 
@@ -1115,15 +1429,15 @@ const Calendar: React.FC = () => {
 
             <div className="p-8 bg-slate-50 border-t border-slate-100 flex flex-col gap-3 shrink-0">
               <button 
-                disabled={isSaving || isCheckingConflictsApi || (isCreating && !selectedStudent)} 
+                disabled={isSaving || isCheckingConflicts || (isCreating && (conflicts.length > 0 || !selectedStudent))} 
                 onClick={handleSave} 
                 className={`w-full py-4 rounded-2xl font-bold shadow-lg transition-all flex items-center justify-center ${
-                  isSaving || isCheckingConflictsApi || (isCreating && !selectedStudent)
+                  isSaving || isCheckingConflicts || (isCreating && (conflicts.length > 0 || !selectedStudent))
                     ? 'bg-slate-300 text-slate-500 cursor-not-allowed'
                     : 'bg-blue-600 text-white hover:bg-blue-700'
                 }`}
               >
-                {isCheckingConflictsApi ? 'בודק...' : isSaving ? 'מעבד...' : (isCreating ? 'צור שיעור' : 'שמור שינויים')}
+                {isCheckingConflicts ? 'בודק חפיפות...' : isSaving ? 'מעבד...' : (isCreating ? 'צור שיעור' : 'שמור שינויים')}
               </button>
               {!isCreating && (
                 <button disabled={isSaving} onClick={handleCancel} className="w-full py-4 text-rose-600 font-bold hover:bg-rose-50 rounded-2xl transition-all">בטל שיעור</button>
@@ -1149,120 +1463,63 @@ const Calendar: React.FC = () => {
         />
       )}
 
-      {/* Non-blocking overlap confirmation when saving over open slots */}
-      <SlotOverlapModal
-        isOpen={showSlotOverlapModal}
-        overlappingSlots={overlappingSlotsForModal}
-        onAction={handleOverlapAction}
-        onCancel={() => {
-          setShowSlotOverlapModal(false);
-          setOverlappingSlotsForModal([]);
-        }}
-        isLoading={isOverlapActionLoading}
-      />
-
-      {/* Non-blocking lesson overlap warning (API: lessons + slot_inventory) */}
-      <LessonOverlapWarningModal
-        isOpen={showLessonOverlapModal}
-        conflicts={lessonOverlapConflicts}
-        onContinue={handleLessonOverlapContinue}
-        onBack={() => {
-          setShowLessonOverlapModal(false);
-          setLessonOverlapConflicts([]);
-        }}
-        isLoading={isSaving}
-      />
-
-      {/* Edit open slot (slot_inventory) — overlap warning via checkConflicts (lessons + slot_inventory) */}
-      {editingSlot && (
-        <div className="fixed inset-0 z-[150] flex items-center justify-center p-4">
-          <div className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm" onClick={() => { setEditingSlot(null); setSlotEditForm({ date: '', startTime: '', endTime: '' }); setShowSlotEditOverlapModal(false); setSlotEditOverlapConflicts([]); }} />
-          <div className="relative w-full max-w-md bg-white rounded-3xl shadow-2xl p-6 md:p-8 space-y-6 animate-in zoom-in-95 duration-200" onClick={(e) => e.stopPropagation()}>
-            <h3 className="text-xl font-black text-slate-900">עריכת חלון פתוח</h3>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <div className="space-y-2">
-                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">תאריך</label>
-                <input
-                  type="date"
-                  value={slotEditForm.date}
-                  onChange={(e) => setSlotEditForm((f) => ({ ...f, date: e.target.value }))}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 font-bold outline-none focus:ring-2 focus:ring-blue-100"
-                />
-              </div>
-              <div className="space-y-2">
-                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">שעת התחלה</label>
-                <input
-                  type="time"
-                  step="900"
-                  value={slotEditForm.startTime}
-                  onChange={(e) => setSlotEditForm((f) => ({ ...f, startTime: e.target.value }))}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 font-bold outline-none focus:ring-2 focus:ring-blue-100"
-                />
-              </div>
-              <div className="space-y-2">
-                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">שעת סיום</label>
-                <input
-                  type="time"
-                  step="900"
-                  value={slotEditForm.endTime}
-                  onChange={(e) => setSlotEditForm((f) => ({ ...f, endTime: e.target.value }))}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 font-bold outline-none focus:ring-2 focus:ring-blue-100"
-                />
-              </div>
-            </div>
-            <div className="flex gap-3 pt-2">
-              <button
-                type="button"
-                onClick={handleSlotEditSave}
-                disabled={isSavingSlotEdit || isCheckingSlotConflictsApi || !slotEditForm.date || !slotEditForm.startTime || !slotEditForm.endTime}
-                className="flex-1 py-3 bg-blue-600 text-white rounded-xl font-black shadow-lg disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {isCheckingSlotConflictsApi ? 'בודק...' : isSavingSlotEdit ? 'שומר...' : 'שמור'}
-              </button>
-              <button
-                type="button"
-                onClick={() => { setEditingSlot(null); setSlotEditForm({ date: '', startTime: '', endTime: '' }); setShowSlotEditOverlapModal(false); setSlotEditOverlapConflicts([]); }}
-                disabled={isSavingSlotEdit || isCheckingSlotConflictsApi}
-                className="flex-1 py-3 bg-slate-100 text-slate-600 rounded-xl font-bold disabled:opacity-50"
-              >
-                ביטול
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      <LessonOverlapWarningModal
-        isOpen={showSlotEditOverlapModal}
-        conflicts={slotEditOverlapConflicts}
-        onContinue={handleSlotEditOverlapContinue}
-        onBack={() => {
-          setShowSlotEditOverlapModal(false);
-          setSlotEditOverlapConflicts([]);
-        }}
-        isLoading={isSavingSlotEdit}
-      />
-
-      {/* Slot Inventory Modal - for reserving or booking lessons from open slots */}
-      {selectedSlot && (
+      {/* Slot Inventory Modal - Shared component */}
+      {slotModal.isOpen && slotModal.slotData && (
         <SlotInventoryModal
-          slot={selectedSlot}
-          onClose={() => setSelectedSlot(null)}
-          onSuccess={async () => {
-            await refreshCalendarData();
+          slot={{
+            id: slotModal.slotData.id,
+            startDateTime: `${slotModal.slotData.date}T${slotModal.slotData.startTime}:00`,
+            endDateTime: `${slotModal.slotData.date}T${slotModal.slotData.endTime}:00`,
+            teacherId: slotModal.slotData.teacherId,
+            status: slotModal.slotData.status as any,
+          }}
+          onClose={slotModal.close}
+          onSuccess={() => {
+            // Immediately remove the slot from openSlots state (optimistic update)
+            if (slotModal.activeSlotId) {
+              setOpenSlots(prev => prev.filter(s => s.id !== slotModal.activeSlotId));
+            }
+            // Refresh data to ensure consistency (cache invalidation already happened in reserveSlotAndCreateLessons)
+            // This ensures we get the latest lessons and updated slot status
+            refreshData();
+            slotModal.handleSuccess();
+          }}
+        />
+      )}
+      
+      {/* Legacy support: clickedSlot (for backward compatibility) */}
+      {clickedSlot && !slotModal.isOpen && (
+        <SlotInventoryModal
+          slot={{
+            id: clickedSlot.id,
+            startDateTime: `${clickedSlot.date}T${clickedSlot.startTime}:00`,
+            endDateTime: `${clickedSlot.date}T${clickedSlot.endTime}:00`,
+            teacherId: clickedSlot.teacherId,
+            status: clickedSlot.status as any,
+          }}
+          onClose={() => setClickedSlot(null)}
+          onSuccess={() => {
+            // Immediately remove the slot from openSlots state (optimistic update)
+            setOpenSlots(prev => prev.filter(s => s.id !== clickedSlot.id));
+            setClickedSlot(null);
+            // Refresh data to ensure consistency (cache invalidation already happened in reserveSlotAndCreateLessons)
+            // This ensures we get the latest lessons and updated slot status
+            refreshData();
           }}
         />
       )}
 
-      {toast && (
-        <Toast
-          message={toast.message}
-          type={toast.type}
-          onClose={() => setToast(null)}
-        />
-      )}
+      {/* Overlap Warning Modal */}
+      <LessonOverlapWarningModal
+        isOpen={showOverlapModal}
+        conflicts={overlapConflicts}
+        onContinue={handleOverlapContinue}
+        onBack={handleOverlapBack}
+        isLoading={isSaving}
+      />
     </div>
   );
 };
 
 export default Calendar;
+

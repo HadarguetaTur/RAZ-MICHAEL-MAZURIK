@@ -1,0 +1,60 @@
+# Render Blueprint - Deploy with one click
+# https://render.com/docs/blueprint-spec
+#
+# To deploy:
+# 1. Push this file to your GitHub repo
+# 2. Go to https://dashboard.render.com/blueprints
+# 3. Click "New Blueprint Instance" and connect your repo
+# 4. Fill in the environment variables when prompted
+
+services:
+  # ============================================
+  # Backend API Server
+  # ============================================
+  - type: web
+    name: raz-mazurik-api
+    runtime: node
+    plan: free
+    region: frankfurt  # eu-central - closest to Israel
+    buildCommand: npm install
+    startCommand: npm run start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "18"
+      - key: AIRTABLE_API_KEY
+        sync: false  # You'll enter this manually
+      - key: AIRTABLE_BASE_ID
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false  # Set to your Vercel/frontend URL
+
+  # ============================================
+  # Frontend Static Site (Alternative to Vercel)
+  # ============================================
+  # Uncomment if you want to host frontend on Render too
+  # - type: web
+  #   name: raz-mazurik-web
+  #   runtime: static
+  #   buildCommand: npm install && npm run build
+  #   staticPublishPath: dist
+  #   headers:
+  #     - path: /*
+  #       name: Cache-Control
+  #       value: public, max-age=0, must-revalidate
+  #   routes:
+  #     - type: rewrite
+  #       source: /*
+  #       destination: /index.html
+  #   envVars:
+  #     - key: NODE_VERSION
+  #       value: "18"
+  #     - key: VITE_AIRTABLE_API_KEY
+  #       sync: false
+  #     - key: VITE_AIRTABLE_BASE_ID
+  #       sync: false
+  #     - key: VITE_API_BASE_URL
+  #       fromService:
+  #         name: raz-mazurik-api
+  #         type: web
+  #         property: host

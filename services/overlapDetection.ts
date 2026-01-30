@@ -57,7 +57,8 @@ export interface LessonDraft {
  */
 export function findOverlappingOpenSlots<T extends OpenSlotLike>(
   lessonDraft: LessonDraft | null | undefined,
-  openSlots: T[]
+  openSlots: T[],
+  excludeSlotId?: string
 ): T[] {
   if (!lessonDraft?.date || !lessonDraft?.startTime || lessonDraft.duration == null) {
     return [];
@@ -74,6 +75,10 @@ export function findOverlappingOpenSlots<T extends OpenSlotLike>(
   const lessonEndISO = lessonEnd.toISOString();
 
   return openSlots.filter((slot) => {
+    // Exclude self if excludeSlotId is provided (for edit mode)
+    if (excludeSlotId && slot.id === excludeSlotId) {
+      return false;
+    }
     if (slot.status !== 'open') return false;
     if (
       lessonDraft.teacherId != null &&
@@ -109,10 +114,12 @@ type LessonLike = {
  * Returns lessons that overlap the slot draft's time range,
  * filtered by same teacherId (when both provided).
  * Uses currently loaded lessons — no network calls.
+ * Excludes lesson with excludeLessonId if provided (for edit mode).
  */
 export function findOverlappingLessons<T extends LessonLike>(
   slotDraft: SlotDraft | null | undefined,
-  lessons: T[]
+  lessons: T[],
+  excludeLessonId?: string
 ): T[] {
   if (!slotDraft?.date || !slotDraft.startTime || !slotDraft.endTime) {
     return [];
@@ -135,6 +142,10 @@ export function findOverlappingLessons<T extends LessonLike>(
   const slotEndISO = slotEnd.toISOString();
 
   return lessons.filter((lesson) => {
+    // Exclude self if excludeLessonId is provided (for edit mode)
+    if (excludeLessonId && lesson.id === excludeLessonId) {
+      return false;
+    }
     if (
       slotDraft.teacherId != null &&
       slotDraft.teacherId !== '' &&
@@ -153,6 +164,7 @@ export function findOverlappingLessons<T extends LessonLike>(
     const lessonEnd = new Date(
       lessonStart.getTime() + (lesson.duration ?? 60) * 60 * 1000
     );
+    // Overlap condition: startA < endB && startB < endA (strict, no <=)
     return hasOverlap(
       slotStartISO,
       slotEndISO,

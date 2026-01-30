@@ -1,34 +1,136 @@
-import React, { useState } from 'react';
-import { OpenSlotRecord } from '../types';
+import React, { useState, useEffect } from 'react';
+import { SlotInventory, Student } from '../types';
 import { nexusApi, parseApiError } from '../services/nexusApi';
-import { bookLessonFromSlot } from '../services/slotBookingService';
+import { reserveSlotAndCreateLessons } from '../services/slotBookingService';
+import StudentPicker from './StudentPicker';
 import Toast from './Toast';
 
 interface SlotInventoryModalProps {
-  slot: OpenSlotRecord;
+  slot?: {
+    id: string;
+    startDateTime: string;
+    endDateTime: string;
+    teacherId: string;
+    status: string;
+  };
+  slotId?: string | null;
   onClose: () => void;
   onSuccess: () => void;
 }
 
-const SlotInventoryModal: React.FC<SlotInventoryModalProps> = ({ slot, onClose, onSuccess }) => {
+const SlotInventoryModal: React.FC<SlotInventoryModalProps> = ({ slot: slotProp, slotId, onClose, onSuccess }) => {
   const [isReserving, setIsReserving] = useState(false);
-  const [isBooking, setIsBooking] = useState(false);
+  const [selectedStudent, setSelectedStudent] = useState<Student | null>(null);
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
+  const [slot, setSlot] = useState<SlotInventory | null>(null);
+  const [isLoadingSlot, setIsLoadingSlot] = useState(false);
 
-  const startDate = new Date(slot.startDateTime);
-  const endDate = new Date(slot.endDateTime);
+  // Fetch slot data if slotId is provided (and slotProp is not provided)
+  useEffect(() => {
+    // Reset state when slotId or slotProp changes
+    if (!slotId && !slotProp) {
+      setSlot(null);
+      setIsLoadingSlot(false);
+      return;
+    }
+
+    if (slotProp) {
+      // Convert slotProp to SlotInventory format
+      const startDate = new Date(slotProp.startDateTime);
+      const endDate = new Date(slotProp.endDateTime);
+      const dateStr = `${startDate.getFullYear()}-${String(startDate.getMonth() + 1).padStart(2, '0')}-${String(startDate.getDate()).padStart(2, '0')}`;
+      const startTime = `${startDate.getHours().toString().padStart(2, '0')}:${startDate.getMinutes().toString().padStart(2, '0')}`;
+      const endTime = `${endDate.getHours().toString().padStart(2, '0')}:${endDate.getMinutes().toString().padStart(2, '0')}`;
+      
+      setSlot({
+        id: slotProp.id,
+        teacherId: slotProp.teacherId,
+        teacherName: '', // Will be filled if needed
+        date: dateStr,
+        startTime,
+        endTime,
+        status: slotProp.status as 'open' | 'closed' | 'canceled',
+      });
+      setIsLoadingSlot(false);
+    } else if (slotId) {
+      // Fetch slot data from API
+      setIsLoadingSlot(true);
+      const fetchSlot = async () => {
+        try {
+          const dayStartISO = new Date().toISOString().split('T')[0];
+          const dayEndISO = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]; // 30 days ahead
+          const slots = await nexusApi.getSlotInventory(dayStartISO, dayEndISO);
+          const foundSlot = slots.find(s => s.id === slotId);
+          if (foundSlot) {
+            setSlot(foundSlot);
+          } else {
+            if (import.meta.env?.DEV) {
+              console.warn('[SlotInventoryModal] Slot not found:', slotId);
+            }
+            setToast({ message: 'חלון לא נמצא', type: 'error' });
+            setTimeout(() => onClose(), 2000);
+          }
+        } catch (err) {
+          console.error('[SlotInventoryModal] Failed to fetch slot:', err);
+          setToast({ message: 'שגיאה בטעינת החלון', type: 'error' });
+          setTimeout(() => onClose(), 2000);
+        } finally {
+          setIsLoadingSlot(false);
+        }
+      };
+      fetchSlot();
+    }
+  }, [slotId, slotProp, onClose]);
+
+  // Use slot from state or prop
+  const currentSlot = slot || (slotProp ? {
+    id: slotProp.id,
+    teacherId: slotProp.teacherId,
+    teacherName: '',
+    date: new Date(slotProp.startDateTime).toISOString().split('T')[0],
+    startTime: `${new Date(slotProp.startDateTime).getHours().toString().padStart(2, '0')}:${new Date(slotProp.startDateTime).getMinutes().toString().padStart(2, '0')}`,
+    endTime: `${new Date(slotProp.endDateTime).getHours().toString().padStart(2, '0')}:${new Date(slotProp.endDateTime).getMinutes().toString().padStart(2, '0')}`,
+    status: slotProp.status as 'open' | 'closed' | 'canceled',
+  } : null);
+
+  if (!currentSlot) {
+    if (isLoadingSlot) {
+      return (
+        <div className="fixed inset-0 z-[150] flex items-center justify-center p-4">
+          <div className="relative w-full max-w-md bg-white rounded-3xl shadow-2xl p-6 md:p-8">
+            <div className="text-center text-slate-500">טוען...</div>
+          </div>
+        </div>
+      );
+    }
+    return null;
+  }
+
+  const startDate = new Date(`${currentSlot.date}T${currentSlot.startTime}:00`);
+  const endDate = new Date(`${currentSlot.date}T${currentSlot.endTime}:00`);
   const dateStr = `${startDate.getFullYear()}-${String(startDate.getMonth() + 1).padStart(2, '0')}-${String(startDate.getDate()).padStart(2, '0')}`;
-  const startTime = `${startDate.getHours().toString().padStart(2, '0')}:${startDate.getMinutes().toString().padStart(2, '0')}`;
-  const endTime = `${endDate.getHours().toString().padStart(2, '0')}:${endDate.getMinutes().toString().padStart(2, '0')}`;
+  const startTime = currentSlot.startTime;
+  const endTime = currentSlot.endTime;
 
-  const handleReserveSlot = async () => {
+  const handleConfirmReservation = async () => {
+    if (!selectedStudent || !currentSlot) return;
     setIsReserving(true);
     try {
-      // Update slot status to 'booked' (which translates to 'סגור' in Airtable)
-      await nexusApi.updateSlotInventory(slot.id, { status: 'booked' });
-      setToast({ message: 'החלון נשמר בהצלחה', type: 'success' });
+      const result = await reserveSlotAndCreateLessons(currentSlot.id, [selectedStudent.id]);
+      
+      if (import.meta.env.DEV) {
+        console.log(`[SlotInventoryModal] Reservation successful:`, {
+          slotId: result.slot.id,
+          slotStatus: result.slot.status,
+          lessonsCreated: result.lessons.length,
+          lessonIds: result.lessons.map(l => l.id),
+        });
+      }
+      
+      setToast({ message: 'השיעור נקבע והחלון עודכן', type: 'success' });
+      // Call onSuccess immediately to trigger refresh (cache invalidation already happened in reserveSlotAndCreateLessons)
+      onSuccess();
       setTimeout(() => {
-        onSuccess();
         onClose();
       }, 1000);
     } catch (err: any) {
@@ -38,17 +140,12 @@ const SlotInventoryModal: React.FC<SlotInventoryModalProps> = ({ slot, onClose, 
     }
   };
 
-  const handleBookLesson = async () => {
-    setIsBooking(true);
+  const handleCloseSlotOnly = async () => {
+    if (!currentSlot) return;
+    setIsReserving(true);
     try {
-      // Use bookLessonFromSlot which creates a lesson and closes the slot
-      await bookLessonFromSlot(slot.id, {
-        slotId: slot.id,
-        date: dateStr,
-        startTime: startTime,
-        endTime: endTime,
-      });
-      setToast({ message: 'השיעור נקבע בהצלחה', type: 'success' });
+      await nexusApi.updateSlotInventory(currentSlot.id, { status: 'closed' as any });
+      setToast({ message: 'החלון נסגר בהצלחה', type: 'success' });
       setTimeout(() => {
         onSuccess();
         onClose();
@@ -56,7 +153,7 @@ const SlotInventoryModal: React.FC<SlotInventoryModalProps> = ({ slot, onClose, 
     } catch (err: any) {
       setToast({ message: parseApiError(err), type: 'error' });
     } finally {
-      setIsBooking(false);
+      setIsReserving(false);
     }
   };
 
@@ -91,31 +188,41 @@ const SlotInventoryModal: React.FC<SlotInventoryModalProps> = ({ slot, onClose, 
               </div>
             </div>
 
+            <div className="space-y-3">
+              <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">שריין לתלמיד</label>
+              <StudentPicker
+                value={selectedStudent}
+                onChange={setSelectedStudent}
+                placeholder="חפש תלמיד לשיבוץ..."
+                disabled={isReserving}
+              />
+            </div>
+
             <div className="flex flex-col gap-3 pt-2">
               <button
                 type="button"
-                onClick={handleReserveSlot}
-                disabled={isReserving || isBooking}
+                onClick={handleConfirmReservation}
+                disabled={isReserving || !selectedStudent}
                 className={`w-full py-4 rounded-2xl font-bold shadow-lg transition-all flex items-center justify-center ${
-                  isReserving || isBooking
+                  isReserving || !selectedStudent
                     ? 'bg-slate-300 text-slate-500 cursor-not-allowed'
-                    : 'bg-blue-600 text-white hover:bg-blue-700'
+                    : 'bg-cyan-600 text-white hover:bg-cyan-700 shadow-cyan-100'
                 }`}
               >
-                {isReserving ? 'שומר...' : 'שריין חלון'}
+                {isReserving && selectedStudent ? 'מעבד...' : 'שריין לתלמיד וצור שיעור'}
               </button>
               
               <button
                 type="button"
-                onClick={handleBookLesson}
-                disabled={isReserving || isBooking}
+                onClick={handleCloseSlotOnly}
+                disabled={isReserving}
                 className={`w-full py-4 rounded-2xl font-bold shadow-lg transition-all flex items-center justify-center ${
-                  isReserving || isBooking
+                  isReserving
                     ? 'bg-slate-300 text-slate-500 cursor-not-allowed'
-                    : 'bg-emerald-600 text-white hover:bg-emerald-700'
+                    : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
                 }`}
               >
-                {isBooking ? 'מעבד...' : 'קבע שיעור בחלון'}
+                {isReserving && !selectedStudent ? 'מעבד...' : 'סגור חלון (ללא שיעור)'}
               </button>
             </div>
           </div>

@@ -10,6 +10,8 @@ import StudentsPicker from './StudentsPicker';
 import SlotInventoryModal from './SlotInventoryModal';
 import { useOpenSlotModal } from '../hooks/useOpenSlotModal';
 import { useToast } from '../hooks/useToast';
+import { useConfirmDialog } from '../hooks/useConfirmDialog';
+import { apiUrl } from '../config/api';
 
 const DAYS_HEBREW = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'];
 
@@ -229,6 +231,7 @@ const Availability: React.FC = () => {
   const [students, setStudents] = useState<Student[]>([]);
   const slotModal = useOpenSlotModal();
   const toast = useToast();
+  const { confirm } = useConfirmDialog();
   const [weekStart, setWeekStart] = useState<string>(() => {
     const d = new Date();
     d.setDate(d.getDate() - d.getDay()); // Start of current week (Sunday)
@@ -333,7 +336,7 @@ const Availability: React.FC = () => {
       const slots = await nexusApi.getWeeklySlots();
       setWeeklySlots(slots);
     } catch (err) {
-      alert(parseApiError(err));
+      toast.error(parseApiError(err));
     } finally {
       setLoading(false);
     }
@@ -470,17 +473,25 @@ const Availability: React.FC = () => {
       });
       setWeeklySlots(prev => prev.map(s => s.id === slot.id ? updated : s));
     } catch (err) {
-      alert(parseApiError(err));
+      toast.error(parseApiError(err));
     }
   };
 
   const handleDelete = async (slot: WeeklySlot) => {
-    if (!confirm('האם להסיר את חלון הזמינות הזה?')) return;
+    const confirmed = await confirm({
+      title: 'מחיקת חלון זמינות',
+      message: 'האם להסיר את חלון הזמינות הזה?',
+      variant: 'warning',
+      confirmLabel: 'מחק',
+      cancelLabel: 'ביטול'
+    });
+    if (!confirmed) return;
+    
     try {
       await nexusApi.deleteWeeklySlot(slot.id);
       setWeeklySlots(prev => prev.filter(s => s.id !== slot.id));
     } catch (err) {
-      alert(parseApiError(err));
+      toast.error(parseApiError(err));
     }
   };
 
@@ -502,7 +513,7 @@ const Availability: React.FC = () => {
         if (import.meta.env.DEV) {
           console.warn('[Availability] Cannot open edit modal: Weekly slot missing ID', s);
         }
-        alert('שגיאה: לא ניתן לפתוח עריכה - חסר מזהה רצועה');
+        toast.error('שגיאה: לא ניתן לפתוח עריכה - חסר מזהה רצועה');
         return;
       }
       
@@ -668,7 +679,7 @@ const Availability: React.FC = () => {
     }
 
     try {
-      const response = await fetch('/api/conflicts/check', {
+      const response = await fetch(apiUrl('/api/conflicts/check'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -837,9 +848,9 @@ const Availability: React.FC = () => {
           conflictDetails = `שיעורים חופפים:\n${lessonDetails}\n\n`;
         }
         
-        alert(`לא ניתן לפתוח חלון!\n\n${err.message || 'החלון המבוקש חופף עם שיעור קיים'}\n\n${conflictDetails}אנא בחר זמן אחר או סגור את השיעור החופף תחילה.`);
+        toast.error(`לא ניתן לפתוח חלון - ${err.message || 'החלון המבוקש חופף עם שיעור קיים'}`);
       } else {
-        alert(parseApiError(err));
+        toast.error(parseApiError(err));
       }
     } finally {
       setIsSaving(false);
@@ -853,7 +864,7 @@ const Availability: React.FC = () => {
     }
 
     if (!formData.teacherId) {
-      alert('אנא בחר מורה');
+      toast.error('אנא בחר מורה');
       return;
     }
 
@@ -892,7 +903,7 @@ const Availability: React.FC = () => {
       
       // Validate required fields for slot_inventory
       if (!slotDate || !formData.startTime || !formData.endTime) {
-        alert('נא למלא את כל שדות החובה: תאריך, שעת התחלה ושעת סיום');
+        toast.error('נא למלא את כל שדות החובה: תאריך, שעת התחלה ושעת סיום');
         return;
       }
 

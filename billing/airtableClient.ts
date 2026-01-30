@@ -14,9 +14,13 @@ const getApiKey = () => {
   if (typeof process !== 'undefined' && process.env) {
     return process.env.AIRTABLE_API_KEY || process.env.VITE_AIRTABLE_API_KEY || '';
   }
-  if (typeof import !== 'undefined' && import.meta?.env) {
-    return import.meta.env.VITE_AIRTABLE_API_KEY || '';
-  }
+  try {
+    // @ts-ignore
+    if (import.meta?.env) {
+      // @ts-ignore
+      return import.meta.env.VITE_AIRTABLE_API_KEY || '';
+    }
+  } catch (e) {}
   return '';
 };
 
@@ -24,9 +28,13 @@ const getBaseId = () => {
   if (typeof process !== 'undefined' && process.env) {
     return process.env.AIRTABLE_BASE_ID || process.env.VITE_AIRTABLE_BASE_ID || '';
   }
-  if (typeof import !== 'undefined' && import.meta?.env) {
-    return import.meta.env.VITE_AIRTABLE_BASE_ID || '';
-  }
+  try {
+    // @ts-ignore
+    if (import.meta?.env) {
+      // @ts-ignore
+      return import.meta.env.VITE_AIRTABLE_BASE_ID || '';
+    }
+  } catch (e) {}
   return '';
 };
 

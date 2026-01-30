@@ -1,29 +1,21 @@
-
 import React, { useState, useEffect, useMemo } from 'react';
-import { Student, Lesson, LessonStatus } from '../types';
+import { Student, Lesson } from '../types';
 import { nexusApi, parseApiError } from '../services/nexusApi';
+import StudentCard from './StudentCard';
+import StudentFormModal from './StudentFormModal';
+import { useToast } from '../hooks/useToast';
 
 const Students: React.FC = () => {
+  const toast = useToast();
   const [students, setStudents] = useState<Student[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedStudent, setSelectedStudent] = useState<Student | null>(null);
-  const [profileTab, setProfileTab] = useState<'overview' | 'history' | 'homework' | 'tests'>('overview');
-  const [lessons, setLessons] = useState<Lesson[]>([]);
-  const [lessonsLoading, setLessonsLoading] = useState(false);
+  const [showAddModal, setShowAddModal] = useState(false);
 
   useEffect(() => {
     loadData();
   }, []);
-
-  // Load lessons when student is selected
-  useEffect(() => {
-    if (selectedStudent) {
-      loadStudentLessons(selectedStudent.id);
-    } else {
-      setLessons([]);
-    }
-  }, [selectedStudent]);
 
   const loadData = async () => {
     setLoading(true);
@@ -31,31 +23,9 @@ const Students: React.FC = () => {
       const studentsData = await nexusApi.getStudents();
       setStudents(studentsData);
     } catch (err) {
-      alert(parseApiError(err));
+      toast.error(parseApiError(err));
     } finally {
       setLoading(false);
-    }
-  };
-
-  const loadStudentLessons = async (studentId: string) => {
-    setLessonsLoading(true);
-    try {
-      // Get lessons for the past year and next month to ensure we have all relevant lessons
-      const now = new Date();
-      const startDate = new Date(now.getFullYear() - 1, now.getMonth(), 1);
-      const endDate = new Date(now.getFullYear(), now.getMonth() + 2, 0);
-      const startDateStr = startDate.toISOString().split('T')[0];
-      const endDateStr = endDate.toISOString().split('T')[0];
-      
-      const allLessons = await nexusApi.getLessons(startDateStr, endDateStr);
-      // Filter lessons for this student
-      const studentLessons = allLessons.filter(lesson => lesson.studentId === studentId);
-      setLessons(studentLessons);
-    } catch (err) {
-      console.error('Error loading lessons:', err);
-      setLessons([]);
-    } finally {
-      setLessonsLoading(false);
     }
   };
 
@@ -89,22 +59,26 @@ const Students: React.FC = () => {
     <div className="space-y-6 md:space-y-10 animate-in fade-in duration-700 pb-20">
       {/* Directory Control */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 md:gap-6">
-        <div className="relative flex-1 max-w-lg">
+        <div className="relative flex-1 max-w-lg text-right">
           <input
             type="text"
             placeholder="חפש תלמיד או הורה..."
-            className="w-full pr-12 pl-4 py-3.5 md:py-4 rounded-xl md:rounded-[24px] border border-slate-200 focus:outline-none focus:ring-4 focus:ring-blue-50 transition-all bg-white font-bold"
+            className="w-full pr-12 pl-4 py-3.5 md:py-4 rounded-xl md:rounded-[24px] border border-slate-200 focus:outline-none focus:ring-4 focus:ring-blue-50 transition-all bg-white font-bold text-right"
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
+            dir="rtl"
           />
           <span className="absolute right-4 top-1/2 -translate-y-1/2 opacity-30 text-xl">🔍</span>
         </div>
-        <button className="bg-blue-600 text-white px-8 md:px-10 py-3.5 md:py-4 rounded-xl md:rounded-[22px] font-black text-sm hover:bg-blue-700 transition-all shadow-lg active:scale-95">
+        <button 
+          onClick={() => setShowAddModal(true)}
+          className="bg-blue-600 text-white px-8 md:px-10 py-3.5 md:py-4 rounded-xl md:rounded-[22px] font-black text-sm hover:bg-blue-700 transition-all shadow-lg active:scale-95"
+        >
           + הוסף תלמיד חדש
         </button>
       </div>
 
-      <div className="bg-white rounded-2xl md:rounded-[40px] border border-slate-200 shadow-sm overflow-hidden">
+      <div className="bg-white rounded-2xl md:rounded-[40px] border border-slate-200 shadow-sm overflow-hidden" dir="rtl">
         {/* Desktop View Table */}
         <div className="hidden md:block overflow-x-auto">
           <table className="w-full text-right border-collapse">
@@ -169,196 +143,27 @@ const Students: React.FC = () => {
         </div>
       </div>
 
-      {/* Profile Sidebar / Bottom Sheet */}
+      {/* Student Card Component */}
       {selectedStudent && (
-        <div className="fixed inset-0 z-50 flex justify-end">
-          <div className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm" onClick={() => setSelectedStudent(null)}></div>
-          <div className="relative w-full lg:w-2/3 xl:w-1/2 bg-white lg:h-full h-[95vh] mt-auto lg:mt-0 lg:rounded-none rounded-t-[40px] shadow-2xl animate-in slide-in-from-bottom lg:slide-in-from-left duration-500 flex flex-col overflow-hidden">
-            <div className="p-6 md:p-10 border-b border-slate-100 shrink-0">
-              <div className="w-12 h-1.5 bg-slate-200 rounded-full mx-auto mb-6 lg:hidden"></div>
-              <div className="flex items-center justify-between mb-8">
-                <button onClick={() => setSelectedStudent(null)} className="w-10 h-10 md:w-12 md:h-12 flex items-center justify-center bg-white border border-slate-200 text-slate-400 rounded-xl transition-all">✕</button>
-                <div className="flex gap-2">
-                   <button className="hidden sm:block px-6 py-2.5 bg-white border border-slate-200 rounded-xl text-xs font-black text-slate-600">דוח התקדמות</button>
-                   <button className="px-6 py-2.5 bg-slate-900 text-white rounded-xl text-xs font-black">עריכה</button>
-                </div>
-              </div>
+        <StudentCard 
+          student={selectedStudent} 
+          onClose={() => setSelectedStudent(null)} 
+          onEdit={(updatedStudent) => {
+            setStudents(prev => prev.map(s => s.id === updatedStudent.id ? updatedStudent : s));
+            setSelectedStudent(updatedStudent);
+          }}
+        />
+      )}
 
-              <div className="flex items-center gap-6">
-                <div className="w-20 h-20 md:w-24 md:h-24 bg-blue-600 rounded-3xl flex items-center justify-center text-white text-3xl md:text-4xl font-black">
-                  {selectedStudent.name[0]}
-                </div>
-                <div>
-                  <h2 className="text-2xl md:text-3xl font-black text-slate-800">{selectedStudent.name}</h2>
-                  <div className="flex items-center gap-3 mt-1">
-                    <span className="text-slate-400 font-bold text-xs uppercase">{selectedStudent.grade}</span>
-                    {getStatusBadge(selectedStudent.status)}
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div className="flex px-4 md:px-10 border-b border-slate-100 overflow-x-auto shrink-0 no-scrollbar">
-              {['overview', 'history', 'homework'].map(tab => (
-                <button
-                  key={tab}
-                  onClick={() => setProfileTab(tab as any)}
-                  className={`px-6 py-4 md:py-5 text-sm font-black transition-all relative shrink-0 ${
-                    profileTab === tab ? 'text-blue-600' : 'text-slate-400'
-                  }`}
-                >
-                  {tab === 'overview' ? 'סקירה' : tab === 'history' ? 'שיעורים' : 'משימות'}
-                  {profileTab === tab && <div className="absolute bottom-0 left-0 right-0 h-1 bg-blue-600 rounded-t-full"></div>}
-                </button>
-              ))}
-            </div>
-
-            <div className="flex-1 overflow-y-auto p-6 md:p-10 custom-scrollbar bg-[#fcfdfe]">
-              {profileTab === 'overview' && (
-                <div className="space-y-6 md:space-y-8 animate-in fade-in slide-in-from-bottom-2">
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 md:gap-8">
-                    <div className="p-6 bg-white border border-slate-100 rounded-2xl md:rounded-[32px] shadow-sm">
-                      <div className="text-[10px] text-slate-400 font-black uppercase mb-4 tracking-widest">פרטי קשר</div>
-                      <div className="space-y-3">
-                        <div className="text-sm font-bold text-slate-400">הורה: {selectedStudent.parentName}</div>
-                        <div className="text-lg font-black text-slate-800">{selectedStudent.phone}</div>
-                        <div className="text-xs font-bold text-slate-500 truncate">{selectedStudent.email}</div>
-                      </div>
-                    </div>
-                    <div className="p-6 bg-white border border-slate-100 rounded-2xl md:rounded-[32px] shadow-sm">
-                      <div className="text-[10px] text-slate-400 font-black uppercase mb-4 tracking-widest">פיננסי</div>
-                      <div className="space-y-4">
-                        <div className="text-3xl font-black text-slate-900 tracking-tighter">₪{selectedStudent.balance}</div>
-                        <div className="text-xs font-black text-slate-400 uppercase">{selectedStudent.subscriptionType}</div>
-                      </div>
-                    </div>
-                  </div>
-                  <div className="space-y-3">
-                     <label className="text-[10px] text-slate-400 font-black uppercase tracking-widest block">הערות פדגוגיות</label>
-                     <textarea 
-                       className="w-full bg-white border border-slate-100 rounded-2xl md:rounded-[32px] p-6 text-sm font-medium min-h-[140px] outline-none shadow-sm"
-                       defaultValue={selectedStudent.notes || 'אין הערות רשומות.'}
-                     />
-                  </div>
-                </div>
-              )}
-
-              {profileTab === 'history' && (
-                <div className="space-y-6 animate-in fade-in slide-in-from-bottom-2">
-                  {lessonsLoading ? (
-                    <div className="py-10 text-center text-slate-300">טוען שיעורים...</div>
-                  ) : lessons.length === 0 ? (
-                    <div className="py-10 text-center text-slate-400">
-                      <div className="text-lg font-bold mb-2">אין שיעורים להצגה</div>
-                      <div className="text-sm">לא נמצאו שיעורים עבור תלמיד זה</div>
-                    </div>
-                  ) : (
-                    <>
-                      <div className="flex items-center justify-between mb-4">
-                        <h3 className="text-lg font-black text-slate-800">שיעורים לפי חודש</h3>
-                        <button
-                          onClick={() => {
-                            const csv = [
-                              ['תאריך', 'שעה', 'משך (דקות)', 'מחיר (₪)', 'מקצוע', 'סטטוס'].join(','),
-                              ...lessons.map(l => {
-                                const displayPrice = l.price !== undefined 
-                                  ? l.price 
-                                  : (l.lessonType === 'private' && l.duration 
-                                      ? Math.round(l.duration * 2.92 * 100) / 100 
-                                      : 0);
-                                return [
-                                  l.date,
-                                  l.startTime,
-                                  l.duration,
-                                  displayPrice.toFixed(2),
-                                  l.subject,
-                                  l.status
-                                ].join(',');
-                              })
-                            ].join('\n');
-                            
-                            const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' });
-                            const link = document.createElement('a');
-                            link.href = URL.createObjectURL(blob);
-                            link.download = `שיעורים_${selectedStudent?.name}_${new Date().toISOString().split('T')[0]}.csv`;
-                            link.click();
-                          }}
-                          className="px-4 py-2 bg-blue-600 text-white rounded-xl text-xs font-black hover:bg-blue-700 transition-all"
-                        >
-                          ייצא פירוט
-                        </button>
-                      </div>
-                      {(() => {
-                        // קיבוץ לפי חודש
-                        const lessonsByMonth = new Map<string, Lesson[]>();
-                        lessons.forEach(lesson => {
-                          const month = lesson.date.substring(0, 7); // YYYY-MM
-                          if (!lessonsByMonth.has(month)) {
-                            lessonsByMonth.set(month, []);
-                          }
-                          lessonsByMonth.get(month)!.push(lesson);
-                        });
-                        
-                        return Array.from(lessonsByMonth.entries())
-                          .sort((a, b) => b[0].localeCompare(a[0])) // חדשים קודם
-                          .map(([month, monthLessons]) => (
-                            <div key={month} className="bg-white border border-slate-100 rounded-2xl p-6">
-                              <h3 className="text-lg font-black text-slate-800 mb-4">
-                                {new Date(month + '-01').toLocaleDateString('he-IL', { month: 'long', year: 'numeric' })}
-                              </h3>
-                              <div className="space-y-2">
-                                {monthLessons
-                                  .sort((a, b) => {
-                                    // Sort by date and time
-                                    const dateA = new Date(a.date + 'T' + a.startTime);
-                                    const dateB = new Date(b.date + 'T' + b.startTime);
-                                    return dateB.getTime() - dateA.getTime(); // Newest first
-                                  })
-                                  .map(lesson => {
-                                    // Calculate price if not available
-                                    const displayPrice = lesson.price !== undefined 
-                                      ? lesson.price 
-                                      : (lesson.lessonType === 'private' && lesson.duration 
-                                          ? Math.round(lesson.duration * 2.92 * 100) / 100 
-                                          : 0);
-                                    
-                                    return (
-                                      <div key={lesson.id} className="flex items-center justify-between p-3 bg-slate-50 rounded-xl">
-                                        <div>
-                                          <div className="font-bold text-slate-800">
-                                            {new Date(lesson.date).toLocaleDateString('he-IL')} {lesson.startTime}
-                                          </div>
-                                          <div className="text-xs text-slate-400">
-                                            {lesson.duration} דק׳ • {lesson.subject}
-                                          </div>
-                                        </div>
-                                        <div className="text-right">
-                                          <div className="font-black text-slate-800">
-                                            ₪{displayPrice.toFixed(2)}
-                                          </div>
-                                          <div className="text-xs text-slate-400">{lesson.status}</div>
-                                        </div>
-                                      </div>
-                                    );
-                                  })}
-                              </div>
-                            </div>
-                          ));
-                      })()}
-                    </>
-                  )}
-                </div>
-              )}
-            </div>
-
-            <div className="p-6 md:p-10 border-t border-slate-100 bg-white flex gap-3 shrink-0 pb-10 md:pb-10">
-               <button className="flex-1 py-4 md:py-5 bg-emerald-600 text-white rounded-2xl font-black shadow-lg shadow-emerald-100 flex items-center justify-center gap-3 active:scale-95">
-                 <span className="text-lg">📱</span>
-                 <span>WhatsApp</span>
-               </button>
-            </div>
-          </div>
-        </div>
+      {/* Add Student Modal */}
+      {showAddModal && (
+        <StudentFormModal
+          onClose={() => setShowAddModal(false)}
+          onSuccess={(newStudent) => {
+            setStudents(prev => [newStudent, ...prev]); // Add to beginning of list
+            setShowAddModal(false);
+          }}
+        />
       )}
     </div>
   );

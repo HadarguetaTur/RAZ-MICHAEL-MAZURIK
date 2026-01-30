@@ -144,6 +144,10 @@ export class AirtableClient {
 
     const url = `${API_BASE_URL}/${encodeURIComponent(this.baseId)}${encodedEndpoint}`;
 
+    if (import.meta.env.DEV) {
+      console.log(`[AirtableClient] Request: ${options.method || 'GET'} ${encodedPath}`);
+    }
+
     const makeRequest = async (): Promise<T> => {
       const response = await fetch(url, {
         ...options,
@@ -208,7 +212,7 @@ export class AirtableClient {
   }
 
   /**
-   * Get records from a table
+   * Get records from a table (alias for listRecords for backward compatibility)
    */
   async getRecords<T = any>(
     tableId: string,
@@ -219,31 +223,65 @@ export class AirtableClient {
       maxRecords?: number;
     } = {}
   ): Promise<Array<{ id: string; fields: T }>> {
-    const params = new URLSearchParams();
-    
-    if (options.filterByFormula) {
-      params.append('filterByFormula', options.filterByFormula);
-    }
-    
-    if (options.pageSize) {
-      params.append('pageSize', String(options.pageSize));
-    }
-    
-    if (options.maxRecords) {
-      params.append('maxRecords', String(options.maxRecords));
-    }
+    return this.listRecords<T>(tableId, options);
+  }
 
-    if (options.sort) {
-      options.sort.forEach((sort, index) => {
-        params.append(`sort[${index}][field]`, sort.field);
-        params.append(`sort[${index}][direction]`, sort.direction);
-      });
-    }
+  /**
+   * List records from a table with pagination support
+   */
+  async listRecords<T = any>(
+    tableId: string,
+    options: {
+      filterByFormula?: string;
+      sort?: Array<{ field: string; direction: 'asc' | 'desc' }>;
+      pageSize?: number;
+      maxRecords?: number;
+    } = {}
+  ): Promise<Array<{ id: string; fields: T }>> {
+    const allRecords: Array<{ id: string; fields: T }> = [];
+    let offset: string | undefined;
 
-    const endpoint = `/${tableId}${params.toString() ? `?${params.toString()}` : ''}`;
-    const response = await this.request<{ records: Array<{ id: string; fields: T }> }>(endpoint);
-    
-    return response.records;
+    do {
+      const params = new URLSearchParams();
+      
+      if (options.filterByFormula) {
+        params.append('filterByFormula', options.filterByFormula);
+      }
+      
+      if (options.pageSize) {
+        params.append('pageSize', String(options.pageSize));
+      } else {
+        params.append('pageSize', '100'); // Default to 100
+      }
+      
+      if (options.maxRecords) {
+        params.append('maxRecords', String(options.maxRecords));
+      }
+
+      if (options.sort) {
+        options.sort.forEach((sort, index) => {
+          params.append(`sort[${index}][field]`, sort.field);
+          params.append(`sort[${index}][direction]`, sort.direction);
+        });
+      }
+
+      if (offset) {
+        params.append('offset', offset);
+      }
+
+      const endpoint = `/${tableId}${params.toString() ? `?${params.toString()}` : ''}`;
+      const response = await this.request<{ records: Array<{ id: string; fields: T }>; offset?: string }>(endpoint);
+      
+      allRecords.push(...response.records);
+      offset = response.offset;
+
+      // Stop if we've reached maxRecords
+      if (options.maxRecords && allRecords.length >= options.maxRecords) {
+        break;
+      }
+    } while (offset);
+
+    return allRecords;
   }
 
   /**

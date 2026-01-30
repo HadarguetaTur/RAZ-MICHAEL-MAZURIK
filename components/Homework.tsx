@@ -7,8 +7,10 @@ import { assignHomework } from '../data/mutations';
 import StudentPicker from './StudentPicker';
 import { useStudents } from '../hooks/useStudents';
 import AppSidePanel from './ui/AppSidePanel';
+import { useToast } from '../hooks/useToast';
 
 const Homework: React.FC = () => {
+  const toast = useToast();
   const [activeView, setActiveView] = useState<'library' | 'assignments'>('assignments');
   const [showAssignModal, setShowAssignModal] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -35,7 +37,7 @@ const Homework: React.FC = () => {
         setLibrary(lib);
         setAssignments(assign);
       } catch (err) {
-        alert(parseApiError(err));
+        toast.error(parseApiError(err));
       } finally {
         setLoading(false);
       }
@@ -48,7 +50,7 @@ const Homework: React.FC = () => {
       e.preventDefault();
     }
     if (!selectedHomework || !selectedStudent || !dueDate) {
-      alert('יש למלא את כל השדות');
+      toast.error('יש למלא את כל השדות');
       return;
     }
 
@@ -72,9 +74,9 @@ const Homework: React.FC = () => {
       setSelectedHomework('');
       setSelectedStudent(null);
       setDueDate('');
-      alert('שיעורי הבית הוקצו בהצלחה');
+      toast.success('שיעורי הבית הוקצו בהצלחה');
     } catch (err) {
-      alert(parseApiError(err));
+      toast.error(parseApiError(err));
     } finally {
       setIsSubmitting(false);
     }

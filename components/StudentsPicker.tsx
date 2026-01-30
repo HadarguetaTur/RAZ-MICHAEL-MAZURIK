@@ -11,6 +11,8 @@ interface StudentsPickerProps {
   filterActiveOnly?: boolean;
   minChars?: number;
   limit?: number;
+  /** Fallback names for IDs that haven't loaded yet (e.g., from slot.reservedForNames) */
+  fallbackNames?: Record<string, string>; // Map of ID -> name
 }
 
 /**
@@ -26,20 +28,67 @@ const StudentsPicker: React.FC<StudentsPickerProps> = ({
   filterActiveOnly = true,
   minChars = 2,
   limit = 15,
+  fallbackNames = {},
 }) => {
-  const { searchStudents, getStudentById, activeStudents, isLoading: isLoadingStudents } = useStudents({ filterActiveOnly, autoLoad: true });
+  const { searchStudents, getStudentById, getStudentByIdSync, activeStudents, isLoading: isLoadingStudents } = useStudents({ filterActiveOnly, autoLoad: true });
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<Student[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [isOpen, setIsOpen] = useState(false);
   const [highlightedIndex, setHighlightedIndex] = useState(-1);
+  const [selectedStudentsState, setSelectedStudentsState] = useState<Student[]>([]);
   const searchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Get selected students from IDs
-  const selectedStudents = values
-    .map(id => getStudentById(id))
-    .filter((s): s is Student => s !== undefined);
+  // Get selected students from IDs - use sync version for immediate render, then fetch missing ones
+  useEffect(() => {
+    const loadSelectedStudents = async () => {
+      // First, get what we can from local cache (synchronous)
+      const localStudents = values
+        .map(id => getStudentByIdSync(id))
+        .filter((s): s is Student => s !== undefined);
+
+      // Find IDs that are missing from local cache
+      const missingIds = values.filter(id => !getStudentByIdSync(id));
+
+      if (import.meta.env.DEV && missingIds.length > 0) {
+        console.log('[StudentsPicker] Missing students from cache, fetching:', missingIds);
+      }
+
+      // Fetch missing students asynchronously
+      const fetchedStudents = await Promise.all(
+        missingIds.map(id => getStudentById(id))
+      );
+      const validFetched = fetchedStudents.filter((s): s is Student => s !== undefined);
+
+      // Combine local and fetched students
+      const allSelected = [...localStudents, ...validFetched];
+      
+      // Update state only if something changed
+      if (allSelected.length !== selectedStudentsState.length || 
+          !allSelected.every((s, i) => selectedStudentsState[i]?.id === s.id)) {
+        setSelectedStudentsState(allSelected);
+        
+        if (import.meta.env.DEV) {
+          console.log('[StudentsPicker] Selected students updated:', {
+            total: allSelected.length,
+            fromCache: localStudents.length,
+            fetched: validFetched.length,
+            studentNames: allSelected.map(s => s.name),
+          });
+        }
+      }
+    };
+
+    if (values.length > 0) {
+      loadSelectedStudents();
+    } else {
+      setSelectedStudentsState([]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [values.join(',')]); // Depend on values as string to avoid object comparison issues
+
+  const selectedStudents = selectedStudentsState;
 
   // Debounced search function
   const performSearch = useCallback(async (query: string) => {
@@ -145,10 +194,13 @@ const StudentsPicker: React.FC<StudentsPickerProps> = ({
     }
   };
 
+  // Find IDs that couldn't be resolved - use fallback names if available
+  const unresolvedIds = values.filter(id => !selectedStudents.find(s => s.id === id));
+
   return (
     <div ref={containerRef} className={`relative space-y-2 ${className}`}>
       {/* Selected Students Chips */}
-      {selectedStudents.length > 0 && (
+      {(selectedStudents.length > 0 || unresolvedIds.length > 0) && (
         <div className="flex flex-wrap gap-2 p-2 bg-slate-50 border border-slate-200 rounded-xl min-h-[60px]">
           {selectedStudents.map(student => (
             <div
@@ -167,6 +219,31 @@ const StudentsPicker: React.FC<StudentsPickerProps> = ({
               )}
             </div>
           ))}
+          {/* Show unresolved IDs with fallback names or loading state */}
+          {unresolvedIds.map(id => {
+            const fallbackName = fallbackNames[id];
+            return (
+              <div
+                key={id}
+                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-bold ${
+                  fallbackName 
+                    ? 'bg-blue-500 text-white' 
+                    : 'bg-slate-300 text-slate-700 animate-pulse'
+                }`}
+              >
+                <span>{fallbackName || 'טוען...'}</span>
+                {!disabled && (
+                  <button
+                    type="button"
+                    onClick={() => handleRemove(id)}
+                    className={fallbackName ? 'text-white/80 hover:text-white' : 'text-slate-600 hover:text-slate-800 transition-colors'}
+                  >
+                    ✕
+                  </button>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
 

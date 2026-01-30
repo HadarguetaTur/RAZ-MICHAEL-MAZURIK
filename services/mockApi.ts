@@ -1,5 +1,5 @@
 
-import { Lesson, Student, Teacher, Subscription, MonthlyBill, LessonStatus, SystemError, BillLineItem } from '../types';
+import { Lesson, Student, Teacher, Subscription, MonthlyBill, LessonStatus, BillLineItem } from '../types';
 
 const MOCK_TEACHERS: Teacher[] = [
   { id: 't1', name: 'רז מנהל', specialties: ['מתמטיקה', 'פיזיקה'] },
@@ -84,9 +84,6 @@ export const mockData = {
     return [];
   },
   getSubscriptions: async (status: string): Promise<Subscription[]> => {
-    return [];
-  },
-  getSystemErrors: async (): Promise<SystemError[]> => {
     return [];
   }
 };
