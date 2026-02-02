@@ -60,10 +60,16 @@ export async function fetchWithCache<T>(
   const cached = getCacheEntry<T>(key);
 
   if (cached?.isFresh) {
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'fetchWithCache.ts:freshReturn',message:'Returning FRESH cached data',data:{key,isFresh:true},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H9'})}).catch(()=>{});
+    // #endregion
     return cached.data;
   }
 
   if (cached && !cached.isFresh && staleWhileRevalidate) {
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'fetchWithCache.ts:staleReturn',message:'Returning STALE data while revalidating',data:{key,isFresh:false,staleWhileRevalidate:true},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H9'})}).catch(()=>{});
+    // #endregion
     // Fire-and-forget revalidation
     void revalidate(key, ttlMs, fetcher);
     return cached.data;

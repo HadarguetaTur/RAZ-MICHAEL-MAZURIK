@@ -1598,6 +1598,7 @@ const Availability: React.FC = () => {
       </div>
 
       {/* Slot Inventory Modal - Shared component (same as Calendar) */}
+      {/* For Availability: require student selection when reserving */}
       {slotModal.isOpen && slotModal.slotData && (
         <SlotInventoryModal
           slot={{
@@ -1620,6 +1621,7 @@ const Availability: React.FC = () => {
             
             slotModal.handleSuccess();
           }}
+          requireStudentForReserve={true}
         />
       )}
     </div>

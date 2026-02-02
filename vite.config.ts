@@ -25,6 +25,7 @@ export default defineConfig(({ mode }) => {
             },
           },
           '/api/conflicts': { target: 'http://localhost:3001', changeOrigin: true },
+          '/api/slot-inventory': { target: 'http://localhost:3001', changeOrigin: true },
         },
       },
       plugins: [react()],

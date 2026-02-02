@@ -2,6 +2,7 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Lesson, LessonStatus, Teacher, Student, LessonType, SlotInventory } from '../types';
 import { nexusApi, parseApiError } from '../services/nexusApi';
+import { updateLesson } from '../data/mutations';
 import { getLessons } from '../data/resources/lessons';
 import { getSlotInventory } from '../data/resources/slotInventory';
 import LessonDetailsModal from './LessonDetailsModal';
@@ -18,7 +19,7 @@ import { isOverlapping } from '../utils/overlaps';
 import { apiUrl } from '../config/api';
 import { useToast } from '../hooks/useToast';
 import { useConfirmDialog } from '../hooks/useConfirmDialog';
-import { sendTeacherCancelNotification, normalizePhoneNumber } from '../services/makeApi';
+import { sendTeacherCancelNotification, normalizePhoneNumber, triggerCancelLessonScenario } from '../services/makeApi';
 
 const HOURS = Array.from({ length: 14 }, (_, i) => i + 8); // 08:00 to 21:00
 const DAYS_HEBREW = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'];
@@ -34,8 +35,14 @@ function shouldRenderOpenSlot(
   slot: SlotInventory,
   allLessons: Lesson[]
 ): boolean {
+  // #region agent log
+  fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:shouldRenderOpenSlot:entry',message:'shouldRenderOpenSlot called',data:{slotId:slot.id,slotStatus:slot.status,slotLessons:slot.lessons,slotLessonsType:typeof slot.lessons,slotLessonsIsArray:Array.isArray(slot.lessons),slotLessonsLength:slot.lessons?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'G'})}).catch(()=>{});
+  // #endregion
   // Guard 1: Status must be "open" (strict check)
   if (slot.status !== 'open') {
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:shouldRenderOpenSlot:guard1',message:'Slot filtered out - status not open',data:{slotId:slot.id,slotStatus:slot.status},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'G'})}).catch(()=>{});
+    // #endregion
     if (import.meta.env.DEV) {
       console.log(`[shouldRenderOpenSlot] Slot ${slot.id} filtered out - status is "${slot.status}", not "open"`);
     }
@@ -44,6 +51,9 @@ function shouldRenderOpenSlot(
   
   // Guard 2: Check if slot has linked lessons (direct check from slot_inventory.lessons field)
   if (slot.lessons && slot.lessons.length > 0) {
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:shouldRenderOpenSlot:guard2',message:'Slot filtered out - has linked lessons',data:{slotId:slot.id,slotLessons:slot.lessons,slotLessonsLength:slot.lessons.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'G'})}).catch(()=>{});
+    // #endregion
     if (import.meta.env.DEV) {
       console.log(`[shouldRenderOpenSlot] Slot ${slot.id} filtered out - has ${slot.lessons.length} linked lesson(s):`, slot.lessons);
     }
@@ -487,22 +497,39 @@ const Calendar: React.FC = () => {
     });
   };
 
-  const refreshData = async () => {
+  const refreshData = async (forceRefresh = false) => {
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:refreshData:entry',message:'refreshData called',data:{startDate,endDateStr,forceRefresh},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H6'})}).catch(()=>{});
+    // #endregion
     try {
       if (import.meta.env.DEV) {
-        console.log(`[Calendar.refreshData] Refreshing data for ${startDate} to ${endDateStr}`);
+        console.log(`[Calendar.refreshData] Refreshing data for ${startDate} to ${endDateStr}${forceRefresh ? ' (forceRefresh=true)' : ''}`);
+      }
+      
+      // If forceRefresh, invalidate cache before fetching
+      if (forceRefresh) {
+        const { invalidateLessons } = await import('../data/resources/lessons');
+        const { invalidateSlotInventory } = await import('../data/resources/slotInventory');
+        invalidateLessons({ start: `${startDate}T00:00:00.000Z`, end: `${endDateStr}T23:59:59.999Z` });
+        invalidateSlotInventory({ start: `${startDate}T00:00:00.000Z`, end: `${endDateStr}T23:59:59.999Z` });
       }
       
       // Use resources that respect cache invalidation
       const [lessonsData, inventoryData] = await Promise.all([
         getLessons({ start: `${startDate}T00:00:00.000Z`, end: `${endDateStr}T23:59:59.999Z` }),
-        getSlotInventory({ start: `${startDate}T00:00:00.000Z`, end: `${endDateStr}T23:59:59.999Z` }),
+        getSlotInventory({ start: `${startDate}T00:00:00.000Z`, end: `${endDateStr}T23:59:59.999Z` }, undefined, forceRefresh),
       ]);
       
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:refreshData:afterFetch',message:'getLessons returned',data:{lessonsCount:lessonsData.length,lessonIds:lessonsData.slice(-3).map(l=>({id:l.id,date:l.date,startTime:l.startTime})),startDate,endDateStr},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H7'})}).catch(()=>{});
+      // #endregion
       setLessons(lessonsData);
       
       // Show only OPEN slots in calendar (exclude slots with linked lessons)
       // Filter aggressively: only show slots that are truly open AND have no matching lessons
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:refreshData:beforeFilter',message:'Before filtering slots',data:{inventoryDataCount:inventoryData.length,inventorySlots:inventoryData.map(s=>({id:s.id,status:s.status,lessons:s.lessons,lessonsLength:s.lessons?.length}))},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'G'})}).catch(()=>{});
+      // #endregion
       const filteredOpenSlots = inventoryData.filter(slot => {
         const shouldRender = shouldRenderOpenSlot(slot, lessonsData);
         if (!shouldRender && import.meta.env.DEV) {
@@ -522,6 +549,9 @@ const Calendar: React.FC = () => {
         }
         return shouldRender;
       });
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:refreshData:afterFilter',message:'After filtering slots',data:{filteredOpenSlotsCount:filteredOpenSlots.length,filteredSlots:filteredOpenSlots.map(s=>({id:s.id,status:s.status,lessons:s.lessons}))},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'G'})}).catch(()=>{});
+      // #endregion
       setOpenSlots(filteredOpenSlots);
       
       if (import.meta.env.DEV) {
@@ -599,11 +629,15 @@ const Calendar: React.FC = () => {
   const performSave = async () => {
     const studentId = selectedStudent?.id || editState.studentId || editState.studentIds?.[0];
     
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:performSave:entry',message:'performSave called',data:{studentId,isCreating,selectedLessonId:selectedLesson?.id,editState:{date:editState.date,startTime:editState.startTime,duration:editState.duration}},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H1'})}).catch(()=>{});
+    // #endregion
+    
     setIsSaving(true);
     try {
       if (selectedLesson) {
         // Update existing lesson
-        const updated = await nexusApi.updateLesson(selectedLesson.id, {
+        const updated = await updateLesson(selectedLesson.id, {
           ...editState,
           studentId: studentId,
           studentName: selectedStudent?.name || editState.studentName
@@ -613,6 +647,9 @@ const Calendar: React.FC = () => {
         setSelectedLesson(null);
         setIsCreating(false);
       } else {
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:performSave:beforeCreate',message:'About to call createLesson',data:{studentId,date:editState.date,startTime:editState.startTime,duration:editState.duration,teacherId:editState.teacherId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H2'})}).catch(()=>{});
+        // #endregion
         // Create new lesson with server-side validation
         const newLesson = await nexusApi.createLesson({
           studentId: studentId,
@@ -627,9 +664,13 @@ const Calendar: React.FC = () => {
           lessonType: editState.lessonType || 'private',
           price: editState.price !== undefined ? editState.price : (editState.lessonType === 'private' ? Math.round((editState.duration || 60) * 2.92 * 100) / 100 : undefined),
         });
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:performSave:afterCreate',message:'createLesson returned',data:{newLessonId:newLesson?.id,newLessonDate:newLesson?.date},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H2'})}).catch(()=>{});
+        // #endregion
         
         // Refresh both lessons and slots to get updated data (slots may have been auto-closed)
-        await refreshData();
+        // Use forceRefresh=true to ensure we get the latest data after creating a lesson
+        await refreshData(true);
       }
       setSelectedLesson(null);
       setSelectedStudent(null);
@@ -640,6 +681,9 @@ const Calendar: React.FC = () => {
       setOverlapConflicts([]);
       setPendingSaveAction(null);
     } catch (err: any) {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:performSave:catch',message:'performSave error caught',data:{errorMessage:err?.message,errorCode:err?.code,errorStatus:err?.status,errorDetails:err?.details},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H2'})}).catch(()=>{});
+      // #endregion
       if (err.code === 'CONFLICT_ERROR' || err.status === 409) {
         // Handle conflicts structure: { lessons: Lesson[], openSlots: SlotInventory[] }
         const conflicts = err.conflicts || {};
@@ -674,13 +718,22 @@ const Calendar: React.FC = () => {
   };
 
   const handleSave = async () => {
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:handleSave:entry',message:'handleSave called',data:{isSaving,isCheckingConflicts,isCreating,hasSelectedStudent:!!selectedStudent,selectedStudentId:selectedStudent?.id,editStateDate:editState.date,editStateStartTime:editState.startTime},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H1'})}).catch(()=>{});
+    // #endregion
     // Prevent double-submit
     if (isSaving || isCheckingConflicts) {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:handleSave:blocked',message:'handleSave blocked by isSaving/isCheckingConflicts',data:{isSaving,isCheckingConflicts},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H1'})}).catch(()=>{});
+      // #endregion
       return;
     }
 
     // For new lessons, require selectedStudent
     if (isCreating && !selectedStudent) {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:handleSave:noStudent',message:'No student selected for new lesson',data:{isCreating},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H1'})}).catch(()=>{});
+      // #endregion
       toast.error('נא לבחור תלמיד');
       return;
     }
@@ -796,8 +849,33 @@ const Calendar: React.FC = () => {
     if (!cancelModalLesson) return;
     
     try {
-      const updated = await nexusApi.updateLesson(cancelModalLesson.id, { status: LessonStatus.CANCELLED });
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:handleCancelOnly:entry',message:'handleCancelOnly called',data:{lessonId:cancelModalLesson.id,date:cancelModalLesson.date,startTime:cancelModalLesson.startTime},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H7'})}).catch(()=>{});
+      // #endregion
+      const updated = await updateLesson(cancelModalLesson.id, { status: LessonStatus.CANCELLED });
       setLessons(prev => prev.map(l => l.id === cancelModalLesson.id ? updated : l));
+      
+      // Trigger Make.com scenario to delete calendar event (non-blocking)
+      try {
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:handleCancelOnly:triggerMake',message:'About to trigger CANCEL_LESSON scenario',data:{lessonId:cancelModalLesson.id},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H7'})}).catch(()=>{});
+        // #endregion
+        const makeResult = await triggerCancelLessonScenario({
+          lessonId: cancelModalLesson.id,
+          studentId: cancelModalLesson.studentId,
+          date: cancelModalLesson.date,
+          startTime: cancelModalLesson.startTime,
+        });
+        if (!makeResult.success) {
+          console.warn('[Calendar] Failed to trigger cancel lesson scenario:', makeResult.error);
+        }
+      } catch (makeErr) {
+        console.warn('[Calendar] Cancel lesson scenario error (non-blocking):', makeErr);
+      }
+      
+      // Refresh data to show reopened slots (if any)
+      await refreshData(true);
+      
       setSelectedLesson(null);
       setShowCancelModal(false);
       setCancelModalLesson(null);
@@ -815,12 +893,30 @@ const Calendar: React.FC = () => {
     // First, cancel the lesson
     let updated: Lesson;
     try {
-      updated = await nexusApi.updateLesson(cancelModalLesson.id, { status: LessonStatus.CANCELLED });
+      updated = await updateLesson(cancelModalLesson.id, { status: LessonStatus.CANCELLED });
       setLessons(prev => prev.map(l => l.id === cancelModalLesson.id ? updated : l));
     } catch (err: any) {
       toast.error(parseApiError(err));
       throw err; // Re-throw to keep modal open on error
     }
+    
+    // Trigger Make.com scenario to delete calendar event (non-blocking)
+    try {
+      const makeResult = await triggerCancelLessonScenario({
+        lessonId: cancelModalLesson.id,
+        studentId: cancelModalLesson.studentId,
+        date: cancelModalLesson.date,
+        startTime: cancelModalLesson.startTime,
+      });
+      if (!makeResult.success) {
+        console.warn('[Calendar] Failed to trigger cancel lesson scenario:', makeResult.error);
+      }
+    } catch (makeErr) {
+      console.warn('[Calendar] Cancel lesson scenario error (non-blocking):', makeErr);
+    }
+    
+    // Refresh data to show reopened slots (if any)
+    await refreshData(true);
     
     // Lesson cancelled successfully - now try to send notification
     // Get student phone number
@@ -1066,28 +1162,28 @@ const Calendar: React.FC = () => {
                       <button
                         key={slot.id}
                         onClick={() => slotModal.open(slot.id, slot)}
-                        className="w-full bg-cyan-50/30 p-5 rounded-2xl border border-cyan-100 shadow-sm flex items-center justify-between text-right hover:border-cyan-300 transition-all group"
+                        className="w-full bg-teal-50/30 p-5 rounded-2xl border border-teal-100 shadow-sm flex items-center justify-between text-right hover:border-teal-300 transition-all group"
                       >
                         <div className="flex items-center gap-6 flex-1 min-w-0">
-                           <div className="w-12 h-12 bg-cyan-50 text-cyan-700 rounded-xl flex items-center justify-center border border-cyan-100 shrink-0">
+                           <div className="w-12 h-12 bg-teal-50 text-teal-700 rounded-xl flex items-center justify-center border border-teal-100 shrink-0">
                               <span className="text-xs font-black">{slot.startTime}</span>
                            </div>
                            <div className="text-right flex-1 min-w-0">
                               <div className="flex items-center gap-2">
-                                <div className="font-black text-cyan-900 leading-tight">חלון פתוח</div>
+                                <div className="font-black text-teal-900 leading-tight">חלון פתוח</div>
                                 {hasOverlapWithLesson && (
                                   <span className="text-[9px] font-bold text-amber-600 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded-full">
                                     חופף
                                   </span>
                                 )}
                               </div>
-                              <div className="text-[10px] font-bold text-cyan-600/70 leading-tight mt-0.5">{slot.startTime}–{slot.endTime}</div>
+                              <div className="text-[10px] font-bold text-teal-600/70 leading-tight mt-0.5">{slot.startTime}–{slot.endTime}</div>
                               {slot.teacherName && (
-                                <div className="text-[9px] font-medium text-cyan-500/60 leading-tight mt-0.5">{slot.teacherName}</div>
+                                <div className="text-[9px] font-medium text-teal-500/60 leading-tight mt-0.5">{slot.teacherName}</div>
                               )}
                            </div>
                         </div>
-                        <div className="px-3 py-1 rounded-full text-[10px] font-black border bg-white text-cyan-600 border-cyan-100 shadow-sm group-hover:bg-cyan-600 group-hover:text-white transition-all shrink-0">
+                        <div className="px-3 py-1 rounded-full text-[10px] font-black border bg-white text-teal-600 border-teal-100 shadow-sm group-hover:bg-teal-600 group-hover:text-white transition-all shrink-0">
                           שריין עכשיו
                         </div>
                       </button>
@@ -1201,19 +1297,19 @@ const Calendar: React.FC = () => {
                               slotModal.open(slot.id, slot);
                             }}
                             style={{ top: `${topOffset}px`, height: `${height}px` }}
-                            className="absolute left-1.5 right-1.5 rounded-2xl p-4 text-right border-r-4 border-cyan-500 shadow-sm border border-cyan-100 flex flex-col justify-start gap-1 overflow-hidden bg-cyan-50/50 hover:bg-cyan-50 hover:z-10 transition-all group"
+                            className="absolute left-1.5 right-1.5 rounded-2xl p-4 text-right border-r-4 border-teal-500 shadow-sm border border-teal-100 flex flex-col justify-start gap-1 overflow-hidden bg-teal-50/50 hover:bg-teal-50 hover:z-10 transition-all group"
                           >
                             <div className="flex items-start justify-between gap-2">
-                              <div className="font-black text-xs text-cyan-700 leading-tight">חלון פתוח</div>
+                              <div className="font-black text-xs text-teal-700 leading-tight">חלון פתוח</div>
                               {hasOverlapWithLesson && (
                                 <span className="text-[8px] font-bold text-amber-600 bg-amber-50 border border-amber-200 px-1 py-0.5 rounded-full shrink-0">
                                   חופף
                                 </span>
                               )}
                             </div>
-                            <div className="text-[10px] font-bold text-cyan-600/70 leading-tight">{slot.startTime}–{slot.endTime}</div>
+                            <div className="text-[10px] font-bold text-teal-600/70 leading-tight">{slot.startTime}–{slot.endTime}</div>
                             {slot.teacherName && (
-                              <div className="text-[9px] font-medium text-cyan-500/60 leading-tight mt-0.5">{slot.teacherName}</div>
+                              <div className="text-[9px] font-medium text-teal-500/60 leading-tight mt-0.5">{slot.teacherName}</div>
                             )}
                           </button>
                         );
@@ -1542,9 +1638,11 @@ const Calendar: React.FC = () => {
             }
             // Refresh data to ensure consistency (cache invalidation already happened in reserveSlotAndCreateLessons)
             // This ensures we get the latest lessons and updated slot status
-            refreshData();
+            // Use forceRefresh=true to ensure we get the latest data after reservation
+            refreshData(true);
             slotModal.handleSuccess();
           }}
+          requireStudentForReserve={true}
         />
       )}
       
@@ -1565,8 +1663,10 @@ const Calendar: React.FC = () => {
             setClickedSlot(null);
             // Refresh data to ensure consistency (cache invalidation already happened in reserveSlotAndCreateLessons)
             // This ensures we get the latest lessons and updated slot status
-            refreshData();
+            // Use forceRefresh=true to ensure we get the latest data after reservation
+            refreshData(true);
           }}
+          requireStudentForReserve={true}
         />
       )}
 

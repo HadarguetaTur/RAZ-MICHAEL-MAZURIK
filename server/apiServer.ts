@@ -185,6 +185,241 @@ async function getOpenSlotsForConflicts(
   return list;
 }
 
+/**
+ * Fetch all records from Airtable with pagination
+ */
+async function listAllAirtableRecords<TFields>(
+  baseId: string,
+  token: string,
+  tableId: string,
+  params: Record<string, string | undefined> = {}
+): Promise<Array<{ id: string; fields: TFields }>> {
+  const allRecords: Array<{ id: string; fields: TFields }> = [];
+  let offset: string | undefined;
+
+  do {
+    const queryParams: Record<string, string> = {};
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined) {
+        queryParams[key] = value;
+      }
+    });
+    if (offset) {
+      queryParams.offset = offset;
+    }
+
+    const data = await airtableGet(baseId, token, `/${tableId}`, queryParams);
+    allRecords.push(...(data.records as Array<{ id: string; fields: TFields }>));
+    offset = (data as { offset?: string }).offset;
+  } while (offset);
+
+  return allRecords;
+}
+
+/**
+ * Get teachers map (id -> name) for slot inventory
+ */
+async function getTeachersMap(baseId: string, token: string): Promise<Map<string, string>> {
+  const teachersTableId = getTableId('teachers');
+  const teacherIdField = getField('teachers', 'teacher_id');
+  const fullNameField = getField('teachers', 'full_name');
+  
+  const data = await airtableGet(baseId, token, `/${teachersTableId}`, { pageSize: '100' });
+  const map = new Map<string, string>();
+  
+  for (const record of data.records ?? []) {
+    const fields = record.fields ?? {};
+    const teacherId = fields[teacherIdField];
+    const name = fields[fullNameField];
+    if (teacherId && name && typeof name === 'string') {
+      const id = typeof teacherId === 'string' ? teacherId : String(teacherId);
+      map.set(id, name);
+    }
+    // Also map by record ID
+    if (name && typeof name === 'string') {
+      map.set(record.id, name);
+    }
+  }
+  
+  return map;
+}
+
+/**
+ * Get slot inventory with full deduplication logic (same as frontend)
+ */
+async function getSlotInventoryForAPI(
+  baseId: string,
+  token: string,
+  start: string,
+  end: string,
+  teacherId?: string
+): Promise<any[]> {
+  const tableId = getTableId('slotInventory');
+  const teachersMap = await getTeachersMap(baseId, token);
+  const dateField = getField('slotInventory', 'תאריך_שיעור');
+  const teacherIdField = getField('slotInventory', 'מורה');
+  const startTimeField = getField('slotInventory', 'שעת_התחלה');
+  
+  // Build filter formula
+  const startDate = start.split('T')[0];
+  const endDate = end.split('T')[0];
+  let filterFormula = `AND({${dateField}} >= "${startDate}", {${dateField}} <= "${endDate}")`;
+  
+  if (teacherId) {
+    const escapedTeacherId = escapeFormula(teacherId);
+    filterFormula = `AND(${filterFormula}, FIND("${escapedTeacherId}", ARRAYJOIN({${teacherIdField}})) > 0)`;
+  }
+  
+  // Fetch all records with pagination
+  const params: Record<string, string | undefined> = {
+    filterByFormula: filterFormula,
+    pageSize: '100',
+    'sort[0][field]': dateField,
+    'sort[0][direction]': 'asc',
+    'sort[1][field]': startTimeField,
+    'sort[1][direction]': 'asc',
+  };
+  const records = await listAllAirtableRecords(baseId, token, tableId, params);
+  
+  // Map records to SlotInventory format
+  const mappedInventory = records.map(record => {
+    const fields = record.fields || {};
+    
+    // Extract teacher ID
+    const teacherIdValue = fields[teacherIdField];
+    let extractedTeacherId = Array.isArray(teacherIdValue) 
+      ? (typeof teacherIdValue[0] === 'string' ? teacherIdValue[0] : teacherIdValue[0]?.id || '')
+      : (typeof teacherIdValue === 'string' ? teacherIdValue : teacherIdValue?.id || '');
+    
+    // Extract source weekly slot
+    const sourceField = getField('slotInventory', 'נוצר_מתוך');
+    const sourceValue = fields[sourceField];
+    const sourceWeeklySlot = sourceValue
+      ? (Array.isArray(sourceValue) 
+          ? (typeof sourceValue[0] === 'string' ? sourceValue[0] : sourceValue[0]?.id || undefined)
+          : (typeof sourceValue === 'string' ? sourceValue : sourceValue?.id || undefined))
+      : undefined;
+    
+    // Map status (Hebrew ↔ English)
+    const statusField = getField('slotInventory', 'סטטוס');
+    const rawStatusValue = fields[statusField] || 'open';
+    const statusValue = typeof rawStatusValue === 'string' ? rawStatusValue.trim() : String(rawStatusValue).trim();
+    const status = (
+      statusValue === 'פתוח' || statusValue === 'open'
+        ? 'open'
+        : statusValue === 'סגור' || statusValue === 'closed' || statusValue === 'booked'
+        ? 'closed'
+        : statusValue === 'חסום ע"י מנהל' || statusValue === 'חסום' || statusValue === 'blocked'
+        ? 'blocked'
+        : statusValue === 'מבוטל' || statusValue === 'canceled'
+        ? 'canceled'
+        : 'open'
+    ) as 'open' | 'closed' | 'canceled' | 'blocked';
+    
+    const occupied = (fields[getField('slotInventory', 'תפוסה_נוכחית' as any)] as number) || 0;
+    const capacity = (fields[getField('slotInventory', 'קיבולת_כוללת' as any)] as number) || 1;
+    
+    // Extract student IDs
+    const studentField = getField('slotInventory', 'תלמידים' as any);
+    const studentVal = fields[studentField];
+    let studentIds: string[] = [];
+    if (Array.isArray(studentVal)) {
+      studentIds = studentVal.map((s: any) => typeof s === 'string' ? s : s.id).filter(Boolean);
+    }
+    
+    // Extract lesson IDs
+    const lessonsField = getField('slotInventory', 'lessons');
+    const lessonsVal = fields[lessonsField] || fields.lessons;
+    let lessonIds: string[] = [];
+    if (Array.isArray(lessonsVal)) {
+      lessonIds = lessonsVal.map((l: any) => typeof l === 'string' ? l : l.id).filter(Boolean);
+    } else if (lessonsVal) {
+      lessonIds = [typeof lessonsVal === 'string' ? lessonsVal : lessonsVal.id].filter(Boolean);
+    }
+    
+    return {
+      id: record.id,
+      naturalKey: fields.natural_key || '',
+      teacherId: extractedTeacherId || '',
+      teacherName: teachersMap.get(extractedTeacherId || '') || '',
+      lessonDate: fields[dateField] || '',
+      date: fields[dateField] || '',
+      startTime: fields[startTimeField] || '',
+      endTime: fields[getField('slotInventory', 'שעת_סיום')] || '',
+      lessonType: fields[getField('slotInventory', 'סוג_שיעור')],
+      sourceWeeklySlot: sourceWeeklySlot,
+      status: status,
+      occupied,
+      capacityOptional: capacity,
+      students: studentIds,
+      lessons: lessonIds,
+      dayOfWeek: fields.day_of_week,
+      startDT: fields.StartDT,
+      endDT: fields.EndDT,
+      isFull: fields.is_full === true || fields.is_full === 1,
+      isBlock: fields.is_block === true || fields.is_block === 1,
+      isLocked: fields.is_locked === true || fields.is_locked === 1,
+    };
+  });
+  
+  // Deduplication logic (same as frontend)
+  const statusPriority: Record<string, number> = {
+    'blocked': 4,
+    'closed': 3,
+    'open': 2,
+    'canceled': 1,
+  };
+  
+  const getDedupeKey = (slot: any): string => {
+    if (slot.naturalKey && slot.naturalKey.trim() !== '') {
+      return `natural_key:${slot.naturalKey}`;
+    }
+    const teacherId = slot.teacherId || 'none';
+    return `composite:${slot.date}|${slot.startTime}|${slot.endTime}|${teacherId}`;
+  };
+  
+  const selectWinner = (slot1: any, slot2: any): any => {
+    const priority1 = statusPriority[slot1.status] || 0;
+    const priority2 = statusPriority[slot2.status] || 0;
+    if (priority1 !== priority2) {
+      return priority1 > priority2 ? slot1 : slot2;
+    }
+    
+    const hasLinks1 = (slot1.lessons && slot1.lessons.length > 0) || (slot1.students && slot1.students.length > 0);
+    const hasLinks2 = (slot2.lessons && slot2.lessons.length > 0) || (slot2.students && slot2.students.length > 0);
+    if (hasLinks1 !== hasLinks2) {
+      return hasLinks1 ? slot1 : slot2;
+    }
+    
+    return slot1.id > slot2.id ? slot1 : slot2;
+  };
+  
+  // Dedupe by key
+  const dedupeMap = new Map<string, any>();
+  for (const slot of mappedInventory) {
+    const key = getDedupeKey(slot);
+    const existing = dedupeMap.get(key);
+    
+    if (!existing) {
+      dedupeMap.set(key, slot);
+    } else {
+      const winner = selectWinner(existing, slot);
+      dedupeMap.set(key, winner);
+    }
+  }
+  
+  const deduplicatedInventory = Array.from(dedupeMap.values());
+  
+  // Sort by date, then startTime
+  deduplicatedInventory.sort((a, b) => {
+    const dateCompare = a.date.localeCompare(b.date);
+    if (dateCompare !== 0) return dateCompare;
+    return a.startTime.localeCompare(b.startTime);
+  });
+  
+  return deduplicatedInventory;
+}
+
 // PORT: Use PORT (cloud platforms like Render/Railway) or CONFLICTS_CHECK_PORT or default 3001
 const PORT = Number(process.env.PORT ?? process.env.CONFLICTS_CHECK_PORT ?? '3001');
 
@@ -205,6 +440,40 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && (url === '/health' || url === '/api/health')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }));
+    return;
+  }
+
+  // --- Slot Inventory: GET /api/slot-inventory ---
+  if (req.method === 'GET' && url.startsWith('/api/slot-inventory')) {
+    const parsedUrl = new URL(url, `http://${req.headers.host || 'localhost'}`);
+    const start = parsedUrl.searchParams.get('start');
+    const end = parsedUrl.searchParams.get('end');
+    const teacherId = parsedUrl.searchParams.get('teacherId') || undefined;
+    
+    if (!start || !end) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing required query params: start, end' }));
+      return;
+    }
+    
+    const baseId = env('AIRTABLE_BASE_ID') || env('VITE_AIRTABLE_BASE_ID');
+    const token = env('AIRTABLE_API_KEY') || env('VITE_AIRTABLE_API_KEY');
+    if (!baseId || !token) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Airtable credentials not configured' }));
+      return;
+    }
+    
+    try {
+      const slotInventory = await getSlotInventoryForAPI(baseId, token, start, end, teacherId);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(slotInventory));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to fetch slot inventory';
+      console.error('[apiServer] slot-inventory error', { start, end, teacherId: teacherId?.slice(0, 6) + '…' });
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: msg }));
+    }
     return;
   }
 
@@ -268,6 +537,7 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.info(`[apiServer] Server running on port ${PORT}`);
   console.info(`  GET  /health - Health check`);
+  console.info(`  GET  /api/slot-inventory - Slot inventory (with deduplication)`);
   console.info(`  POST /api/conflicts/check - Conflicts checking`);
   if (process.env.ALLOWED_ORIGINS) {
     console.info(`  CORS origins: ${process.env.ALLOWED_ORIGINS}`);

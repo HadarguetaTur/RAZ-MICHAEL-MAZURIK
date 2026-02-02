@@ -315,21 +315,20 @@ const SlotInventoryCard: React.FC<{
       <>
         <div
           className={`group relative p-4 rounded-2xl border transition-all duration-200 ${
-            isOpen ? 'bg-cyan-50 border-cyan-200 shadow-sm hover:border-cyan-400' 
-            : isBlocked ? 'bg-amber-50 border-amber-300 shadow-sm hover:border-amber-400'
-            : 'bg-slate-100 border-slate-200'
+            isBlocked ? 'bg-amber-50 border-amber-300 shadow-sm hover:border-amber-400'
+            : 'bg-teal-50 border-teal-200 shadow-sm hover:border-teal-400'
           }`}
         >
           <div className="flex flex-col gap-1">
             <div className="flex items-center justify-between">
-              <span className={`text-sm font-black ${isOpen ? 'text-slate-900' : isBlocked ? 'text-amber-900' : 'text-slate-400'}`}>
+              <span className={`text-sm font-black ${isBlocked ? 'text-amber-900' : 'text-slate-900'}`}>
                 {slot.startTime} – {slot.endTime}
               </span>
               <div className="flex items-center gap-1">
                 <span
                   className={`text-[8px] font-black px-1.5 py-0.5 rounded ${
                     slot.status === 'open'
-                      ? 'text-cyan-700 bg-cyan-100'
+                      ? 'text-teal-700 bg-teal-100'
                       : slot.status === 'closed'
                       ? 'text-blue-600 bg-blue-50'
                       : slot.status === 'blocked'
@@ -352,12 +351,12 @@ const SlotInventoryCard: React.FC<{
                 <span className="text-[10px] font-medium text-slate-500">{slot.teacherName}</span>
               )}
               {slot.occupied !== undefined && slot.capacityOptional !== undefined && (
-                <span className="text-[10px] font-bold text-cyan-700">תפוסה: {slot.occupied}/{slot.capacityOptional}</span>
+                <span className="text-[10px] font-bold text-teal-700">תפוסה: {slot.occupied}/{slot.capacityOptional}</span>
               )}
               {slotStudents.length > 0 && (
                 <div className="flex flex-wrap gap-1 mt-1">
                   {slotStudents.map((s, i) => (
-                    <span key={i} className="text-[9px] bg-cyan-100 text-cyan-800 px-1.5 py-0.5 rounded-md font-bold">
+                    <span key={i} className="text-[9px] bg-teal-100 text-teal-800 px-1.5 py-0.5 rounded-md font-bold">
                       {s.name}
                     </span>
                   ))}
@@ -378,7 +377,7 @@ const SlotInventoryCard: React.FC<{
                       }
                       onReserveSlot(slot.id);
                     }}
-                    className="text-[10px] font-black text-cyan-600 hover:text-cyan-700 underline transition-colors"
+                    className="text-[10px] font-black text-teal-600 hover:text-teal-700 underline transition-colors"
                   >
                     שריין חלון
                   </button>

@@ -59,7 +59,38 @@ export async function updateLesson(
 ): Promise<Lesson> {
   const result = await nexusApi.updateLesson(id, updates);
   
-  // Invalidate both lessons and slot inventory (slots may have been auto-closed)
+  // If lesson was cancelled, reopen linked slot_inventory records
+  // LessonStatus.CANCELLED = 'בוטל' (Hebrew), so check both English and Hebrew values
+  // #region agent log
+  fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'mutations.ts:63',message:'Checking if lesson was cancelled',data:{lessonId:id,status:updates.status,isCancelled:updates.status === 'CANCELLED' || updates.status === 'cancelled' || updates.status === 'בוטל'},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H'})}).catch(()=>{});
+  // #endregion
+  if (updates.status === 'CANCELLED' || updates.status === 'cancelled' || updates.status === 'בוטל') {
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'mutations.ts:65',message:'Lesson was cancelled - calling reopenSlotsForCancelledLesson',data:{lessonId:id},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H'})}).catch(()=>{});
+    // #endregion
+    try {
+      const { reopenSlotsForCancelledLesson } = await import('../services/slotReopeningService');
+      const reopenedSlots = await reopenSlotsForCancelledLesson(id);
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'mutations.ts:69',message:'reopenSlotsForCancelledLesson returned',data:{lessonId:id,reopenedSlotsCount:reopenedSlots.length,reopenedSlots},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H'})}).catch(()=>{});
+      // #endregion
+      if (import.meta.env.DEV) {
+        if (reopenedSlots.length > 0) {
+          console.log(`[Mutations] updateLesson | Reopened ${reopenedSlots.length} slot(s) after cancelling lesson ${id}:`, reopenedSlots);
+        } else {
+          console.log(`[Mutations] updateLesson | No slots found to reopen for cancelled lesson ${id}`);
+        }
+      }
+    } catch (error) {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'mutations.ts:78',message:'Error in reopenSlotsForCancelledLesson',data:{lessonId:id,error:error?.message,errorStack:error?.stack},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H'})}).catch(()=>{});
+      // #endregion
+      // Don't fail lesson update if slot reopening fails
+      console.warn(`[Mutations] updateLesson | Failed to reopen slots for cancelled lesson ${id}:`, error);
+    }
+  }
+  
+  // Invalidate both lessons and slot inventory (slots may have been auto-closed or reopened)
   invalidateLessons();
   invalidateSlotInventory();
   

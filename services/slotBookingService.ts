@@ -78,6 +78,9 @@ export async function reserveSlotAndCreateLessons(
   slotId: string,
   studentIds: string[]
 ): Promise<{ lessons: Lesson[]; slot: SlotInventory }> {
+  // #region agent log
+  fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'slotBookingService.ts:reserveSlotAndCreateLessons:entry',message:'reserveSlotAndCreateLessons called',data:{slotId,studentIds,studentCount:studentIds?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H6'})}).catch(()=>{});
+  // #endregion
   // Validate inputs
   if (!slotId) {
     throw {
@@ -204,6 +207,9 @@ export async function reserveSlotAndCreateLessons(
       };
     }
 
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'slotBookingService.ts:beforeCreateLesson',message:'About to create lesson for student',data:{studentRecordId,date,startTime,durationMin,teacherId:finalTeacherRecordId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H6'})}).catch(()=>{});
+    // #endregion
     const lesson = await nexusApi.createLesson({
       studentId: studentRecordId,
       date,
@@ -214,6 +220,9 @@ export async function reserveSlotAndCreateLessons(
       source: 'slot_inventory',
       lessonType: lessonType,
     });
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'slotBookingService.ts:afterCreateLesson',message:'Lesson created successfully',data:{lessonId:lesson?.id,studentRecordId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H6'})}).catch(()=>{});
+    // #endregion
     createdLessons.push(lesson);
   }
 
@@ -241,33 +250,74 @@ export async function reserveSlotAndCreateLessons(
   }
 
   // Link lessons (if lessons field exists)
+  // #region agent log
+  fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'slotBookingService.ts:252',message:'Before linking lessons',data:{createdLessonsCount:createdLessons.length,createdLessonIds:createdLessons.map(l=>l.id)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A,B'})}).catch(()=>{});
+  // #endregion
   try {
     const lessonsField = getField('slotInventory', 'lessons');
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'slotBookingService.ts:255',message:'Got lessonsField from getField',data:{lessonsField,lessonsFieldType:typeof lessonsField,lessonsFieldExists:!!lessonsField},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+    // #endregion
     if (lessonsField) {
       const lessonIds = createdLessons.map(l => l.id);
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'slotBookingService.ts:258',message:'Adding lessons to updateFields',data:{lessonsField,lessonIds,lessonIdsCount:lessonIds.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+      // #endregion
       (updateFields as any)[lessonsField] = lessonIds;
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'slotBookingService.ts:260',message:'After adding lessons to updateFields',data:{updateFieldsKeys:Object.keys(updateFields),lessonsFieldValue:(updateFields as any)[lessonsField]},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+      // #endregion
+    } else {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'slotBookingService.ts:262',message:'lessonsField is falsy',data:{lessonsField},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+      // #endregion
     }
   } catch (fieldError) {
     // Field doesn't exist in fieldMap, skip linking lessons
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'slotBookingService.ts:265',message:'Error getting lessonsField',data:{fieldError:fieldError?.message,fieldErrorStack:fieldError?.stack},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+    // #endregion
     if (import.meta.env.DEV) {
       console.warn(`[reserveSlotAndCreateLessons] lessons field not found in fieldMap, skipping lesson linking`);
     }
   }
 
   // Link students (if תלמידים field exists)
+  // #region agent log
+  fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'slotBookingService.ts:267',message:'Before linking students',data:{studentIdsCount:studentIds.length,studentIds},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+  // #endregion
   try {
     const studentsField = getField('slotInventory', 'תלמידים');
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'slotBookingService.ts:270',message:'Got studentsField from getField',data:{studentsField,studentsFieldType:typeof studentsField,studentsFieldExists:!!studentsField},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+    // #endregion
     if (studentsField) {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'slotBookingService.ts:273',message:'Adding students to updateFields',data:{studentsField,studentIds},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+      // #endregion
       (updateFields as any)[studentsField] = studentIds;
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'slotBookingService.ts:275',message:'After adding students to updateFields',data:{updateFieldsKeys:Object.keys(updateFields),studentsFieldValue:(updateFields as any)[studentsField]},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+      // #endregion
+    } else {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'slotBookingService.ts:277',message:'studentsField is falsy',data:{studentsField},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+      // #endregion
     }
   } catch (fieldError) {
     // Field doesn't exist in fieldMap, skip linking students
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'slotBookingService.ts:280',message:'Error getting studentsField',data:{fieldError:fieldError?.message,fieldErrorStack:fieldError?.stack},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+    // #endregion
     if (import.meta.env.DEV) {
       console.warn(`[reserveSlotAndCreateLessons] תלמידים field not found in fieldMap, skipping student linking`);
     }
   }
 
   // Update slot_inventory record directly via airtableClient (to handle status + links in one call)
+  // #region agent log
+  fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'slotBookingService.ts:285',message:'Before updating slot_inventory',data:{slotId,updateFields,updateFieldsKeys:Object.keys(updateFields),hasLessonsField:!!(updateFields as any)[getField('slotInventory','lessons')],hasStudentsField:!!(updateFields as any)[getField('slotInventory','תלמידים')]},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D,E'})}).catch(()=>{});
+  // #endregion
   try {
     if (import.meta.env.DEV) {
       console.log(`[reserveSlotAndCreateLessons] Updating slot_inventory with fields:`, JSON.stringify(updateFields, null, 2));
@@ -280,10 +330,17 @@ export async function reserveSlotAndCreateLessons(
       { typecast: true } // Enable automatic option creation for Single Select fields
     );
     
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'slotBookingService.ts:293',message:'After updating slot_inventory - success',data:{slotId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+    // #endregion
+    
     if (import.meta.env.DEV) {
       console.log(`[reserveSlotAndCreateLessons] Successfully updated slot_inventory ${slotId}`);
     }
   } catch (updateError: any) {
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'slotBookingService.ts:297',message:'Error updating slot_inventory',data:{slotId,updateError:updateError?.message,updateErrorStatus:updateError?.status,updateErrorDetails:updateError?.details},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
+    // #endregion
     // If update fails, try updating just status via nexusApi as fallback
     console.error(`[reserveSlotAndCreateLessons] Direct update failed:`, updateError);
     if (import.meta.env.DEV) {
@@ -317,6 +374,10 @@ export async function reserveSlotAndCreateLessons(
   const lessonsField = getField('slotInventory', 'lessons');
   const linkedLessons = updatedFields[lessonsField] || updatedFields.lessons;
   const hasLinkedLessons = Array.isArray(linkedLessons) ? linkedLessons.length > 0 : !!linkedLessons;
+  
+  // #region agent log
+  fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'slotBookingService.ts:326',message:'After fetching updated record - checking lessons field',data:{slotId,lessonsField,linkedLessons,linkedLessonsType:typeof linkedLessons,linkedLessonsIsArray:Array.isArray(linkedLessons),hasLinkedLessons,allUpdatedFieldsKeys:Object.keys(updatedFields),lessonsFieldInFields:!!updatedFields[lessonsField],lessonsInFields:!!updatedFields.lessons},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D,F'})}).catch(()=>{});
+  // #endregion
   
   // Extract lesson IDs for the returned slot object
   let lessonIds: string[] = [];

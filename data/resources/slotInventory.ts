@@ -6,6 +6,7 @@ import { fetchWithCache } from '../fetchWithCache';
 import { invalidateCache, buildKey } from '../cache';
 import { nexusApi } from '../../services/nexusApi';
 import { SlotInventory } from '../../types';
+import { apiUrl } from '../../config/api';
 
 const SLOT_INVENTORY_TTL = 3 * 60 * 1000; // 3 minutes (dynamic data)
 
@@ -45,7 +46,34 @@ export async function getSlotInventory(
   return fetchWithCache({
     key,
     ttlMs: SLOT_INVENTORY_TTL,
-    fetcher: () => nexusApi.getSlotInventory(start, end, teacherId),
+    fetcher: async () => {
+      // Try API server first (production-safe)
+      try {
+        const apiPath = apiUrl('/api/slot-inventory');
+        const url = apiPath.startsWith('http') 
+          ? new URL(apiPath)
+          : new URL(apiPath, window.location.origin);
+        url.searchParams.set('start', start);
+        url.searchParams.set('end', end);
+        if (teacherId) {
+          url.searchParams.set('teacherId', teacherId);
+        }
+        
+        const response = await fetch(url.toString());
+        if (response.ok) {
+          const data = await response.json();
+          return data as SlotInventory[];
+        }
+        // If API server fails, fall back to direct Airtable (for dev)
+        console.warn('[getSlotInventory] API server failed, falling back to direct Airtable');
+      } catch (err) {
+        // Fall back to direct Airtable if API server is unavailable
+        console.warn('[getSlotInventory] API server unavailable, falling back to direct Airtable:', err);
+      }
+      
+      // Fallback: direct Airtable call (for dev/local)
+      return nexusApi.getSlotInventory(start, end, teacherId);
+    },
     staleWhileRevalidate: true,
   });
 }

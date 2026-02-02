@@ -10,6 +10,7 @@ let cachedChargeSchema: ChargeTableSchema | null = null;
 import { getTableId, getField, isComputedField, filterComputedFields } from '../contracts/fieldMap';
 import { getWeeklySlots as getWeeklySlotsService, getSlotInventory as getSlotInventoryService, updateWeeklySlot as updateWeeklySlotService, updateSlotInventory as updateSlotInventoryService, createWeeklySlot as createWeeklySlotService, deleteWeeklySlot as deleteWeeklySlotService } from './slotManagementService';
 import { openNewWeek as openNewWeekService } from './weeklyRolloverService';
+import { triggerCreateLessonScenario } from './makeApi';
 
 // Use Vite's import.meta.env for client-side environment variables
 const API_BASE_URL = 'https://api.airtable.com/v0';
@@ -1945,28 +1946,19 @@ export const nexusApi = {
               id
             );
 
-            if (!canOpen) {
-              // Prevent opening - set status to "closed" instead
-              statusValue = 'סגור';
-              if (import.meta.env.DEV) {
-                console.warn(`[updateSlotInventory] Cannot open slot ${id} - ${conflictingLessons.length} overlapping lesson(s) found. Setting status to "סגור" instead.`);
-              }
-              // Throw error to inform UI
-              throw {
-                message: `לא ניתן לפתוח חלון - יש ${conflictingLessons.length} שיעור${conflictingLessons.length > 1 ? 'ים' : ''} חופף${conflictingLessons.length > 1 ? 'ים' : ''} בזמן זה`,
-                code: 'CONFLICT_ERROR',
-                status: 409,
-                conflicts: conflictingLessons,
-              };
+            // NOTE: Changed from blocking to warning-only
+            // Previously this would throw CONFLICT_ERROR and prevent opening.
+            // Now we allow opening with a warning - slots and lessons are independent entities.
+            // The UI (Availability.tsx) already shows warnings for overlapping lessons.
+            if (!canOpen && import.meta.env.DEV) {
+              console.warn(`[updateSlotInventory] Opening slot ${id} with ${conflictingLessons.length} overlapping lesson(s). ` +
+                `Slot will be opened anyway - slots and lessons are independent.`);
             }
+            // Allow opening - statusValue remains 'פתוח'
           }
-        } catch (preventError: any) {
-          // If it's our conflict error, re-throw it
-          if (preventError.code === 'CONFLICT_ERROR') {
-            throw preventError;
-          }
-          // Otherwise log and continue (don't fail the update)
-          console.warn(`[updateSlotInventory] Failed to check for lesson overlaps:`, preventError);
+        } catch (checkError: any) {
+          // Log but don't fail the update - lesson overlap check is now advisory only
+          console.warn(`[updateSlotInventory] Failed to check for lesson overlaps:`, checkError);
         }
       }
       
@@ -2190,71 +2182,12 @@ export const nexusApi = {
       throw new Error('Airtable API Key or Base ID not configured');
     }
 
-    // PREVENT DUPLICATES: Check for overlapping open slots BEFORE updating lesson
-    // This prevents duplicate windows (open slot + lesson for same time)
-    if (updates.date && updates.startTime && (updates.duration || updates.teacherId)) {
-      try {
-        // Fetch current lesson to get teacherId if not in updates
-        const currentLesson = await (async () => {
-          const lessonsTableId = getTableId('lessons');
-          const record = await airtableRequest<{ id: string; fields: any }>(`/${lessonsTableId}/${id}`);
-          return mapAirtableToLesson({ id: record.id, fields: record.fields });
-        })();
-
-        const teacherId = updates.teacherId || currentLesson.teacherId;
-        const duration = updates.duration || currentLesson.duration || 60;
-
-        if (teacherId && updates.date && updates.startTime) {
-          // Check for overlapping open slots first
-          const { validateConflicts } = await import('./conflictValidationService');
-          const validationResult = await validateConflicts({
-            teacherId: teacherId,
-            date: updates.date,
-            startTime: updates.startTime,
-            endTime: duration, // duration in minutes
-            excludeLessonId: id, // Exclude current lesson from conflict check
-          });
-
-          // If there are overlapping open slots, prevent lesson update
-          if (validationResult.conflicts.openSlots.length > 0) {
-            const slotDetails = validationResult.conflicts.openSlots.map(s => 
-              `${s.date} ${s.startTime}-${s.endTime}`
-            ).join(', ');
-            
-            const conflictError: any = {
-              message: `לא ניתן לעדכן שיעור - יש חלון פתוח חופף בזמן זה: ${slotDetails}. אנא סגור את החלון הפתוח תחילה או בחר זמן אחר.`,
-              code: 'CONFLICT_ERROR',
-              status: 409,
-              conflicts: {
-                lessons: [],
-                openSlots: validationResult.conflicts.openSlots,
-              },
-            };
-            throw conflictError;
-          }
-
-          // Auto-close overlapping open slots (should be empty after check above, but keep for safety)
-          const { autoCloseOverlappingSlots } = await import('./conflictValidationService');
-          const closedSlots = await autoCloseOverlappingSlots(
-            teacherId,
-            updates.date,
-            updates.startTime,
-            duration,
-            id // Link lesson to closed slots
-          );
-          if (closedSlots.length > 0 && import.meta.env.DEV) {
-            console.log(`[updateLesson] Auto-closed ${closedSlots.length} overlapping open slot(s)`);
-          }
-        }
-      } catch (conflictError: any) {
-        // Re-throw conflict errors (they should prevent lesson update)
-        if (conflictError.code === 'CONFLICT_ERROR') {
-          throw conflictError;
-        }
-        // Log but don't fail lesson update if other errors occur
-        console.warn(`[updateLesson] Failed to check/close overlapping slots:`, conflictError);
-      }
-    }
+    // NOTE: Slot conflict checking removed from updateLesson
+    // Reason: If lesson was created from slot_inventory, the slot is already closed.
+    // If lesson was created manually, there's no relationship to slots.
+    // This prevents the bidirectional coupling issue where editing lessons
+    // could unexpectedly close open slots or be blocked by them.
+    // Slot management is handled separately via slot_inventory UI.
 
     const airtableFields = mapLessonToAirtable(updates);
     const lessonsTableId = getTableId('lessons');
@@ -2951,7 +2884,7 @@ export const nexusApi = {
   // Create a new lesson with server-side validation
   createLesson: async (lesson: Partial<Lesson>): Promise<Lesson> => {
     // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:2478',message:'createLesson: entry with params',data:{teacherId:lesson.teacherId,date:lesson.date,startTime:lesson.startTime,duration:lesson.duration,studentId:lesson.studentId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:createLesson:entry',message:'createLesson ENTRY - starting function',data:{teacherId:lesson.teacherId,date:lesson.date,startTime:lesson.startTime,duration:lesson.duration,studentId:lesson.studentId,lessonType:lesson.lessonType,source:(lesson as any).source},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H1,H2'})}).catch(()=>{});
     // #endregion
     if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
       throw new Error('Airtable API Key or Base ID not configured');
@@ -3044,6 +2977,9 @@ export const nexusApi = {
     console.log(`[DEBUG createLesson] PART C - duration: ${lesson.duration} minutes`);
     console.log(`[DEBUG createLesson] PART C - end_datetime (UTC): ${endDatetime}`);
     console.log(`[DEBUG createLesson] PART C - Validation: end > start: ${endTimeMs > startTimeMs} (${endTimeMs} > ${startTimeMs})`);
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:createLesson:beforeConflictCheck',message:'createLesson - BEFORE server-side lesson conflict check',data:{startDatetime,endDatetime,studentId:studentRecordId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H2,H4'})}).catch(()=>{});
+    // #endregion
 
     // Server-side conflict check (call the function directly, not through nexusApi to avoid circular reference)
     const conflicts = await (async () => {
@@ -3113,6 +3049,9 @@ export const nexusApi = {
       return mappedConflicts;
     })();
 
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:createLesson:afterConflictCheck',message:'createLesson - AFTER server-side lesson conflict check',data:{conflictsCount:conflicts.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H2,H4'})}).catch(()=>{});
+    // #endregion
     if (conflicts.length > 0) {
       // Build detailed conflict message
       const conflictDetails = conflicts.map(c => 
@@ -3131,10 +3070,17 @@ export const nexusApi = {
     // PREVENT DUPLICATES: Check for overlapping open slots BEFORE creating lesson
     // This prevents duplicate windows (open slot + lesson for same time)
     // Check even if teacherId is missing - we'll check all slots for that date/time
+    // IMPORTANT: Skip this check when lesson is created from slot_inventory booking
+    // (source === 'slot_inventory'), because slotBookingService already handles slot closure
+    // This allows manual lesson creation without affecting slot_inventory
+    const isFromSlotBooking = (lesson as any).source === 'slot_inventory';
     // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:2653',message:'createLesson: checking if conflict check should run',data:{teacherId:lesson.teacherId,date:lesson.date,startTime:lesson.startTime,hasAllRequired:!!(lesson.date && lesson.startTime)},timestamp:Date.now(),sessionId:'debug-session',runId:'run2',hypothesisId:'B'})}).catch(()=>{});
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:2653',message:'createLesson: checking if conflict check should run',data:{teacherId:lesson.teacherId,date:lesson.date,startTime:lesson.startTime,hasAllRequired:!!(lesson.date && lesson.startTime),isFromSlotBooking},timestamp:Date.now(),sessionId:'debug-session',runId:'run2',hypothesisId:'B'})}).catch(()=>{});
     // #endregion
-    if (lesson.date && lesson.startTime) {
+    if (isFromSlotBooking && import.meta.env.DEV) {
+      console.log(`[createLesson] Skipping slot conflict check - lesson is from slot_inventory booking (slotBookingService handles slot closure)`);
+    }
+    if (lesson.date && lesson.startTime && !isFromSlotBooking) {
       try {
         // #region agent log
         fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:2656',message:'createLesson: resolving teacherId',data:{originalTeacherId:lesson.teacherId,teacherIdIsRecordId:lesson.teacherId?.startsWith('rec'),date:lesson.date,startTime:lesson.startTime,duration:lesson.duration || 60},timestamp:Date.now(),sessionId:'debug-session',runId:'run3',hypothesisId:'B'})}).catch(()=>{});
@@ -3187,12 +3133,18 @@ export const nexusApi = {
       } catch (conflictError: any) {
         // Re-throw conflict errors (they should prevent lesson creation)
         if (conflictError.code === 'CONFLICT_ERROR') {
+          // #region agent log
+          fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:createLesson:slotConflictError',message:'createLesson - SLOT CONFLICT ERROR thrown',data:{errorCode:conflictError.code,errorMessage:conflictError.message},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H1,H2'})}).catch(()=>{});
+          // #endregion
           throw conflictError;
         }
         // Log but don't fail lesson creation if other errors occur
         console.warn(`[createLesson] Failed to check/close overlapping slots:`, conflictError);
       }
     }
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:createLesson:afterSlotCheck',message:'createLesson - AFTER slot conflict check - preparing Airtable fields',data:{isFromSlotBooking},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H1'})}).catch(()=>{});
+    // #endregion
 
     // Prepare Airtable fields - ONLY use mapped fields from fieldMap
     const airtableFields: any = { fields: {} };
@@ -3316,6 +3268,9 @@ export const nexusApi = {
     try {
       const lessonsTableId = getTableId('lessons');
       
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:createLesson:beforeAirtable',message:'About to call Airtable API',data:{lessonsTableId,fieldCount:Object.keys(airtableFields.fields).length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H5'})}).catch(()=>{});
+      // #endregion
       const response = await airtableRequest<{ id: string; fields: any }>(
         `/${lessonsTableId}`,
         {
@@ -3324,6 +3279,9 @@ export const nexusApi = {
         }
       );
       
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:createLesson:airtableSuccess',message:'Airtable returned successfully',data:{lessonId:response.id,fieldKeys:Object.keys(response.fields||{})},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H5'})}).catch(()=>{});
+      // #endregion
       console.log(`[DEBUG createLesson] STEP 5 - SUCCESS! Created lesson ${response.id}`);
       console.log(`[DEBUG createLesson] STEP 5 - Response fields:`, Object.keys(response.fields || {}));
       
@@ -3331,8 +3289,36 @@ export const nexusApi = {
       const newLesson = mapAirtableToLesson({ id: response.id, fields: response.fields });
       
       console.log(`[Airtable] Created lesson ${response.id}`);
+      
+      // STEP 6: Trigger Make.com scenario to create calendar event
+      // This is non-blocking - we don't fail the lesson creation if Make fails
+      try {
+        console.log(`[DEBUG createLesson] STEP 6 - Triggering Make.com scenario for calendar sync`);
+        const makeResult = await triggerCreateLessonScenario({
+          lessonId: response.id,
+          studentId: studentRecordId,
+          teacherId: lesson.teacherId,
+          date: lesson.date,
+          startTime: lesson.startTime,
+          duration: lesson.duration,
+          lessonType: lesson.lessonType,
+        });
+        
+        if (makeResult.success) {
+          console.log(`[DEBUG createLesson] STEP 6 - Make.com scenario triggered successfully`);
+        } else {
+          console.warn(`[DEBUG createLesson] STEP 6 - Make.com scenario failed (non-blocking):`, makeResult.error);
+        }
+      } catch (makeError) {
+        // Log but don't fail - the lesson was already created in Airtable
+        console.warn(`[DEBUG createLesson] STEP 6 - Make.com trigger failed (non-blocking):`, makeError);
+      }
+      
       return newLesson;
     } catch (error: any) {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:createLesson:catch',message:'createLesson failed',data:{errorMessage:error?.message,errorCode:error?.code,errorStatus:error?.status},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H2'})}).catch(()=>{});
+      // #endregion
       console.error(`[DEBUG createLesson] STEP 5 - ERROR creating lesson:`, error);
       console.error(`[DEBUG createLesson] STEP 5 - Error message:`, error.message);
       console.error(`[DEBUG createLesson] STEP 5 - Error details:`, error.details);

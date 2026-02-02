@@ -59,6 +59,7 @@ export function apiUrl(path: string): string {
  */
 export const API_ENDPOINTS = {
   CONFLICTS_CHECK: '/api/conflicts/check',
+  SLOT_INVENTORY: '/api/slot-inventory',
   HEALTH: '/health',
 } as const;
 
