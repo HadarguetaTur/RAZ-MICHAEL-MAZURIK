@@ -333,7 +333,16 @@ function mapAirtableToStudent(record: any): Student {
     paymentStatus: fields[paymentStatusField] || '',
     registrationDate: fields[registrationDateField] || '',
     lastActivity: fields[lastActivityField] || '',
-    status: (fields['Status'] || (fields[isActiveField] ? 'active' : 'inactive')) as 'active' | 'on_hold' | 'inactive',
+    // Map is_active boolean field to status enum
+    // is_active is a boolean checkbox field - true → 'active', false → 'inactive'
+    // Note: There is no 'Status' field in the students table, only 'is_active' boolean field
+    status: (() => {
+      const isActive = fields[isActiveField];
+      if (isActive === true || isActive === 1) return 'active';
+      // For 'on_hold' status, we might need to check other fields or default to 'inactive'
+      // Since is_active is boolean, we can't distinguish between 'inactive' and 'on_hold'
+      return 'inactive';
+    })() as 'active' | 'on_hold' | 'inactive',
     subscriptionType: fields['Subscription_Type'] || fields['subscription_type'] || '',
     balance: parseFloat(fields[totalWithVatField] || '0') || 0, // סכום כולל מע״מ ומנויים
     notes: fields['Notes'] || fields['notes'],
@@ -718,22 +727,84 @@ export const nexusApi = {
 
     const airtableFields: any = { fields: {} };
     
-    if (updates.name !== undefined) airtableFields.fields[getField('students', 'full_name')] = updates.name;
-    if (updates.phone !== undefined) airtableFields.fields[getField('students', 'phone_number')] = updates.phone;
-    if (updates.parentName !== undefined) airtableFields.fields[getField('students', 'parent_name')] = updates.parentName;
-    if (updates.parentPhone !== undefined) airtableFields.fields[getField('students', 'parent_phone')] = updates.parentPhone;
-    if (updates.grade !== undefined) airtableFields.fields[getField('students', 'grade_level')] = updates.grade;
-    if (updates.subjectFocus !== undefined) airtableFields.fields[getField('students', 'subject_focus')] = updates.subjectFocus;
-    if (updates.level !== undefined) airtableFields.fields[getField('students', 'level')] = updates.level;
-    if (updates.weeklyLessonsLimit !== undefined) airtableFields.fields[getField('students', 'weekly_lessons_limit')] = updates.weeklyLessonsLimit;
-    if (updates.paymentStatus !== undefined) airtableFields.fields[getField('students', 'payment_status')] = updates.paymentStatus;
-    if (updates.notes !== undefined) airtableFields.fields[getField('students', 'notes' as any)] = updates.notes;
-    if (updates.email !== undefined) airtableFields.fields[getField('students', 'email' as any)] = updates.email;
+    if (updates.name !== undefined && updates.name !== '') {
+      airtableFields.fields[getField('students', 'full_name')] = updates.name;
+    }
+    if (updates.phone !== undefined && updates.phone !== '') {
+      airtableFields.fields[getField('students', 'phone_number')] = updates.phone;
+    }
+    if (updates.parentName !== undefined) {
+      airtableFields.fields[getField('students', 'parent_name')] = updates.parentName || null;
+    }
+    if (updates.parentPhone !== undefined) {
+      airtableFields.fields[getField('students', 'parent_phone')] = updates.parentPhone || null;
+    }
+    // Handle grade_level - Single select field (יא, יב, י, ו, ט, ח, ז)
+    if (updates.grade !== undefined) {
+      // Empty string or null should be sent as null for single select fields
+      airtableFields.fields[getField('students', 'grade_level')] = 
+        (updates.grade === '' || updates.grade === null || updates.grade === undefined) 
+          ? null 
+          : updates.grade;
+    }
+    
+    // Handle subject_focus - Multiple select field (מתמטיקה, פיזיקה, אנגלית)
+    if (updates.subjectFocus !== undefined) {
+      if (updates.subjectFocus === '' || updates.subjectFocus === null || updates.subjectFocus === undefined) {
+        airtableFields.fields[getField('students', 'subject_focus')] = null;
+      } else if (Array.isArray(updates.subjectFocus)) {
+        // Already an array - filter empty values and send
+        const validSubjects = updates.subjectFocus.filter(s => s && s.trim());
+        airtableFields.fields[getField('students', 'subject_focus')] = validSubjects.length > 0 ? validSubjects : null;
+      } else if (typeof updates.subjectFocus === 'string') {
+        // Comma-separated string - split and filter
+        const subjects = updates.subjectFocus.split(',').map(s => s.trim()).filter(Boolean);
+        airtableFields.fields[getField('students', 'subject_focus')] = subjects.length > 0 ? subjects : null;
+      } else {
+        // Fallback to null for unexpected types
+        airtableFields.fields[getField('students', 'subject_focus')] = null;
+      }
+    }
+    
+    // Handle level - Single select field (3, 5, 4)
+    if (updates.level !== undefined) {
+      // Empty string or null should be sent as null for single select fields
+      // Convert to string if it's a number (Airtable expects string for select fields)
+      const levelValue = updates.level === '' || updates.level === null || updates.level === undefined
+        ? null
+        : String(updates.level);
+      airtableFields.fields[getField('students', 'level')] = levelValue;
+    }
+    if (updates.weeklyLessonsLimit !== undefined) {
+      airtableFields.fields[getField('students', 'weekly_lessons_limit')] = updates.weeklyLessonsLimit;
+    }
+    // Handle payment_status - Single select field (משלם, מקדמה, חייב)
+    if (updates.paymentStatus !== undefined) {
+      // Empty string or null should be sent as null for single select fields
+      airtableFields.fields[getField('students', 'payment_status')] = 
+        (updates.paymentStatus === '' || updates.paymentStatus === null || updates.paymentStatus === undefined)
+          ? null
+          : updates.paymentStatus;
+    }
+    if (updates.notes !== undefined) {
+      airtableFields.fields[getField('students', 'notes' as any)] = updates.notes || null;
+    }
+    // Note: Email field doesn't exist in Airtable students table, so we skip it
+    // if (updates.email !== undefined) {
+    //   airtableFields.fields[getField('students', 'email' as any)] = updates.email || null;
+    // }
     
     if (updates.status !== undefined) {
+      // is_active is a boolean field - convert status to boolean
+      // 'active' → true, 'inactive' or 'on_hold' → false
       airtableFields.fields[getField('students', 'is_active')] = updates.status === 'active';
-      // Also update 'Status' field if it exists (Airtable often has both)
-      airtableFields.fields['Status'] = updates.status;
+      // Note: There is no 'Status' field in the students table, only 'is_active' boolean field
+    }
+
+    if (import.meta.env.DEV) {
+      console.log('[updateStudent] Updating student:', id);
+      console.log('[updateStudent] Updates received:', updates);
+      console.log('[updateStudent] Airtable fields to send:', airtableFields);
     }
 
     const studentsTableId = getTableId('students');

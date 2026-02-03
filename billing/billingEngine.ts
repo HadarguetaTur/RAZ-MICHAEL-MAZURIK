@@ -265,7 +265,8 @@ export async function buildStudentMonth(
   const lessonsContribution = calculateLessonsContribution(
     lessons.map(r => r.fields),
     billingMonth,
-    studentRecordId
+    studentRecordId,
+    subscriptions.map(r => r.fields)
   );
 
   if (lessonsContribution instanceof MissingFieldsError) {
@@ -286,7 +287,8 @@ export async function buildStudentMonth(
   const cancellationsResult = calculateCancellationsContribution(
     cancellations.map(r => r.fields),
     billingMonth,
-    getLinkedLesson
+    getLinkedLesson,
+    subscriptions.map(r => r.fields)
   );
 
   if (cancellationsResult instanceof MissingFieldsError) {

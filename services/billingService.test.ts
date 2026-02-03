@@ -57,22 +57,86 @@ test('calculateLessonPrice - Private (Hebrew)', () => {
   assertEquals(calculateLessonPrice('פרטי'), 175);
 });
 
-test('calculateLessonPrice - Pair (English)', () => {
-  assertEquals(calculateLessonPrice('pair'), 0);
-  assertEquals(calculateLessonPrice('Pair'), 0);
+test('calculateLessonPrice - Pair (English) - No subscription (default)', () => {
+  // Without subscription info, defaults to 120 (no subscription)
+  assertEquals(calculateLessonPrice('pair'), 120);
+  assertEquals(calculateLessonPrice('Pair'), 120);
 });
 
-test('calculateLessonPrice - Pair (Hebrew)', () => {
-  assertEquals(calculateLessonPrice('זוגי'), 0);
+test('calculateLessonPrice - Pair (Hebrew) - No subscription (default)', () => {
+  // Without subscription info, defaults to 120 (no subscription)
+  assertEquals(calculateLessonPrice('זוגי'), 120);
 });
 
-test('calculateLessonPrice - Group (English)', () => {
-  assertEquals(calculateLessonPrice('group'), 0);
-  assertEquals(calculateLessonPrice('Group'), 0);
+test('calculateLessonPrice - Group (English) - No subscription (default)', () => {
+  // Without subscription info, defaults to 120 (no subscription)
+  assertEquals(calculateLessonPrice('group'), 120);
+  assertEquals(calculateLessonPrice('Group'), 120);
 });
 
-test('calculateLessonPrice - Group (Hebrew)', () => {
-  assertEquals(calculateLessonPrice('קבוצתי'), 0);
+test('calculateLessonPrice - Group (Hebrew) - No subscription (default)', () => {
+  // Without subscription info, defaults to 120 (no subscription)
+  assertEquals(calculateLessonPrice('קבוצתי'), 120);
+});
+
+test('calculateLessonPrice - Pair with active subscription', () => {
+  const subscriptions: Subscription[] = [
+    {
+      id: 'sub1',
+      studentId: 's1',
+      monthlyAmount: '₪480.00',
+      subscriptionType: 'זוגי',
+      subscriptionStartDate: '2024-01-01',
+      subscriptionEndDate: '2024-12-31',
+      pauseSubscription: false,
+    },
+  ];
+  
+  // With active subscription, should return 0
+  assertEquals(calculateLessonPrice('pair', 60, 's1', subscriptions, '2024-03-15'), 0);
+  assertEquals(calculateLessonPrice('זוגי', 60, 's1', subscriptions, '2024-03-15'), 0);
+});
+
+test('calculateLessonPrice - Pair without subscription', () => {
+  const subscriptions: Subscription[] = [];
+  
+  // Without subscription, should return 120
+  assertEquals(calculateLessonPrice('pair', 60, 's1', subscriptions, '2024-03-15'), 120);
+  assertEquals(calculateLessonPrice('זוגי', 60, 's1', subscriptions, '2024-03-15'), 120);
+});
+
+test('calculateLessonPrice - Pair with paused subscription', () => {
+  const subscriptions: Subscription[] = [
+    {
+      id: 'sub1',
+      studentId: 's1',
+      monthlyAmount: '₪480.00',
+      subscriptionType: 'זוגי',
+      subscriptionStartDate: '2024-01-01',
+      subscriptionEndDate: '2024-12-31',
+      pauseSubscription: true, // Paused
+    },
+  ];
+  
+  // With paused subscription, should return 120 (no active subscription)
+  assertEquals(calculateLessonPrice('pair', 60, 's1', subscriptions, '2024-03-15'), 120);
+});
+
+test('calculateLessonPrice - Pair with expired subscription', () => {
+  const subscriptions: Subscription[] = [
+    {
+      id: 'sub1',
+      studentId: 's1',
+      monthlyAmount: '₪480.00',
+      subscriptionType: 'זוגי',
+      subscriptionStartDate: '2024-01-01',
+      subscriptionEndDate: '2024-02-29', // Expired
+      pauseSubscription: false,
+    },
+  ];
+  
+  // With expired subscription, should return 120 (no active subscription)
+  assertEquals(calculateLessonPrice('pair', 60, 's1', subscriptions, '2024-03-15'), 120);
 });
 
 test('calculateLessonPrice - Default/Unknown', () => {
@@ -126,12 +190,34 @@ test('calculateCancellationCharge - Billable cancellation (private)', () => {
   assertEquals(calculateCancellationCharge(lessonStart, 'פרטי', cancellationTime), 175);
 });
 
-test('calculateCancellationCharge - Billable cancellation (pair)', () => {
+test('calculateCancellationCharge - Billable cancellation (pair) - No subscription', () => {
   const lessonStart = '2024-03-15T14:00:00';
   const cancellationTime = '2024-03-15T10:00:00';
+  const subscriptions: Subscription[] = [];
   
-  assertEquals(calculateCancellationCharge(lessonStart, 'pair', cancellationTime), 0);
-  assertEquals(calculateCancellationCharge(lessonStart, 'זוגי', cancellationTime), 0);
+  // Without subscription, should charge 120
+  assertEquals(calculateCancellationCharge(lessonStart, 'pair', cancellationTime, 60, 's1', subscriptions), 120);
+  assertEquals(calculateCancellationCharge(lessonStart, 'זוגי', cancellationTime, 60, 's1', subscriptions), 120);
+});
+
+test('calculateCancellationCharge - Billable cancellation (pair) - With active subscription', () => {
+  const lessonStart = '2024-03-15T14:00:00';
+  const cancellationTime = '2024-03-15T10:00:00';
+  const subscriptions: Subscription[] = [
+    {
+      id: 'sub1',
+      studentId: 's1',
+      monthlyAmount: '₪480.00',
+      subscriptionType: 'זוגי',
+      subscriptionStartDate: '2024-01-01',
+      subscriptionEndDate: '2024-12-31',
+      pauseSubscription: false,
+    },
+  ];
+  
+  // With active subscription, should charge 0
+  assertEquals(calculateCancellationCharge(lessonStart, 'pair', cancellationTime, 60, 's1', subscriptions), 0);
+  assertEquals(calculateCancellationCharge(lessonStart, 'זוגי', cancellationTime, 60, 's1', subscriptions), 0);
 });
 
 test('calculateCancellationCharge - Non-billable cancellation', () => {
@@ -235,7 +321,7 @@ test('calculateStudentBilling - Private lessons only', () => {
   assertEquals(result.lineItems.length, 2);
 });
 
-test('calculateStudentBilling - Pair/Group lessons (not charged)', () => {
+test('calculateStudentBilling - Pair/Group lessons without subscription (charged 120)', () => {
   const lessons: Lesson[] = [
     {
       id: 'l1',
@@ -255,8 +341,46 @@ test('calculateStudentBilling - Pair/Group lessons (not charged)', () => {
   const subscriptions: Subscription[] = [];
   const result = calculateStudentBilling(lessons, subscriptions, 's1', '2024-03');
 
+  // Without subscription, pair lesson should be charged 120
+  assertEquals(result.lessonsTotal, 120);
+  assertEquals(result.total, 120);
+});
+
+test('calculateStudentBilling - Pair/Group lessons with active subscription (not charged)', () => {
+  const lessons: Lesson[] = [
+    {
+      id: 'l1',
+      studentId: 's1',
+      studentName: 'Test Student',
+      date: '2024-03-15',
+      startTime: '10:00',
+      duration: 60,
+      status: LessonStatus.COMPLETED,
+      subject: 'Math',
+      isChargeable: true,
+      isPrivate: false,
+      lessonType: 'pair',
+    },
+  ];
+
+  const subscriptions: Subscription[] = [
+    {
+      id: 'sub1',
+      studentId: 's1',
+      monthlyAmount: '₪480.00',
+      subscriptionType: 'זוגי',
+      subscriptionStartDate: '2024-01-01',
+      subscriptionEndDate: '2024-12-31',
+      pauseSubscription: false,
+    },
+  ];
+  
+  const result = calculateStudentBilling(lessons, subscriptions, 's1', '2024-03');
+
+  // With active subscription, pair lesson should be charged 0
   assertEquals(result.lessonsTotal, 0);
-  assertEquals(result.total, 0);
+  assertEquals(result.subscriptionsTotal, 480);
+  assertEquals(result.total, 480);
 });
 
 test('calculateStudentBilling - Billable cancellation', () => {

@@ -83,12 +83,88 @@ export function isPrivateLesson(lessonType: string): boolean {
 }
 
 /**
+ * Check if student has active subscription for a given lesson date
+ */
+function checkActiveSubscriptionForLesson(
+  studentId: string,
+  lessonDate: string,
+  subscriptions: SubscriptionsAirtableFields[]
+): boolean {
+  const lessonDateObj = new Date(lessonDate);
+  lessonDateObj.setHours(0, 0, 0, 0);
+  
+  for (const subscription of subscriptions) {
+    // Extract student ID from linked record
+    const subscriptionStudentId = extractStudentId(subscription.student_id);
+    
+    // בדוק שהמנוי שייך לתלמיד הנכון
+    if (subscriptionStudentId !== studentId) {
+      continue;
+    }
+    
+    // בדוק שהמנוי לא מושהה
+    if (subscription.pause_subscription === true) {
+      continue;
+    }
+    
+    // בדוק תאריך התחלה
+    if (subscription.subscription_start_date) {
+      const startDate = new Date(subscription.subscription_start_date);
+      startDate.setHours(0, 0, 0, 0);
+      if (startDate > lessonDateObj) {
+        continue;  // המנוי עוד לא התחיל
+      }
+    }
+    
+    // בדוק תאריך סיום
+    if (subscription.subscription_end_date) {
+      const endDate = new Date(subscription.subscription_end_date);
+      endDate.setHours(0, 0, 0, 0);
+      if (endDate < lessonDateObj) {
+        continue;  // המנוי פג תוקף
+      }
+    }
+    
+    // המנוי פעיל!
+    return true;
+  }
+  
+  // לא נמצא מנוי פעיל
+  return false;
+}
+
+/**
  * Calculate lesson amount
  */
-export function calculateLessonAmount(lesson: LessonsAirtableFields): number {
+export function calculateLessonAmount(
+  lesson: LessonsAirtableFields,
+  subscriptions?: SubscriptionsAirtableFields[]
+): number {
   // Prefer line_amount if present
   if (lesson.line_amount !== undefined && lesson.line_amount !== null) {
     return lesson.line_amount;
+  }
+  
+  // Check if pair/group lesson
+  const normalized = (lesson.lesson_type || '').toLowerCase().trim();
+  if (normalized === 'pair' || normalized === 'זוגי' || 
+      normalized === 'group' || normalized === 'קבוצתי') {
+    
+    if (subscriptions && subscriptions.length > 0 && lesson.start_datetime) {
+      // Extract student ID from lesson
+      const studentId = extractStudentId(lesson.full_name);
+      const lessonDate = lesson.start_datetime.split('T')[0];
+      
+      const hasActive = checkActiveSubscriptionForLesson(
+        studentId,
+        lessonDate,
+        subscriptions
+      );
+      return hasActive ? 0 : 120;
+    }
+    
+    // No subscriptions provided → assume no subscription → 120
+    return 120;
   }
   
   // Default: 175 for private lessons
@@ -106,7 +182,8 @@ export interface LessonsContribution {
 export function calculateLessonsContribution(
   lessons: LessonsAirtableFields[],
   billingMonth: string,
-  targetStudentId: string
+  targetStudentId: string,
+  subscriptions?: SubscriptionsAirtableFields[]
 ): LessonsContribution | MissingFieldsError {
   let lessonsTotal = 0;
   let lessonsCount = 0;
@@ -181,23 +258,36 @@ export function calculateLessonsContribution(
         });
         continue; // Skip this lesson until rule is defined
       }
-      // For זוגי/קבוצתי: amount is 0, so no split needed
-      // Continue to next lesson (these contribute 0 anyway)
-      console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} skipped: group/pair lesson (amount=0)`);
+      // For זוגי/קבוצתי with multiple students: check subscription and charge if no subscription
+      // Note: For pair/group lessons with multiple students, we check subscription for the primary student
+      const amount = calculateLessonAmount(lesson, subscriptions);
+      if (amount > 0) {
+        console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} INCLUDED: group/pair lesson with multiple students, status=${lesson.status}, amount=${amount}`);
+        lessonsTotal += amount;
+        lessonsCount++;
+      } else {
+        console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} skipped: group/pair lesson with active subscription (amount=0)`);
+      }
       continue;
     }
 
-    // Only include private lessons
-    if (!isPrivateLesson(lesson.lesson_type)) {
-      console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} skipped: not private lesson (lesson_type=${lesson.lesson_type})`);
-      continue;
-    }
+    // Include private lessons and pair/group lessons (pair/group will be charged if no subscription)
+    const amount = calculateLessonAmount(lesson, subscriptions);
     
-    console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} INCLUDED: private lesson, status=${lesson.status}, amount=${calculateLessonAmount(lesson)}`);
-
-    const amount = calculateLessonAmount(lesson);
-    lessonsTotal += amount;
-    lessonsCount++;
+    if (isPrivateLesson(lesson.lesson_type)) {
+      console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} INCLUDED: private lesson, status=${lesson.status}, amount=${amount}`);
+      lessonsTotal += amount;
+      lessonsCount++;
+    } else {
+      // Pair/Group lesson - include only if amount > 0 (no active subscription)
+      if (amount > 0) {
+        console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} INCLUDED: pair/group lesson without subscription, status=${lesson.status}, amount=${amount}`);
+        lessonsTotal += amount;
+        lessonsCount++;
+      } else {
+        console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} skipped: pair/group lesson with active subscription (amount=0)`);
+      }
+    }
   }
 
   console.log(`[calculateLessonsContribution] Final result for student ${targetStudentId}: lessonsCount=${lessonsCount}, lessonsTotal=${lessonsTotal}`);
@@ -215,7 +305,8 @@ export function calculateLessonsContribution(
  */
 export function calculateCancellationAmount(
   cancellation: CancellationsAirtableFields,
-  linkedLesson?: LessonsAirtableFields
+  linkedLesson?: LessonsAirtableFields,
+  subscriptions?: SubscriptionsAirtableFields[]
 ): number | null {
   // Prefer explicit charge if present
   if (cancellation.charge !== undefined && cancellation.charge !== null) {
@@ -227,8 +318,29 @@ export function calculateCancellationAmount(
     if (isPrivateLesson(linkedLesson.lesson_type)) {
       return 175;
     }
-    // For pair/group lessons, charge is 0 unless explicit
-    return 0;
+    
+    // For pair/group lessons, check subscription
+    const normalized = (linkedLesson.lesson_type || '').toLowerCase().trim();
+    if (normalized === 'pair' || normalized === 'זוגי' || 
+        normalized === 'group' || normalized === 'קבוצתי') {
+      
+      if (subscriptions && subscriptions.length > 0 && linkedLesson.start_datetime) {
+        const studentId = extractStudentId(linkedLesson.full_name);
+        const lessonDate = linkedLesson.start_datetime.split('T')[0];
+        const hasActive = checkActiveSubscriptionForLesson(
+          studentId,
+          lessonDate,
+          subscriptions
+        );
+        return hasActive ? 0 : 120;
+      }
+      
+      // No subscriptions provided → assume no subscription → 120
+      return 120;
+    }
+    
+    // Unknown lesson type
+    return null;
   }
 
   // No linked lesson and no explicit charge - cannot determine
@@ -247,7 +359,8 @@ export interface CancellationsContribution {
 export function calculateCancellationsContribution(
   cancellations: CancellationsAirtableFields[],
   billingMonth: string,
-  getLinkedLesson?: (lessonId: string) => LessonsAirtableFields | undefined
+  getLinkedLesson?: (lessonId: string) => LessonsAirtableFields | undefined,
+  subscriptions?: SubscriptionsAirtableFields[]
 ): CancellationsContribution | MissingFieldsError {
   let cancellationsTotal = 0;
   let cancellationsCount = 0;
@@ -279,7 +392,7 @@ export function calculateCancellationsContribution(
     // Calculate amount
     const lessonId = extractLessonId(cancellation.lesson);
     const linkedLesson = getLinkedLesson ? getLinkedLesson(lessonId) : undefined;
-    const amount = calculateCancellationAmount(cancellation, linkedLesson);
+    const amount = calculateCancellationAmount(cancellation, linkedLesson, subscriptions);
 
     if (amount === null) {
       // Cannot determine charge

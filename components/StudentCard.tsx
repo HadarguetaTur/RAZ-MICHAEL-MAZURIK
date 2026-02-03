@@ -30,16 +30,45 @@ const StudentCard: React.FC<StudentCardProps> = ({ student, onClose, onEdit }) =
   const handleSave = async () => {
     setIsSaving(true);
     try {
-      const updatedStudent = await nexusApi.updateStudent(student.id, editedStudent);
+      // Only send editable fields to avoid sending read-only fields like id, balance, etc.
+      // Note: email field doesn't exist in Airtable students table, so we skip it
+      const updates: Partial<Student> = {
+        name: editedStudent.name,
+        phone: editedStudent.phone,
+        parentName: editedStudent.parentName,
+        parentPhone: editedStudent.parentPhone,
+        // email: editedStudent.email, // Email field doesn't exist in Airtable
+        grade: editedStudent.grade,
+        level: editedStudent.level,
+        subjectFocus: editedStudent.subjectFocus,
+        weeklyLessonsLimit: editedStudent.weeklyLessonsLimit,
+        status: editedStudent.status,
+        notes: editedStudent.notes,
+      };
+
+      console.log('[StudentCard] Saving student updates:', {
+        studentId: student.id,
+        updates,
+        originalStudent: student,
+        editedStudent,
+      });
+
+      const updatedStudent = await nexusApi.updateStudent(student.id, updates);
       setIsEditing(false);
       if (onEdit) {
         onEdit(updatedStudent);
       }
-      // Note: We might want to refresh the local student data too, 
-      // but usually the parent will handle the refresh if onEdit is called.
-    } catch (err) {
-      console.error('Error saving student:', err);
-      toast.error('שגיאה בשמירת הנתונים');
+      toast.success('הנתונים נשמרו בהצלחה');
+    } catch (err: any) {
+      console.error('[StudentCard] Error saving student:', err);
+      console.error('[StudentCard] Error details:', {
+        message: err?.message,
+        stack: err?.stack,
+        response: err?.response,
+        studentId: student.id,
+        editedStudent,
+      });
+      toast.error(`שגיאה בשמירת הנתונים: ${err?.message || 'שגיאה לא ידועה'}`);
     } finally {
       setIsSaving(false);
     }
@@ -664,22 +693,6 @@ const StudentCard: React.FC<StudentCardProps> = ({ student, onClose, onEdit }) =
           )}
         </div>
 
-        {/* Footer Actions */}
-        <div className="p-6 md:p-10 border-t border-slate-100 bg-white flex gap-3 shrink-0 pb-10">
-           <a 
-            href={`https://wa.me/${student.phone.replace(/[^0-9]/g, '')}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex-1 py-4 bg-emerald-600 text-white rounded-2xl font-black shadow-lg shadow-emerald-100 flex items-center justify-center gap-3 active:scale-95 transition-all hover:bg-emerald-700"
-           >
-             <span className="text-lg">📱</span>
-             <span>WhatsApp</span>
-           </a>
-           <button className="flex-1 py-4 bg-slate-100 text-slate-600 rounded-2xl font-black flex items-center justify-center gap-3 active:scale-95 transition-all hover:bg-slate-200">
-             <span>📧</span>
-             <span>אימייל</span>
-           </button>
-        </div>
       </div>
     </div>
   );

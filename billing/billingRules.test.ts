@@ -87,7 +87,7 @@ describe('billingRules', () => {
       }
     });
 
-    test('Scenario 2: Student with 2 pair lessons and NO subscription => lessons_total = 0', () => {
+    test('Scenario 2: Student with 2 pair lessons and NO subscription => lessons_total = 240', () => {
       const lessons: LessonsAirtableFields[] = [
         {
           lesson_id: 'L001',
@@ -113,12 +113,13 @@ describe('billingRules', () => {
         },
       ];
 
-      const result = calculateLessonsContribution(lessons, billingMonth, studentId);
+      const subscriptions: SubscriptionsAirtableFields[] = [];
+      const result = calculateLessonsContribution(lessons, billingMonth, studentId, subscriptions);
 
       expect(result).not.toBeInstanceOf(MissingFieldsError);
       if (!(result instanceof MissingFieldsError)) {
-        expect(result.lessonsTotal).toBe(0); // Pair lessons never billed per-lesson
-        expect(result.lessonsCount).toBe(0);
+        expect(result.lessonsTotal).toBe(240); // 2 × 120 (pair lessons without subscription)
+        expect(result.lessonsCount).toBe(2);
       }
     });
 
@@ -263,7 +264,7 @@ describe('billingRules', () => {
       }
     });
 
-    test('Multi-student pair/group lesson contributes 0 (no split needed)', () => {
+    test('Multi-student pair/group lesson without subscription contributes 120', () => {
       const lessons: LessonsAirtableFields[] = [
         {
           lesson_id: 'L001',
@@ -278,10 +279,49 @@ describe('billingRules', () => {
         },
       ];
 
-      const result = calculateLessonsContribution(lessons, billingMonth, studentId);
+      const subscriptions: SubscriptionsAirtableFields[] = [];
+      const result = calculateLessonsContribution(lessons, billingMonth, studentId, subscriptions);
 
       expect(result).not.toBeInstanceOf(MissingFieldsError);
       if (!(result instanceof MissingFieldsError)) {
+        // Without subscription, should charge 120 (checked for primary student)
+        expect(result.lessonsTotal).toBe(120);
+        expect(result.lessonsCount).toBe(1);
+      }
+    });
+
+    test('Multi-student pair/group lesson with active subscription contributes 0', () => {
+      const lessons: LessonsAirtableFields[] = [
+        {
+          lesson_id: 'L001',
+          full_name: [studentId, 'recOtherStudent'], // Multi-link
+          status: 'הסתיים',
+          lesson_date: '2024-03-05',
+          start_datetime: '2024-03-05T10:00:00Z',
+          end_datetime: '2024-03-05T11:00:00Z',
+          lesson_type: 'זוגי',
+          duration: 60,
+          billing_month: billingMonth,
+        },
+      ];
+
+      const subscriptions: SubscriptionsAirtableFields[] = [
+        {
+          id: 'SUB001',
+          student_id: studentId,
+          subscription_start_date: '2024-01-01',
+          subscription_end_date: '2024-12-31',
+          monthly_amount: 300,
+          subscription_type: 'pair',
+          pause_subscription: false,
+        },
+      ];
+      
+      const result = calculateLessonsContribution(lessons, billingMonth, studentId, subscriptions);
+
+      expect(result).not.toBeInstanceOf(MissingFieldsError);
+      if (!(result instanceof MissingFieldsError)) {
+        // With active subscription, should charge 0
         expect(result.lessonsTotal).toBe(0);
         expect(result.lessonsCount).toBe(0);
       }
@@ -513,15 +553,75 @@ describe('billingRules', () => {
         return undefined;
       };
 
+      const subscriptions: SubscriptionsAirtableFields[] = [];
       const result = calculateCancellationsContribution(
         cancellations,
         billingMonth,
-        getLinkedLesson
+        getLinkedLesson,
+        subscriptions
       );
 
       expect(result).not.toBeInstanceOf(MissingFieldsError);
       if (!(result instanceof MissingFieldsError)) {
-        expect(result.cancellationsTotal).toBe(0); // Pair/group = 0
+        expect(result.cancellationsTotal).toBe(120); // Pair/group without subscription = 120
+        expect(result.cancellationsCount).toBe(1);
+      }
+    });
+
+    test('Cancellation with linked pair/group lesson with active subscription => charge 0', () => {
+      const cancellations: CancellationsAirtableFields[] = [
+        {
+          natural_key: 'CANCEL001',
+          lesson: 'recLesson123',
+          student: studentId,
+          cancellation_date: '2024-03-10',
+          hours_before: 12,
+          is_lt_24h: 1,
+          is_charged: true,
+          charge: undefined,
+          billing_month: billingMonth,
+        },
+      ];
+
+      const linkedLesson: LessonsAirtableFields = {
+        lesson_id: 'L001',
+        full_name: studentId,
+        status: 'בוטל',
+        lesson_date: '2024-03-10',
+        start_datetime: '2024-03-10T10:00:00Z',
+        end_datetime: '2024-03-10T11:00:00Z',
+        lesson_type: 'זוגי',
+        duration: 60,
+        billing_month: billingMonth,
+      };
+
+      const getLinkedLesson = (lessonId: string) => {
+        if (lessonId === 'recLesson123') return linkedLesson;
+        return undefined;
+      };
+
+      const subscriptions: SubscriptionsAirtableFields[] = [
+        {
+          id: 'SUB001',
+          student_id: studentId,
+          subscription_start_date: '2024-01-01',
+          subscription_end_date: '2024-12-31',
+          monthly_amount: 300,
+          subscription_type: 'pair',
+          pause_subscription: false,
+        },
+      ];
+      
+      const result = calculateCancellationsContribution(
+        cancellations,
+        billingMonth,
+        getLinkedLesson,
+        subscriptions
+      );
+
+      expect(result).not.toBeInstanceOf(MissingFieldsError);
+      if (!(result instanceof MissingFieldsError)) {
+        expect(result.cancellationsTotal).toBe(0); // Pair/group with active subscription = 0
         expect(result.cancellationsCount).toBe(1);
       }
     });

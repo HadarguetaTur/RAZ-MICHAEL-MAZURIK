@@ -38,12 +38,64 @@ export interface MissingFields {
 }
 
 /**
+ * Check if student has active subscription for a given date
+ */
+function checkActiveSubscription(
+  studentId: string,
+  lessonDate: string,
+  subscriptions: Subscription[]
+): boolean {
+  const lessonDateObj = new Date(lessonDate);
+  lessonDateObj.setHours(0, 0, 0, 0);
+  
+  for (const subscription of subscriptions) {
+    // בדוק שהמנוי שייך לתלמיד הנכון
+    if (subscription.studentId !== studentId) {
+      continue;
+    }
+    
+    // בדוק שהמנוי לא מושהה
+    if (subscription.pauseSubscription === true) {
+      continue;
+    }
+    
+    // בדוק תאריך התחלה
+    if (subscription.subscriptionStartDate) {
+      const startDate = new Date(subscription.subscriptionStartDate);
+      startDate.setHours(0, 0, 0, 0);
+      if (startDate > lessonDateObj) {
+        continue;  // המנוי עוד לא התחיל
+      }
+    }
+    
+    // בדוק תאריך סיום
+    if (subscription.subscriptionEndDate) {
+      const endDate = new Date(subscription.subscriptionEndDate);
+      endDate.setHours(0, 0, 0, 0);
+      if (endDate < lessonDateObj) {
+        continue;  // המנוי פג תוקף
+      }
+    }
+    
+    // המנוי פעיל!
+    return true;
+  }
+  
+  // לא נמצא מנוי פעיל
+  return false;
+}
+
+/**
  * Pure function: Calculate lesson price based on type and duration
  * Private lessons: 175 for 60 minutes (proportional calculation)
+ * Pair/Group lessons: 0 if has active subscription, 120 if no subscription
  */
 export function calculateLessonPrice(
   lessonType: string | undefined | null,
-  duration?: number
+  duration?: number,
+  studentId?: string,
+  subscriptions?: Subscription[],
+  lessonDate?: string
 ): number {
   // Normalize lesson type (handle Hebrew and English)
   const normalized = (lessonType || '').toLowerCase().trim();
@@ -54,10 +106,26 @@ export function calculateLessonPrice(
     return Math.round((minutes / 60) * 175 * 100) / 100; // עיגול ל-2 ספרות אחרי הנקודה
   }
   
-  // Pair and Group lessons: 0 (billed via subscription)
+  // Pair and Group lessons: check subscription
   if (normalized === 'pair' || normalized === 'זוגי' || 
       normalized === 'group' || normalized === 'קבוצתי') {
-    return 0;
+    
+    // אם יש subscriptions, בדוק מנוי פעיל
+    if (studentId && subscriptions && subscriptions.length > 0) {
+      const dateToCheck = lessonDate || new Date().toISOString().split('T')[0];
+      const hasActiveSubscription = checkActiveSubscription(
+        studentId,
+        dateToCheck,
+        subscriptions
+      );
+      
+      if (hasActiveSubscription) {
+        return 0;  // יש מנוי → מחיר 0
+      }
+    }
+    
+    // אין מנוי או לא הועברו פרמטרים → מחיר 120
+    return 120;
   }
   
   // Default: assume private if not specified
@@ -97,14 +165,25 @@ export function calculateCancellationCharge(
   lessonStartDatetime: string,
   lessonType: string | undefined | null,
   cancellationDatetime?: string | null,
-  duration?: number
+  duration?: number,
+  studentId?: string,
+  subscriptions?: Subscription[]
 ): number {
   if (!isCancellationBillable(lessonStartDatetime, cancellationDatetime)) {
     return 0;
   }
   
+  // Extract date from lessonStartDatetime
+  const lessonDate = lessonStartDatetime.split('T')[0];
+  
   // Full charge for billable cancellations
-  return calculateLessonPrice(lessonType, duration);
+  return calculateLessonPrice(
+    lessonType, 
+    duration,
+    studentId,
+    subscriptions,
+    lessonDate
+  );
 }
 
 /**
@@ -210,7 +289,9 @@ export function calculateStudentBilling(
         lessonStartDatetime,
         lesson.lessonType,
         cancellationDatetime,
-        lesson.duration
+        lesson.duration,
+        lesson.studentId,
+        subscriptions
       );
       
       if (cancellationCharge > 0) {
@@ -228,7 +309,13 @@ export function calculateStudentBilling(
       // Use price from lesson if available, otherwise calculate based on duration
       const price = lesson.price !== undefined 
         ? lesson.price 
-        : calculateLessonPrice(lesson.lessonType, lesson.duration);
+        : calculateLessonPrice(
+            lesson.lessonType, 
+            lesson.duration,
+            lesson.studentId,
+            subscriptions,
+            lesson.date
+          );
       
       if (price > 0) {
         lessonsTotal += price;
