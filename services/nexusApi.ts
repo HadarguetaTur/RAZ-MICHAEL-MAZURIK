@@ -3233,7 +3233,7 @@ export const nexusApi = {
       const priceField = getField('lessons', 'price');
       const calculatedPrice = lesson.price !== undefined 
         ? lesson.price 
-        : (lesson.duration || 60) * 2.92;
+        : ((lesson.duration || 60) / 60) * 175;
       airtableFields.fields[priceField] = Math.round(calculatedPrice * 100) / 100;
       console.log(`[DEBUG createLesson] Added price field "${priceField}" = ${airtableFields.fields[priceField]}`);
     }

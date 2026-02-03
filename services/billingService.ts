@@ -39,7 +39,7 @@ export interface MissingFields {
 
 /**
  * Pure function: Calculate lesson price based on type and duration
- * Private lessons: 2.92 per minute
+ * Private lessons: 175 for 60 minutes (proportional calculation)
  */
 export function calculateLessonPrice(
   lessonType: string | undefined | null,
@@ -48,10 +48,10 @@ export function calculateLessonPrice(
   // Normalize lesson type (handle Hebrew and English)
   const normalized = (lessonType || '').toLowerCase().trim();
   
-  // Private lessons: 2.92 per minute
+  // Private lessons: 175 for 60 minutes, calculated proportionally
   if (normalized === 'private' || normalized === 'פרטי') {
     const minutes = duration || 60; // ברירת מחדל 60 דקות
-    return Math.round(minutes * 2.92 * 100) / 100; // עיגול ל-2 ספרות אחרי הנקודה
+    return Math.round((minutes / 60) * 175 * 100) / 100; // עיגול ל-2 ספרות אחרי הנקודה
   }
   
   // Pair and Group lessons: 0 (billed via subscription)
@@ -62,7 +62,7 @@ export function calculateLessonPrice(
   
   // Default: assume private if not specified
   const minutes = duration || 60;
-  return Math.round(minutes * 2.92 * 100) / 100;
+  return Math.round((minutes / 60) * 175 * 100) / 100;
 }
 
 /**

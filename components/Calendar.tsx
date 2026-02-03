@@ -472,7 +472,7 @@ const Calendar: React.FC = () => {
   // Auto-update price when duration or lessonType changes (only if not manually edited)
   useEffect(() => {
     if (editState.lessonType === 'private' && !priceManuallyEdited && editState.duration) {
-      const calculatedPrice = Math.round(editState.duration * 2.92 * 100) / 100;
+      const calculatedPrice = Math.round(((editState.duration || 60) / 60) * 175 * 100) / 100;
       setEditState(p => ({ ...p, price: calculatedPrice }));
     }
   }, [editState.duration, editState.lessonType, priceManuallyEdited]);
@@ -662,7 +662,7 @@ const Calendar: React.FC = () => {
           notes: editState.notes || '',
           isPrivate: editState.lessonType === 'private',
           lessonType: editState.lessonType || 'private',
-          price: editState.price !== undefined ? editState.price : (editState.lessonType === 'private' ? Math.round((editState.duration || 60) * 2.92 * 100) / 100 : undefined),
+          price: editState.price !== undefined ? editState.price : (editState.lessonType === 'private' ? Math.round(((editState.duration || 60) / 60) * 175 * 100) / 100 : undefined),
         });
         // #region agent log
         fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:performSave:afterCreate',message:'createLesson returned',data:{newLessonId:newLesson?.id,newLessonDate:newLesson?.date},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H2'})}).catch(()=>{});
@@ -1528,7 +1528,7 @@ const Calendar: React.FC = () => {
                         // אם זה שיעור פרטי, עדכן גם את המחיר אוטומטית
                         const newState = { ...p, duration: newDuration };
                         if ((p.lessonType === 'private' || p.isPrivate) && p.price === undefined) {
-                          newState.price = Math.round(newDuration * 2.92 * 100) / 100;
+                          newState.price = Math.round((newDuration / 60) * 175 * 100) / 100;
                         }
                         return newState;
                       });
@@ -1544,7 +1544,7 @@ const Calendar: React.FC = () => {
               {editState.lessonType === 'private' && (
                 <div className="space-y-3">
                   <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-                    מחיר שיעור (₪)
+                    מחיר שיעור (₪) - ברירת מחדל: 175₪ ל-60 דקות
                   </label>
                   <div className="flex items-center gap-2">
                     <input
@@ -1552,7 +1552,7 @@ const Calendar: React.FC = () => {
                       step="0.01"
                       min="0"
                       className="flex-1 bg-slate-50 border border-slate-200 rounded-xl p-4 font-bold outline-none focus:bg-white focus:ring-2 focus:ring-blue-100 transition-all"
-                      value={editState.price !== undefined ? editState.price.toFixed(2) : (editState.duration ? (editState.duration * 2.92).toFixed(2) : '0.00')}
+                      value={editState.price !== undefined ? editState.price.toFixed(2) : (editState.duration ? ((editState.duration / 60) * 175).toFixed(2) : '175.00')}
                       onChange={(e) => {
                         const newPrice = parseFloat(e.target.value) || 0;
                         setEditState(p => ({ ...p, price: newPrice }));
@@ -1562,18 +1562,19 @@ const Calendar: React.FC = () => {
                     <button
                       type="button"
                       onClick={() => {
-                        const calculatedPrice = Math.round((editState.duration || 60) * 2.92 * 100) / 100;
+                        const calculatedPrice = Math.round(((editState.duration || 60) / 60) * 175 * 100) / 100;
                         setEditState(p => ({ ...p, price: calculatedPrice }));
                         setPriceManuallyEdited(false);
                       }}
                       className="px-4 py-4 bg-blue-50 text-blue-600 rounded-xl font-bold text-xs hover:bg-blue-100 transition-all"
-                      title="חשב אוטומטית"
+                      title="איפוס למחיר יחסי לפי משך השיעור"
                     >
                       ↻
                     </button>
                   </div>
                   <div className="text-xs text-slate-400">
-                    מחיר לדקה: 2.92 ₪ • מחיר מחושב: {Math.round((editState.duration || 60) * 2.92 * 100) / 100} ₪
+                    מחיר ל-60 דקות: 175 ₪ • מחיר מחושב לפי משך השיעור: {Math.round(((editState.duration || 60) / 60) * 175 * 100) / 100} ₪
+                    {!priceManuallyEdited && <span className="block mt-1 text-slate-500">המחיר מתעדכן אוטומטית לפי משך השיעור</span>}
                   </div>
                 </div>
               )}
