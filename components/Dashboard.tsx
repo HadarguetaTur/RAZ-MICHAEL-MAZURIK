@@ -99,6 +99,34 @@ const Dashboard: React.FC = () => {
         </button>
       </div>
 
+      {/* Lessons & Occupancy Row */}
+      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
+        <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+          <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest">שיעורים מתוכננים (השבוע)</div>
+          <div className="text-2xl font-black text-slate-900 mt-1">{metrics.lessonsStats.scheduled}</div>
+        </div>
+        <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+          <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest">בוצעו (השבוע)</div>
+          <div className="text-2xl font-black text-emerald-600 mt-1">{metrics.lessonsStats.completed}</div>
+        </div>
+        <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+          <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest">בוטלו (השבוע)</div>
+          <div className="text-2xl font-black text-rose-600 mt-1">{metrics.lessonsStats.cancelled}</div>
+        </div>
+        <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+          <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest">סלוטים פתוחים</div>
+          <div className="text-2xl font-black text-blue-600 mt-1">{metrics.occupancy.open}</div>
+        </div>
+        <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+          <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest">סלוטים תפוסים</div>
+          <div className="text-2xl font-black text-slate-800 mt-1">{metrics.occupancy.occupied}</div>
+        </div>
+        <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+          <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest">אחוז תפוסה</div>
+          <div className="text-2xl font-black text-slate-800 mt-1">{metrics.occupancy.percentOccupied}%</div>
+        </div>
+      </div>
+
       {/* Primary KPI Row */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         {primaryKpis.map((kpi, idx) => (
@@ -170,6 +198,38 @@ const Dashboard: React.FC = () => {
                 </div>
               ))}
             </div>
+            {(metrics.billing.totalLessonsAmount !== undefined && metrics.billing.totalSubscriptionsAmount !== undefined) && (metrics.billing.totalLessonsAmount > 0 || metrics.billing.totalSubscriptionsAmount > 0) && (
+              <div className="px-8 py-4 border-t border-slate-50 flex gap-6 text-sm">
+                <span className="text-slate-500">התפלגות החודש:</span>
+                <span>שיעורים: <strong className="text-slate-800">₪{metrics.billing.totalLessonsAmount?.toLocaleString() ?? 0}</strong></span>
+                <span>מנויים: <strong className="text-slate-800">₪{metrics.billing.totalSubscriptionsAmount?.toLocaleString() ?? 0}</strong></span>
+              </div>
+            )}
+          </div>
+
+          {/* Cancellations */}
+          <div className="bg-white rounded-[32px] border border-slate-200 shadow-sm overflow-hidden">
+            <div className="p-8 border-b border-slate-50">
+              <h3 className="text-xl font-black text-slate-800">ביטולים החודש</h3>
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-4 divide-x divide-x-reverse divide-slate-100">
+              <div className="p-6">
+                <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest">סה&quot;כ ביטולים</div>
+                <div className="text-2xl font-black text-slate-800 mt-1">{metrics.cancellations.totalCancellations}</div>
+              </div>
+              <div className="p-6">
+                <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest">מאוחרים (&lt;24 שעות)</div>
+                <div className="text-2xl font-black text-amber-600 mt-1">{metrics.cancellations.lateCancellations}</div>
+              </div>
+              <div className="p-6">
+                <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest">שיעור מאוחרים</div>
+                <div className="text-2xl font-black text-slate-800 mt-1">{metrics.cancellations.latePercent}%</div>
+              </div>
+              <div className="p-6">
+                <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest">הכנסות מביטולים מאוחרים</div>
+                <div className="text-2xl font-black text-slate-800 mt-1">₪{metrics.cancellations.revenueFromLate.toLocaleString()}</div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -225,6 +285,77 @@ const Dashboard: React.FC = () => {
             <div className="mt-8 pt-6 border-t border-slate-50">
                <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">תחזית לחודש הבא</div>
                <div className="text-lg font-black text-slate-800 italic">₪16,200 ~</div>
+            </div>
+          </div>
+
+          {/* Students distribution */}
+          <div className="bg-white rounded-[32px] border border-slate-200 shadow-sm p-8">
+            <h3 className="text-lg font-black text-slate-800 mb-4">התפלגות תלמידים (פעילים)</h3>
+            <div className="grid grid-cols-2 gap-6">
+              <div>
+                <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">לפי כיתה</div>
+                <div className="space-y-1 max-h-40 overflow-y-auto custom-scrollbar">
+                  {Object.entries(metrics.studentsByGrade).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([grade, count]) => (
+                    <div key={grade} className="flex justify-between text-sm">
+                      <span className="text-slate-700">{grade}</span>
+                      <span className="font-bold text-slate-900">{count}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">לפי מקצוע</div>
+                <div className="space-y-1 max-h-40 overflow-y-auto custom-scrollbar">
+                  {Object.entries(metrics.studentsBySubject).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([subj, count]) => (
+                    <div key={subj} className="flex justify-between text-sm">
+                      <span className="text-slate-700">{subj}</span>
+                      <span className="font-bold text-slate-900">{count}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Teachers load */}
+          <div className="bg-white rounded-[32px] border border-slate-200 shadow-sm p-8 overflow-hidden">
+            <h3 className="text-lg font-black text-slate-800 mb-4">עומס מורים (השבוע + סלוטים)</h3>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-slate-100">
+                    <th className="text-right py-2 px-2 text-[10px] font-black text-slate-400 uppercase">מורה</th>
+                    <th className="text-center py-2 px-2 text-[10px] font-black text-slate-400 uppercase">שיעורים</th>
+                    <th className="text-center py-2 px-2 text-[10px] font-black text-slate-400 uppercase">סלוטים פתוחים</th>
+                    <th className="text-center py-2 px-2 text-[10px] font-black text-slate-400 uppercase">סלוטים תפוסים</th>
+                    <th className="text-center py-2 px-2 text-[10px] font-black text-slate-400 uppercase">תלמידים</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {Object.keys(metrics.teachers.lessonsByTeacher).length === 0 && Object.keys(metrics.teachers.slotsByTeacher).length === 0 ? (
+                    <tr><td colSpan={5} className="py-4 text-center text-slate-400 text-sm">אין נתונים השבוע</td></tr>
+                  ) : (
+                    Array.from(new Set([
+                      ...Object.keys(metrics.teachers.lessonsByTeacher),
+                      ...Object.keys(metrics.teachers.slotsByTeacher),
+                    ])).map(tid => {
+                      const name = metrics.teachers.teacherNames[tid] || tid || 'ללא שם';
+                      const lessons = metrics.teachers.lessonsByTeacher[tid] ?? 0;
+                      const slots = metrics.teachers.slotsByTeacher[tid] ?? { open: 0, occupied: 0 };
+                      const students = metrics.teachers.studentsByTeacher[tid] ?? 0;
+                      return (
+                        <tr key={tid} className="border-b border-slate-50 hover:bg-slate-50/50">
+                          <td className="py-2 px-2 font-bold text-slate-800">{name}</td>
+                          <td className="py-2 px-2 text-center">{lessons}</td>
+                          <td className="py-2 px-2 text-center text-blue-600">{slots.open}</td>
+                          <td className="py-2 px-2 text-center">{slots.occupied}</td>
+                          <td className="py-2 px-2 text-center">{students}</td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
             </div>
           </div>
         </div>

@@ -385,12 +385,13 @@ const Billing: React.FC = () => {
     // 1. Download PDF first
     await handleDownloadPdf();
 
-    // 2. Prepare WhatsApp message
+    // 2. Prepare WhatsApp message (with payment link)
+    const paymentLink = import.meta.env.VITE_PAYMENT_LINK || 'https://pay.grow.link/0caae66323d44f2feb12b471e167be5a-Mjk5ODA4OQ';
     const parentName = selectedBill.parentName || selectedBill.studentName;
     const totalAmount = selectedBill.totalAmount;
     const phone = selectedBill.parentPhone;
 
-    const message = `היי ${parentName} מצורף קישור לתשלום, ופירוט החיוב, הסכום לתשלום החודש הוא ₪${totalAmount} אודה להסדרת התשלום בהקדם.`;
+    const message = `היי ${parentName} מצורף קישור לתשלום, ופירוט החיוב. הסכום לתשלום החודש הוא ₪${totalAmount}. קישור לתשלום: ${paymentLink} אודה להסדרת התשלום בהקדם.`;
 
     if (!phone) {
       toast.error('לא נמצא מספר טלפון להורה. אנא עדכן את פרטי התלמיד.');

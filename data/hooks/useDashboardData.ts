@@ -8,9 +8,11 @@ import { useBilling } from './useBilling';
 import { getBillingKPIs, getMonthlyBills } from '../resources/billing';
 import { invalidateLessons } from '../resources/lessons';
 import { invalidateBilling } from '../resources/billing';
-import { Lesson, MonthlyBill } from '../../types';
+import { MonthlyBill } from '../../types';
 import { ChargesReportKPIs } from '../../services/billingService';
 import { useStudents } from '../../hooks/useStudents';
+import { nexusApi } from '../../services/nexusApi';
+import { getSlotInventory } from '../resources/slotInventory';
 
 export interface DashboardMetrics {
   daily: {
@@ -35,6 +37,33 @@ export interface DashboardMetrics {
     billsCount: number;
     collectionRate: number;
     pendingLinkCount: number;
+    totalLessonsAmount?: number;
+    totalSubscriptionsAmount?: number;
+  };
+  cancellations: {
+    totalCancellations: number;
+    lateCancellations: number;
+    latePercent: number;
+    revenueFromLate: number;
+  };
+  lessonsStats: {
+    scheduled: number;
+    completed: number;
+    cancelled: number;
+  };
+  occupancy: {
+    open: number;
+    occupied: number;
+    total: number;
+    percentOccupied: number;
+  };
+  studentsByGrade: Record<string, number>;
+  studentsBySubject: Record<string, number>;
+  teachers: {
+    lessonsByTeacher: Record<string, number>;
+    slotsByTeacher: Record<string, { open: number; occupied: number }>;
+    studentsByTeacher: Record<string, number>;
+    teacherNames: Record<string, string>;
   };
   charts: {
     weeklyVolume: { day: string; current: number; previous: number }[];
@@ -178,6 +207,53 @@ export function useDashboardData() {
     loadRevenueTrend();
   }, [loadRevenueTrend]);
 
+  // Cancellations KPIs (current month)
+  const [cancellationsKpis, setCancellationsKpis] = useState({
+    totalCancellations: 0,
+    lateCancellations: 0,
+    latePercent: 0,
+    revenueFromLate: 0,
+  });
+  const loadCancellationsKPIs = useCallback(async () => {
+    try {
+      const kpis = await nexusApi.getCancellationsKPIs(currentMonthStr);
+      setCancellationsKpis(kpis);
+    } catch (err) {
+      console.warn('[useDashboardData] Cancellations KPIs failed:', err);
+    }
+  }, [currentMonthStr]);
+  useEffect(() => {
+    loadCancellationsKPIs();
+  }, [loadCancellationsKPIs]);
+
+  // Slot inventory for occupancy (next 14 days from today)
+  const slotInventoryRange = useMemo(() => {
+    const start = new Date(today);
+    start.setHours(0, 0, 0, 0);
+    const end = new Date(today);
+    end.setDate(end.getDate() + 14);
+    end.setHours(23, 59, 59, 999);
+    return { start: start.toISOString(), end: end.toISOString() };
+  }, [today]);
+  const [slotInventoryList, setSlotInventoryList] = useState<Array<{ id: string; status: string; teacherId?: string; teacherName?: string }>>([]);
+  const loadSlotInventory = useCallback(async () => {
+    try {
+      const slots = await getSlotInventory(slotInventoryRange);
+      setSlotInventoryList(slots.map(s => ({
+        id: s.id,
+        status: s.status || 'open',
+        teacherId: s.teacherId,
+        teacherName: s.teacherName,
+      })));
+    } catch (err) {
+      console.warn('[useDashboardData] Slot inventory failed:', err);
+      setSlotInventoryList([]);
+    }
+  }, [slotInventoryRange.start, slotInventoryRange.end]);
+  useEffect(() => {
+    loadSlotInventory();
+  }, [loadSlotInventory]);
+
   const metrics: DashboardMetrics = useMemo(() => {
     // 1. Daily Metrics
     const completed = lessonsTodayData.filter(l => l.status === 'הסתיים').length;
@@ -198,16 +274,79 @@ export function useDashboardData() {
       l.status === 'בוטל'
     ).length;
 
-    // 2. Student Metrics
+    // Lesson stats (this week): scheduled, completed, cancelled
+    const scheduled = currentWeekLessons.filter(l => l.status === 'מתוכנן' || l.status === 'ממתין' || (l as any).status === 'אישר הגעה').length;
+    const completedThisWeek = currentWeekLessons.filter(l => l.status === 'הסתיים' || (l as any).status === 'בוצע').length;
+    const cancelledLessons = currentWeekLessons.filter(l => l.status === 'בוטל').length;
+
+    // Occupancy from slot inventory (open vs occupied/closed)
+    const totalSlots = slotInventoryList.length;
+    const openSlots = slotInventoryList.filter(s => s.status === 'open' || s.status === 'פתוח').length;
+    const occupiedSlots = totalSlots - openSlots;
+    const percentOccupied = totalSlots ? Math.round((occupiedSlots / totalSlots) * 1000) / 10 : 0;
+
+    // 2. Student Metrics + distributions
     const totalActive = students.filter(s => s.status === 'active').length;
     const onHold = students.filter(s => s.status === 'on_hold').length;
     const inactive = students.filter(s => s.status === 'inactive').length;
     const withBalance = students.filter(s => s.balance > 0).length;
+    const activeStudents = students.filter(s => s.status === 'active');
+    const studentsByGrade: Record<string, number> = {};
+    activeStudents.forEach(s => {
+      const g = (s.grade ?? '').trim() || 'ללא כיתה';
+      studentsByGrade[g] = (studentsByGrade[g] || 0) + 1;
+    });
+    const studentsBySubject: Record<string, number> = {};
+    activeStudents.forEach(s => {
+      const raw = s.subjectFocus;
+      const subjects = Array.isArray(raw) ? raw : (typeof raw === 'string' && raw ? raw.split(',').map(x => x.trim()) : []);
+      if (subjects.length === 0) studentsBySubject['ללא מקצוע'] = (studentsBySubject['ללא מקצוע'] || 0) + 1;
+      else subjects.forEach(sub => {
+        const key = (sub || '').trim() || 'ללא מקצוע';
+        studentsBySubject[key] = (studentsBySubject[key] || 0) + 1;
+      });
+    });
+
+    // Teachers: from currentWeekLessons and slot inventory
+    const lessonsByTeacher: Record<string, number> = {};
+    const studentsByTeacher: Record<string, Set<string>> = {};
+    const teacherNames: Record<string, string> = {};
+    currentWeekLessons.forEach(l => {
+      const tid = (l as any).teacherId || l.teacherId || '';
+      const tname = (l as any).teacherName || l.teacherName || tid || 'ללא מורה';
+      if (tid) {
+        lessonsByTeacher[tid] = (lessonsByTeacher[tid] || 0) + 1;
+        teacherNames[tid] = tname;
+        if (!studentsByTeacher[tid]) studentsByTeacher[tid] = new Set();
+        studentsByTeacher[tid].add((l as any).studentId || l.studentId || '');
+      }
+    });
+    const slotsByTeacher: Record<string, { open: number; occupied: number }> = {};
+    slotInventoryList.forEach(s => {
+      const tid = s.teacherId || 'ללא מורה';
+      if (!slotsByTeacher[tid]) slotsByTeacher[tid] = { open: 0, occupied: 0 };
+      const isOpen = s.status === 'open' || s.status === 'פתוח';
+      if (isOpen) slotsByTeacher[tid].open += 1;
+      else slotsByTeacher[tid].occupied += 1;
+      if (s.teacherName) teacherNames[tid] = s.teacherName;
+    });
+    const teachersPayload = {
+      lessonsByTeacher: Object.fromEntries(Object.entries(lessonsByTeacher).map(([k, v]) => [k, v])),
+      slotsByTeacher: Object.fromEntries(
+        Object.entries(slotsByTeacher).map(([k, v]) => [k, v])
+      ),
+      studentsByTeacher: Object.fromEntries(
+        Object.entries(studentsByTeacher).map(([k, set]) => [k, set.size])
+      ),
+      teacherNames,
+    };
 
     // 3. Billing Metrics
     const openAmount = billingKpis?.pendingTotal || 0;
     const paidThisMonth = billingKpis?.paidTotal || 0;
     const pendingLinkCount = billingKpis?.pendingLinkCount || 0;
+    const totalLessonsAmount = billingKpis?.totalLessonsAmount ?? 0;
+    const totalSubscriptionsAmount = billingKpis?.totalSubscriptionsAmount ?? 0;
     
     // Overdue: bills from previous months that are not paid
     const overdueCount = overdueBills.length;
@@ -307,15 +446,23 @@ export function useDashboardData() {
         overdueTotal,
         billsCount: billingKpis?.studentCount || 0,
         collectionRate: billingKpis?.collectionRate || 0,
-        pendingLinkCount
+        pendingLinkCount,
+        totalLessonsAmount,
+        totalSubscriptionsAmount,
       },
+      cancellations: cancellationsKpis,
+      lessonsStats: { scheduled, completed: completedThisWeek, cancelled: cancelledLessons },
+      occupancy: { open: openSlots, occupied: occupiedSlots, total: totalSlots, percentOccupied },
+      studentsByGrade,
+      studentsBySubject,
+      teachers: teachersPayload,
       charts: {
         weeklyVolume,
         revenueTrend
       },
       urgentTasks
     };
-  }, [lessonsTodayData, currentWeekLessons, prevWeekLessons, students, billingKpis, overdueBills, revenueTrendData]);
+  }, [lessonsTodayData, currentWeekLessons, prevWeekLessons, students, billingKpis, overdueBills, revenueTrendData, cancellationsKpis, slotInventoryList]);
 
   const refresh = useCallback(async () => {
     // Invalidate caches
@@ -330,9 +477,11 @@ export function useDashboardData() {
       refreshBilling(),
       refreshStudents(),
       loadOverdueBills(),
-      loadRevenueTrend()
+      loadRevenueTrend(),
+      loadCancellationsKPIs(),
+      loadSlotInventory(),
     ]);
-  }, [refreshLessonsToday, refreshCurrentWeek, refreshPrevWeek, refreshBilling, refreshStudents, loadOverdueBills, loadRevenueTrend]);
+  }, [refreshLessonsToday, refreshCurrentWeek, refreshPrevWeek, refreshBilling, refreshStudents, loadOverdueBills, loadRevenueTrend, loadCancellationsKPIs, loadSlotInventory]);
 
   // Core loading: only essential data blocks the initial render
   // Students, overdue bills, and revenue trend load in background (non-blocking)

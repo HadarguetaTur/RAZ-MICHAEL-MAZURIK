@@ -2327,6 +2327,49 @@ export const nexusApi = {
     }
   },
 
+  /** Cancellations KPIs for dashboard: total, late (<24h), late %, revenue from charged cancellations */
+  getCancellationsKPIs: async (month: string): Promise<{
+    totalCancellations: number;
+    lateCancellations: number;
+    latePercent: number;
+    revenueFromLate: number;
+  }> => {
+    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
+      return { totalCancellations: 0, lateCancellations: 0, latePercent: 0, revenueFromLate: 0 };
+    }
+    try {
+      const tableId = getTableId('cancellations');
+      const billingMonthField = getField('cancellations', 'billing_month');
+      const isLt24Field = getField('cancellations', 'is_lt_24h');
+      const isChargedField = getField('cancellations', 'is_charged');
+      const chargeField = getField('cancellations', 'charge');
+      const filter = `{${billingMonthField}} = "${month}"`;
+      const records = await airtableClient.listRecords<Record<string, unknown>>(tableId, {
+        filterByFormula: filter,
+        maxRecords: 5000,
+      });
+      let late = 0;
+      let revenueFromLate = 0;
+      for (const r of records) {
+        const f = r.fields || {};
+        const isLate = f[isLt24Field] === 1 || f[isLt24Field] === '1' || f[isLt24Field] === true;
+        if (isLate) late++;
+        const charged = f[isChargedField] === true || f[isChargedField] === 1;
+        if (charged) revenueFromLate += Number(f[chargeField]) || 0;
+      }
+      const total = records.length;
+      return {
+        totalCancellations: total,
+        lateCancellations: late,
+        latePercent: total ? Math.round((late / total) * 1000) / 10 : 0,
+        revenueFromLate: Math.round(revenueFromLate * 100) / 100,
+      };
+    } catch (err) {
+      console.warn('[nexusApi.getCancellationsKPIs]', err);
+      return { totalCancellations: 0, lateCancellations: 0, latePercent: 0, revenueFromLate: 0 };
+    }
+  },
+
   getMonthlyBills: async (
     month: string,
     options?: { statusFilter?: 'all' | 'draft' | 'sent' | 'paid' | 'link_sent'; searchQuery?: string }
