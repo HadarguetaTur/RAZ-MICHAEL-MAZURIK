@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { WeeklySlot, SlotInventory, Student } from '../types';
 import ConfirmDialog from './ui/ConfirmDialog';
+import { formatDate, parseLocalDate } from '../services/dateUtils';
 
 const DAYS_HEBREW = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'];
 
@@ -224,14 +225,14 @@ const WeeklySlotsGrid: React.FC<WeeklySlotsGridProps> = (props) => {
             .sort((a, b) => a.startTime.localeCompare(b.startTime));
         } else {
           const { weekStart } = props as OneTimeModeProps;
-          const startDate = new Date(weekStart);
+          const startDate = parseLocalDate(weekStart);
           const dayDate = new Date(startDate);
           dayDate.setDate(startDate.getDate() + dayIdx);
-          const dateStr = dayDate.toISOString().split('T')[0];
+          const dateStr = formatDate(dayDate);
 
           daySlots = (slots as SlotInventory[])
-            .filter((s) => s.date === dateStr)
-            .sort((a, b) => a.startTime.localeCompare(b.startTime));
+            .filter((s) => (s.date != null ? String(s.date) : '') === dateStr)
+            .sort((a, b) => (a.startTime ?? '').localeCompare(b.startTime ?? ''));
         }
 
         return (
@@ -322,7 +323,7 @@ const SlotInventoryCard: React.FC<{
           <div className="flex flex-col gap-1">
             <div className="flex items-center justify-between">
               <span className={`text-sm font-black ${isBlocked ? 'text-amber-900' : 'text-slate-900'}`}>
-                {slot.startTime} – {slot.endTime}
+                {slot.startTime ?? ''} – {slot.endTime ?? ''}
               </span>
               <div className="flex items-center gap-1">
                 <span

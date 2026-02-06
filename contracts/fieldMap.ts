@@ -162,12 +162,12 @@ export const FIELDS = {
     is_active: 'is_active',
   },
   weeklySlot: {
-    day_of_week: 'day_of_week',
+    day_of_week: 'day_of_week', // Text/Single Select: Hebrew day names "ראשון","שני",...,"שבת" (API spec)
     day_num: 'day_num', // Normalized day number (1-7, where 1=Sunday)
     start_time: 'start_time',
     end_time: 'end_time',
     reserved_for: 'reserved_for', // Linked record
-    is_reserved: 'is_reserved',
+    is_reserved: 'is_reserved', // Single Select "לא פנוי"|"פנוי" or Checkbox (verify in Airtable)
     type: 'type',
     slot: 'slot',
     duration_min: 'duration_min',
@@ -239,6 +239,7 @@ export const FIELDS = {
     full_name: 'full_name', // Linked record to students
     'חודש_חיוב': 'חודש חיוב',
     'כולל_מעמ_ומנויים': 'כולל מע"מ ומנויים', // Lookup
+    total_amount_from_student: 'כולל מע"מ ומנויים (from תלמיד)', // Lookup - canonical final total
     Subscription_Monthly_Amount: 'Subscription Monthly Amount', // Rollup
     Late_Cancellation_Dates: 'Late Cancellation Dates', // Lookup
     'מנוי_קבוצתי': 'מנוי קבוצתי', // Lookup

@@ -11,6 +11,8 @@ interface StudentsPickerProps {
   filterActiveOnly?: boolean;
   minChars?: number;
   limit?: number;
+  /** Max number of students that can be selected (e.g. 2 for pair lessons) */
+  maxSelection?: number;
   /** Fallback names for IDs that haven't loaded yet (e.g., from slot.reservedForNames) */
   fallbackNames?: Record<string, string>; // Map of ID -> name
 }
@@ -28,9 +30,10 @@ const StudentsPicker: React.FC<StudentsPickerProps> = ({
   filterActiveOnly = true,
   minChars = 2,
   limit = 15,
+  maxSelection,
   fallbackNames = {},
 }) => {
-  const { searchStudents, getStudentById, getStudentByIdSync, activeStudents, isLoading: isLoadingStudents } = useStudents({ filterActiveOnly, autoLoad: true });
+  const { searchStudents, getStudentById, getStudentByIdSync, activeStudents, students: hookStudents, isLoading: isLoadingStudents } = useStudents({ filterActiveOnly, autoLoad: true });
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<Student[]>([]);
   const [isSearching, setIsSearching] = useState(false);
@@ -85,8 +88,9 @@ const StudentsPicker: React.FC<StudentsPickerProps> = ({
     } else {
       setSelectedStudentsState([]);
     }
+    // Re-run when hook's cache updates so we resolve names from cache when initial load completes
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [values.join(',')]); // Depend on values as string to avoid object comparison issues
+  }, [values.join(','), hookStudents.length]);
 
   const selectedStudents = selectedStudentsState;
 
@@ -157,6 +161,9 @@ const StudentsPicker: React.FC<StudentsPickerProps> = ({
     if (isSelected) {
       onChange(values.filter(id => id !== student.id));
     } else {
+      if (maxSelection !== undefined && values.length >= maxSelection) {
+        return; // Don't add more than maxSelection (e.g. pair = 2)
+      }
       onChange([...values, student.id]);
     }
     setSearchQuery('');

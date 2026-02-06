@@ -2,6 +2,20 @@
  * Date utility functions for weekly slot management
  */
 
+/** Day names in Hebrew (index 0 = Sunday, 6 = Saturday). Used for weekly_slot day_of_week field in Airtable. */
+export const DAYS_HEBREW = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'] as const;
+
+/** Map Hebrew day name to 0-6 (0 = Sunday). Used when reading day_of_week from Airtable. */
+export const DAY_HEBREW_TO_NUM: Record<string, number> = {
+  'ראשון': 0,
+  'שני': 1,
+  'שלישי': 2,
+  'רביעי': 3,
+  'חמישי': 4,
+  'שישי': 5,
+  'שבת': 6,
+};
+
 /**
  * Get the start of the week (Sunday) for a given date
  * @param date - Reference date
@@ -61,15 +75,21 @@ export function getNextWeekStart(weekStart: Date): Date {
 }
 
 /**
- * Format date as YYYY-MM-DD
- * @param date - Date to format
- * @returns Formatted date string
+ * Format date as YYYY-MM-DD in local time (for display and slot date matching).
+ * Use this instead of date.toISOString().split('T')[0] to avoid UTC shifting the calendar date.
  */
 export function formatDate(date: Date): string {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, '0');
   const day = String(date.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
+}
+
+/**
+ * Parse a YYYY-MM-DD string as local midnight (not UTC) so week navigation stays in local time.
+ */
+export function parseLocalDate(dateStr: string): Date {
+  return new Date(dateStr + 'T00:00:00');
 }
 
 /**

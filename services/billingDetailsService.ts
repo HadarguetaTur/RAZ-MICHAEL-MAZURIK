@@ -63,12 +63,53 @@ function extractLinkedId(field: unknown): string | null {
   return null;
 }
 
+function linkedRecordIds(field: unknown): string[] {
+  if (!field) return [];
+  if (typeof field === 'string' && field.startsWith('rec')) return [field];
+  if (Array.isArray(field)) {
+    return field.map((v: unknown) => (typeof v === 'string' ? v : (v && typeof v === 'object' && 'id' in v ? (v as { id: string }).id : null))).filter(Boolean) as string[];
+  }
+  return [];
+}
+
 function parseAmount(val: string | number | undefined | null): number {
   if (typeof val === 'number' && !Number.isNaN(val)) return val;
   if (val == null || val === '') return 0;
   const s = String(val).replace(/[₪,\s]/g, '');
   const n = parseFloat(s);
   return Number.isNaN(n) ? 0 : n;
+}
+
+/** True if student has an active (non-paused) subscription covering the given lesson date. */
+function hasActiveSubscriptionForDate(
+  studentId: string,
+  lessonDateStr: string,
+  subsRaw: Array<{ id: string; fields: Record<string, unknown> }>,
+  S: typeof FIELDS.subscriptions
+): boolean {
+  const lessonDate = new Date(lessonDateStr);
+  lessonDate.setHours(0, 0, 0, 0);
+  for (const r of subsRaw) {
+    const f = r.fields;
+    const linkId = extractLinkedId(f[S.student_id]);
+    if (linkId !== studentId) continue;
+    if (f[S.pause_subscription] === true || f[S.pause_subscription] === 1) continue;
+    const startDate = f[S.subscription_start_date] ? String(f[S.subscription_start_date]).split('T')[0] : '';
+    if (startDate) {
+      const start = new Date(startDate);
+      start.setHours(0, 0, 0, 0);
+      if (start > lessonDate) continue;
+    }
+    const endDateVal = f[S.subscription_end_date];
+    const endDate = endDateVal ? String(endDateVal).split('T')[0] : null;
+    if (endDate) {
+      const end = new Date(endDate);
+      end.setHours(0, 0, 0, 0);
+      if (end < lessonDate) continue;
+    }
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -126,28 +167,43 @@ export async function getBillingBreakdown(
     if (import.meta.env.DEV) console.warn('[getBillingBreakdown] lessons fetch failed', e);
   }
 
+  // Fetch subscriptions now so we can set lesson amount to 0 for pair/group when subscription is active
+  const subsTableId = TABLES.subscriptions.id;
+  let subsRaw: Array<{ id: string; fields: Record<string, unknown> }> = [];
+  try {
+    subsRaw = await client.getRecords(subsTableId, { maxRecords: 5000 });
+  } catch (e) {
+    if (import.meta.env.DEV) console.warn('[getBillingBreakdown] subscriptions fetch failed (for lesson coverage)', e);
+  }
+
   const lessons: BreakdownLesson[] = [];
   let lessonsTotal = 0;
   for (const r of lessonsRaw) {
     const f = r.fields;
-    const linkId = extractLinkedId(f[L.full_name]);
-    if (import.meta.env.DEV && lessonsRaw.length > 0) {
-      console.log('[getBillingBreakdown] Checking lesson', {
-        lessonId: r.id,
-        linkId,
-        studentId,
-        matches: linkId === studentId,
-      });
-    }
-    if (linkId !== studentId) continue;
-    const lineAmount = parseAmount(f[L.line_amount] as string | number);
-    if (lineAmount <= 0) continue;
-    const dateVal = f[L.lesson_date];
+    const studentIds = linkedRecordIds(f[L.full_name]);
+    if (!studentIds.includes(studentId)) continue;
+    const dateVal = f[L.lesson_date] ?? f[L.start_datetime];
     const date = dateVal ? String(dateVal).split('T')[0] : '';
+    let lineAmount = parseAmount(f[L.line_amount] as string | number);
+    const lessonType = String(f[L.lesson_type] ?? '').toLowerCase().trim();
+    const isPair = lessonType === 'pair' || lessonType === 'זוגי';
+    const isGroup = lessonType === 'group' || lessonType === 'קבוצתי';
+    if (lineAmount <= 0 && isPair) {
+      const totalPrice = parseAmount(f[L.price] as string | number);
+      if (totalPrice > 0) lineAmount = Math.round((totalPrice / 2) * 100) / 100;
+    }
+    if (lineAmount <= 0 && isGroup) {
+      lineAmount = 120;
+    }
+    // Pair/group with active subscription for this date => do not charge (show row with 0)
+    const coveredBySubscription =
+      (isPair || isGroup) && date && hasActiveSubscriptionForDate(studentId, date, subsRaw, S);
+    if (coveredBySubscription && lineAmount > 0) lineAmount = 0;
+    if (lineAmount <= 0 && !coveredBySubscription) continue;
     lessons.push({
       date,
       type: String(f[L.lesson_type] ?? ''),
-      unitPrice: parseAmount(f[L.unit_price] as string | number),
+      unitPrice: parseAmount(f[L.unit_price] as string | number) || (isPair || isGroup ? lineAmount : 0),
       lineAmount,
       status: String(f[L.status] ?? ''),
     });
@@ -192,26 +248,19 @@ export async function getBillingBreakdown(
     paidCancellations.push({ date, hoursBefore, isLt24h, isCharged, linkedLessonId });
   }
 
-  // --- C) Subscriptions: student_id contains studentId, active in month ---
-  const subsTableId = TABLES.subscriptions.id;
-  let subsRaw: Array<{ id: string; fields: Record<string, unknown> }> = [];
-  try {
-    subsRaw = await client.getRecords(subsTableId, { maxRecords: 5000 });
-    if (import.meta.env.DEV) {
-      console.log('[getBillingBreakdown] Fetched subscriptions', {
-        studentId,
-        monthKey,
-        count: subsRaw.length,
-        sampleSubs: subsRaw.slice(0, 3).map(r => ({
-          id: r.id,
-          studentLink: r.fields[S.student_id],
-          type: r.fields[S.subscription_type],
-          paused: r.fields[S.pause_subscription],
-        })),
-      });
-    }
-  } catch (e) {
-    if (import.meta.env.DEV) console.warn('[getBillingBreakdown] subscriptions fetch failed', e);
+  // --- C) Subscriptions: use subsRaw already fetched (student_id contains studentId, active in month) ---
+  if (import.meta.env.DEV) {
+    console.log('[getBillingBreakdown] Subscriptions (from same fetch)', {
+      studentId,
+      monthKey,
+      count: subsRaw.length,
+      sampleSubs: subsRaw.slice(0, 3).map(r => ({
+        id: r.id,
+        studentLink: r.fields[S.student_id],
+        type: r.fields[S.subscription_type],
+        paused: r.fields[S.pause_subscription],
+      })),
+    });
   }
 
   const subscriptions: BreakdownSubscription[] = [];

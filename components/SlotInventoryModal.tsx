@@ -24,9 +24,17 @@ const SlotInventoryModal: React.FC<SlotInventoryModalProps> = ({ slot, onClose, 
 
   const startDate = new Date(slot.startDateTime);
   const endDate = new Date(slot.endDateTime);
-  const dateStr = `${startDate.getFullYear()}-${String(startDate.getMonth() + 1).padStart(2, '0')}-${String(startDate.getDate()).padStart(2, '0')}`;
-  const startTime = `${startDate.getHours().toString().padStart(2, '0')}:${startDate.getMinutes().toString().padStart(2, '0')}`;
-  const endTime = `${endDate.getHours().toString().padStart(2, '0')}:${endDate.getMinutes().toString().padStart(2, '0')}`;
+  const startValid = !isNaN(startDate.getTime());
+  const endValid = !isNaN(endDate.getTime());
+  const dateStr = startValid
+    ? `${startDate.getFullYear()}-${String(startDate.getMonth() + 1).padStart(2, '0')}-${String(startDate.getDate()).padStart(2, '0')}`
+    : (slot as any).date ?? '—';
+  const startTime = startValid
+    ? `${String(startDate.getHours()).padStart(2, '0')}:${String(startDate.getMinutes()).padStart(2, '0')}`
+    : (slot as any).startTime ?? '—';
+  const endTime = endValid
+    ? `${String(endDate.getHours()).padStart(2, '0')}:${String(endDate.getMinutes()).padStart(2, '0')}`
+    : (slot as any).endTime ?? '—';
 
   // "שריין חלון" - Reserve/Book the slot
   const handleReserveSlot = async () => {

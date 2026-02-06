@@ -281,8 +281,11 @@ async function getSlotInventoryForAPI(
   };
   const records = await listAllAirtableRecords(baseId, token, tableId, params);
   
-  // Map records to SlotInventory format
-  const mappedInventory = records.map(record => {
+  const endTimeField = getField('slotInventory', 'שעת_סיום');
+  // Map records to SlotInventory format (one bad record won't break the whole response)
+  const mappedInventory: any[] = [];
+  for (const record of records) {
+    try {
     const fields = record.fields || {};
     
     // Extract teacher ID
@@ -337,15 +340,18 @@ async function getSlotInventoryForAPI(
       lessonIds = [typeof lessonsVal === 'string' ? lessonsVal : lessonsVal.id].filter(Boolean);
     }
     
-    return {
+    const dateStr = typeof fields[dateField] === 'string' ? fields[dateField] : (fields[dateField] || '').toString();
+    const startTimeStr = typeof fields[startTimeField] === 'string' ? fields[startTimeField] : (fields[startTimeField] || '').toString();
+    const endTimeStr = typeof fields[endTimeField] === 'string' ? fields[endTimeField] : (fields[endTimeField] || '').toString();
+    const slotItem = {
       id: record.id,
-      naturalKey: fields.natural_key || '',
+      naturalKey: (fields.natural_key as string) || '',
       teacherId: extractedTeacherId || '',
       teacherName: teachersMap.get(extractedTeacherId || '') || '',
-      lessonDate: fields[dateField] || '',
-      date: fields[dateField] || '',
-      startTime: fields[startTimeField] || '',
-      endTime: fields[getField('slotInventory', 'שעת_סיום')] || '',
+      lessonDate: dateStr,
+      date: dateStr,
+      startTime: startTimeStr,
+      endTime: endTimeStr,
       lessonType: fields[getField('slotInventory', 'סוג_שיעור')],
       sourceWeeklySlot: sourceWeeklySlot,
       status: status,
@@ -360,7 +366,11 @@ async function getSlotInventoryForAPI(
       isBlock: fields.is_block === true || fields.is_block === 1,
       isLocked: fields.is_locked === true || fields.is_locked === 1,
     };
-  });
+    mappedInventory.push(slotItem);
+    } catch (err) {
+      console.warn('[apiServer] getSlotInventoryForAPI: skip bad record', record.id, err instanceof Error ? err.message : err);
+    }
+  }
   
   // Deduplication logic (same as frontend)
   const statusPriority: Record<string, number> = {
@@ -375,7 +385,10 @@ async function getSlotInventoryForAPI(
       return `natural_key:${slot.naturalKey}`;
     }
     const teacherId = slot.teacherId || 'none';
-    return `composite:${slot.date}|${slot.startTime}|${slot.endTime}|${teacherId}`;
+    const d = slot.date ?? '';
+    const st = slot.startTime ?? '';
+    const et = slot.endTime ?? '';
+    return `composite:${d}|${st}|${et}|${teacherId}`;
   };
   
   const selectWinner = (slot1: any, slot2: any): any => {
@@ -410,11 +423,15 @@ async function getSlotInventoryForAPI(
   
   const deduplicatedInventory = Array.from(dedupeMap.values());
   
-  // Sort by date, then startTime
+  // Sort by date, then startTime (defensive: ensure string for localeCompare)
   deduplicatedInventory.sort((a, b) => {
-    const dateCompare = a.date.localeCompare(b.date);
+    const dateA = a.date != null ? String(a.date) : '';
+    const dateB = b.date != null ? String(b.date) : '';
+    const dateCompare = dateA.localeCompare(dateB);
     if (dateCompare !== 0) return dateCompare;
-    return a.startTime.localeCompare(b.startTime);
+    const startA = a.startTime != null ? String(a.startTime) : '';
+    const startB = b.startTime != null ? String(b.startTime) : '';
+    return startA.localeCompare(startB);
   });
   
   return deduplicatedInventory;

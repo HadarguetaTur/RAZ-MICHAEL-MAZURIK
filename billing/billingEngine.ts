@@ -38,7 +38,8 @@ import {
   LinkedRecord,
 } from '../contracts/types';
 
-const isDev = typeof process !== 'undefined' ? process.env.NODE_ENV === 'development' : (typeof import.meta !== 'undefined' && (import.meta as any).env?.DEV);
+/** Jest-safe: no import.meta; Vite sets process.env.NODE_ENV in define. */
+const isDev = typeof process !== 'undefined' && process.env?.NODE_ENV === 'development';
 import {
   DomainError,
   MissingFieldsError,

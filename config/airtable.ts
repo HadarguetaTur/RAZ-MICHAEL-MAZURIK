@@ -1,12 +1,14 @@
-
-const getEnv = (name: string) => {
+/**
+ * Get env var: process.env first (Jest/Node), then import.meta.env in browser
+ * so Vite client has AIRTABLE credentials without relying on define at build time.
+ */
+const getEnv = (name: string): string => {
   if (typeof process !== 'undefined' && process.env) {
-    return process.env[name] || process.env[`VITE_${name}`] || '';
+    const fromProcess = process.env[name] || process.env[`VITE_${name}`] || '';
+    if (fromProcess) return fromProcess;
   }
-  // @ts-ignore
-  if (typeof import.meta !== 'undefined' && import.meta.env) {
-    // @ts-ignore
-    return import.meta.env[`VITE_${name}`] || '';
+  if (typeof window !== 'undefined' && typeof import.meta !== 'undefined' && import.meta.env) {
+    return (import.meta.env as Record<string, string>)[`VITE_${name}`] || (import.meta.env as Record<string, string>)[name] || '';
   }
   return '';
 };

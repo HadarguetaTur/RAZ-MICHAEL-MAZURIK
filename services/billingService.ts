@@ -10,8 +10,12 @@
  * - total = lessons_total + cancellations_total + subscriptions_total (no VAT)
  */
 
+/** Dev flag: Jest-safe (no import.meta); Vite sets process.env.NODE_ENV in define. */
+const _isDev = typeof process !== 'undefined' && process.env?.NODE_ENV === 'development';
+
 import { AirtableClient } from './airtableClient';
 import { AIRTABLE_CONFIG } from '../config/airtable';
+import { getField } from '../contracts/fieldMap';
 import { Lesson, Subscription, MonthlyBill } from '../types';
 import { LessonStatus } from '../types';
 import { buildMonthForAllActiveStudents } from '../billing/billingEngine';
@@ -87,30 +91,24 @@ function checkActiveSubscription(
 
 /**
  * Pure function: Calculate lesson price based on type and duration
- * Private lessons: 175 for 60 minutes (proportional calculation)
- * Pair/Group lessons: 0 if has active subscription, 120 if no subscription
+ * Private: 175 (proportional) or lesson price. Pair: 0 with subscription; else pairTotalPrice/2 or 112.5. Group: 0 with subscription; else 120.
  */
 export function calculateLessonPrice(
   lessonType: string | undefined | null,
   duration?: number,
   studentId?: string,
   subscriptions?: Subscription[],
-  lessonDate?: string
+  lessonDate?: string,
+  pairTotalPrice?: number
 ): number {
-  // Normalize lesson type (handle Hebrew and English)
   const normalized = (lessonType || '').toLowerCase().trim();
-  
-  // Private lessons: 175 for 60 minutes, calculated proportionally
+
   if (normalized === 'private' || normalized === 'פרטי') {
-    const minutes = duration || 60; // ברירת מחדל 60 דקות
-    return Math.round((minutes / 60) * 175 * 100) / 100; // עיגול ל-2 ספרות אחרי הנקודה
+    const minutes = duration || 60;
+    return Math.round((minutes / 60) * 175 * 100) / 100;
   }
-  
-  // Pair and Group lessons: check subscription
-  if (normalized === 'pair' || normalized === 'זוגי' || 
-      normalized === 'group' || normalized === 'קבוצתי') {
-    
-    // אם יש subscriptions, בדוק מנוי פעיל
+
+  if (normalized === 'group' || normalized === 'קבוצתי') {
     if (studentId && subscriptions && subscriptions.length > 0) {
       const dateToCheck = lessonDate || new Date().toISOString().split('T')[0];
       const hasActiveSubscription = checkActiveSubscription(
@@ -118,17 +116,27 @@ export function calculateLessonPrice(
         dateToCheck,
         subscriptions
       );
-      
-      if (hasActiveSubscription) {
-        return 0;  // יש מנוי → מחיר 0
-      }
+      if (hasActiveSubscription) return 0;
     }
-    
-    // אין מנוי או לא הועברו פרמטרים → מחיר 120
     return 120;
   }
-  
-  // Default: assume private if not specified
+
+  if (normalized === 'pair' || normalized === 'זוגי') {
+    if (studentId && subscriptions && subscriptions.length > 0) {
+      const dateToCheck = lessonDate || new Date().toISOString().split('T')[0];
+      const hasActiveSubscription = checkActiveSubscription(
+        studentId,
+        dateToCheck,
+        subscriptions
+      );
+      if (hasActiveSubscription) return 0;
+    }
+    if (pairTotalPrice !== undefined && pairTotalPrice !== null && pairTotalPrice >= 0) {
+      return Math.round((pairTotalPrice / 2) * 100) / 100;
+    }
+    return 112.5;
+  }
+
   const minutes = duration || 60;
   return Math.round((minutes / 60) * 175 * 100) / 100;
 }
@@ -305,17 +313,14 @@ export function calculateStudentBilling(
         });
       }
     } else if (lesson.status === LessonStatus.COMPLETED || lesson.status === LessonStatus.SCHEDULED) {
-      // Only charge completed or scheduled lessons (not pending)
-      // Use price from lesson if available, otherwise calculate based on duration
-      const price = lesson.price !== undefined 
-        ? lesson.price 
-        : calculateLessonPrice(
-            lesson.lessonType, 
-            lesson.duration,
-            lesson.studentId,
-            subscriptions,
-            lesson.date
-          );
+      const normalizedType = (lesson.lessonType || '').toLowerCase().trim();
+      const isPair = normalizedType === 'pair' || normalizedType === 'זוגי';
+      const isGroup = normalizedType === 'group' || normalizedType === 'קבוצתי';
+      const price = isPair
+        ? calculateLessonPrice(lesson.lessonType, lesson.duration, lesson.studentId, subscriptions, lesson.date, lesson.price)
+        : isGroup
+          ? calculateLessonPrice(lesson.lessonType, lesson.duration, lesson.studentId, subscriptions, lesson.date)
+          : (lesson.price !== undefined ? lesson.price : calculateLessonPrice(lesson.lessonType, lesson.duration, lesson.studentId, subscriptions, lesson.date));
       
       if (price > 0) {
         lessonsTotal += price;
@@ -362,7 +367,7 @@ export function calculateStudentBilling(
 /**
  * Pure function: Parse subscription amount from currency string
  */
-function parseSubscriptionAmount(amount: string | number | undefined | null): number {
+export function parseSubscriptionAmount(amount: string | number | undefined | null): number {
   if (amount === null || amount === undefined) {
     return 0;
   }
@@ -832,7 +837,7 @@ export async function discoverChargeTableSchema(
 
     const booleanFields = getBooleanFields();
 
-    if (import.meta.env.DEV) {
+    if (_isDev) {
       console.log('--- AIRTABLE SCHEMA DIAGNOSTIC (חיובים) ---');
       console.log('Total unique fields found in', records.length, 'records:', fields.length);
       console.log('All available fields (normalized):', normalizedFieldsList.map(f => logStringDetailed(f)));
@@ -909,7 +914,7 @@ export async function discoverChargeTableSchema(
     let rawPaidField = potentialPaid ? normalizedFieldsMap.get(potentialPaid)! :
                       findExactRawField([KNOWN_PAID_FIELD, 'paid', 'שולם'], KNOWN_PAID_FIELD);
     
-    if (import.meta.env.DEV) {
+    if (_isDev) {
       console.log('[discoverChargeTableSchema] Discovered Raw Schema Mapping:', {
         studentField: logStringDetailed(rawStudentField),
         billingMonthField: logStringDetailed(rawBillingMonthField),
@@ -1630,7 +1635,7 @@ export async function getChargesReport(
   const billingTableId = client.getTableId('monthlyBills');
   
   // Log table ID being used (for debugging 403 errors)
-  if (import.meta.env.DEV) {
+  if (_isDev) {
     console.log('[getChargesReport] Using table ID:', billingTableId, 'for monthlyBills');
   }
   
@@ -1651,7 +1656,7 @@ export async function getChargesReport(
     const schemaResult = await discoverChargeTableSchema(client);
     let schema: ChargeTableSchema;
     if (Array.isArray(schemaResult)) {
-      if (import.meta.env.DEV) {
+      if (_isDev) {
         console.warn('[getChargesReport] Schema discovery returned missing fields, but continuing with fallbacks:', schemaResult);
       }
       // Use fallback schema instead of throwing
@@ -1688,12 +1693,12 @@ export async function getChargesReport(
           maxRecords: 100,
         });
         
-        if (import.meta.env.DEV) {
+        if (_isDev) {
           console.log(`[getChargesReport] Filter formula: ${filterFormula}`);
           console.log(`[getChargesReport] Found ${chargeRecords.length} records with filter`);
         }
       } catch (e) {
-        if (import.meta.env.DEV) {
+        if (_isDev) {
           console.warn('[getChargesReport] Filter failed, trying fallback:', e);
         }
         // Fallback: fetch all and filter in memory
@@ -1701,7 +1706,7 @@ export async function getChargesReport(
           const allRecords = await client.getRecords(billingTableId, { maxRecords: 100 });
           chargeRecords = filterRecordsInMemory(allRecords, input, schema, lookupFields);
           
-          if (import.meta.env.DEV) {
+          if (_isDev) {
             console.log(`[getChargesReport] Filtered ${chargeRecords.length} records from ${allRecords.length} total in memory (fallback)`);
           }
         } catch (fallbackError) {
@@ -1718,12 +1723,21 @@ export async function getChargesReport(
       const fields = record.fields as any;
       const studentRecordId = extractStudentRecordId(record, schema.studentField) || '';
       const displayName = extractDisplayName(record, lookupFields);
-      
-      const lessonsCount = fields.lessons_count || extractNumericValue(record, lookupFields.lessonsCountField);
+      // Canonical total: "כולל מע"מ ומנויים (from תלמיד)" first, then fieldMap total_amount, then discovery
+      const totalAmount =
+        extractNumericValue(record, getField('monthlyBills', 'total_amount_from_student')) ??
+        extractNumericValue(record, getField('monthlyBills', 'total_amount')) ??
+        extractNumericValue(record, lookupFields.totalAmountField);
+      const subscriptionsAmount =
+        extractNumericValue(record, getField('monthlyBills', 'subscriptions_amount')) ??
+        extractNumericValue(record, lookupFields.subscriptionsAmountField);
+      const lessonsAmount =
+        extractNumericValue(record, getField('monthlyBills', 'lessons_amount')) ??
+        extractNumericValue(record, lookupFields.lessonsAmountField);
+      const lessonsCount =
+        extractNumericValue(record, getField('monthlyBills', 'lessons_count')) ??
+        extractNumericValue(record, lookupFields.lessonsCountField);
       const subscriptionsCount = extractNumericValue(record, lookupFields.subscriptionsCountField);
-      const subscriptionsAmount = fields.subscriptions_amount || extractNumericValue(record, lookupFields.subscriptionsAmountField);
-      const totalAmount = fields.total_amount || extractNumericValue(record, lookupFields.totalAmountField);
-      const lessonsAmount = fields.lessons_amount || extractNumericValue(record, lookupFields.lessonsAmountField);
       const cancellationsAmount = fields.cancellations_amount;
       
       const approved = fields[schema.approvedField] === true || fields[schema.approvedField] === 1;
@@ -1773,7 +1787,7 @@ export async function getChargesReport(
         },
       };
       
-      if (import.meta.env.DEV) {
+      if (_isDev) {
         console.error('[getChargesReport] 403 Error Details:', diagnosticError);
       }
       
@@ -1939,11 +1953,11 @@ export async function getChargesReportKPIs(
       maxRecords: 10000,
     });
     
-    if (import.meta.env.DEV && chargeRecords.length > 0) {
+    if (_isDev && chargeRecords.length > 0) {
       console.log(`[getChargesReportKPIs] Found ${chargeRecords.length} records with date filter (YEAR/MONTH)`);
     }
   } catch (e) {
-    if (import.meta.env.DEV) {
+    if (_isDev) {
       console.warn('[getChargesReportKPIs] Date YEAR/MONTH filter failed:', e);
     }
   }
@@ -1957,11 +1971,11 @@ export async function getChargesReportKPIs(
         maxRecords: 10000,
       });
       
-      if (import.meta.env.DEV && chargeRecords.length > 0) {
+      if (_isDev && chargeRecords.length > 0) {
         console.log(`[getChargesReportKPIs] Found ${chargeRecords.length} records with date range filter`);
       }
     } catch (e) {
-      if (import.meta.env.DEV) {
+      if (_isDev) {
         console.warn('[getChargesReportKPIs] Date range filter failed:', e);
       }
     }
@@ -1976,11 +1990,11 @@ export async function getChargesReportKPIs(
         maxRecords: 10000,
       });
       
-      if (import.meta.env.DEV && chargeRecords.length > 0) {
+      if (_isDev && chargeRecords.length > 0) {
         console.log(`[getChargesReportKPIs] Found ${chargeRecords.length} records with text filter`);
       }
     } catch (e) {
-      if (import.meta.env.DEV) {
+      if (_isDev) {
         console.warn('[getChargesReportKPIs] Text filter failed:', e);
       }
     }
@@ -1988,7 +2002,7 @@ export async function getChargesReportKPIs(
   
   // Strategy 4: Last resort - fetch ALL and filter in memory
   if (chargeRecords.length === 0) {
-    if (import.meta.env.DEV) {
+    if (_isDev) {
       console.warn('[getChargesReportKPIs] All filters returned 0 records, fetching all and filtering in memory');
     }
     try {
@@ -2018,7 +2032,7 @@ export async function getChargesReportKPIs(
         return false;
       });
       
-      if (import.meta.env.DEV) {
+      if (_isDev) {
         console.log(`[getChargesReportKPIs] Filtered ${chargeRecords.length} records from ${allRecords.length} total records in memory`);
       }
     } catch (e) {
@@ -2027,7 +2041,7 @@ export async function getChargesReportKPIs(
     }
   }
   
-  if (import.meta.env.DEV) {
+  if (_isDev) {
     console.log(`[getChargesReportKPIs] Final result: ${chargeRecords.length} records for month ${billingMonth}`);
     if (chargeRecords.length > 0) {
       console.log(`[getChargesReportKPIs] Sample record billing month value:`, chargeRecords[0].fields[schema.billingMonthField]);

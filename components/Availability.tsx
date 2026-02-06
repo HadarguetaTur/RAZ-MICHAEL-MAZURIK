@@ -12,6 +12,7 @@ import { useOpenSlotModal } from '../hooks/useOpenSlotModal';
 import { useToast } from '../hooks/useToast';
 import { useConfirmDialog } from '../hooks/useConfirmDialog';
 import { apiUrl } from '../config/api';
+import { formatDate, parseLocalDate } from '../services/dateUtils';
 
 const DAYS_HEBREW = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'];
 
@@ -235,7 +236,7 @@ const Availability: React.FC = () => {
   const [weekStart, setWeekStart] = useState<string>(() => {
     const d = new Date();
     d.setDate(d.getDate() - d.getDay()); // Start of current week (Sunday)
-    return d.toISOString().split('T')[0];
+    return formatDate(d); // local date so Sunday column shows Sunday slots
   });
 
   const [formData, setFormData] = useState({
@@ -345,7 +346,7 @@ const Availability: React.FC = () => {
   const loadInventory = async (forceRefresh = false) => {
     setIsInventoryLoading(true);
     try {
-      const d = new Date(weekStart);
+      const d = parseLocalDate(weekStart);
       const weekEnd = new Date(d);
       weekEnd.setDate(d.getDate() + 6);
       
@@ -356,7 +357,7 @@ const Availability: React.FC = () => {
       const inventory = await getSlotInventory(
         {
           start: weekStart,
-          end: weekEnd.toISOString().split('T')[0],
+          end: formatDate(weekEnd),
         },
         undefined, // teacherId
         forceRefresh // forceRefresh flag
@@ -402,7 +403,10 @@ const Availability: React.FC = () => {
         // Check duplicates by composite key
         const compositeKeys = inventory.map(s => {
           const teacherId = s.teacherId || 'none';
-          return `${s.date}|${s.startTime}|${s.endTime}|${teacherId}`;
+          const d = s.date != null ? String(s.date) : '';
+          const st = s.startTime != null ? String(s.startTime) : '';
+          const et = s.endTime != null ? String(s.endTime) : '';
+          return `${d}|${st}|${et}|${teacherId}`;
         });
         const compositeKeyMap = new Map<string, string[]>();
         compositeKeys.forEach((key, idx) => {
@@ -430,6 +434,7 @@ const Availability: React.FC = () => {
       // Final deduplication guard before setting state (defensive)
       const dedupeMap = new Map<string, SlotInventory>();
       for (const slot of inventory) {
+        if (!slot?.id) continue;
         if (!dedupeMap.has(slot.id)) {
           dedupeMap.set(slot.id, slot);
         } else if (import.meta.env?.DEV) {
@@ -438,11 +443,15 @@ const Availability: React.FC = () => {
       }
       const deduplicatedInventory = Array.from(dedupeMap.values());
       
-      // Sort deterministically
+      // Sort deterministically (defensive: date/startTime may be missing)
       deduplicatedInventory.sort((a, b) => {
-        const dateCompare = a.date.localeCompare(b.date);
+        const dateA = a.date != null ? String(a.date) : '';
+        const dateB = b.date != null ? String(b.date) : '';
+        const dateCompare = dateA.localeCompare(dateB);
         if (dateCompare !== 0) return dateCompare;
-        return a.startTime.localeCompare(b.startTime);
+        const startA = a.startTime != null ? String(a.startTime) : '';
+        const startB = b.startTime != null ? String(b.startTime) : '';
+        return startA.localeCompare(startB);
       });
       
       setSlotInventory(deduplicatedInventory);
@@ -1068,13 +1077,13 @@ const Availability: React.FC = () => {
   };
 
   const changeWeek = (delta: number) => {
-    const d = new Date(weekStart);
+    const d = parseLocalDate(weekStart);
     d.setDate(d.getDate() + delta * 7);
-    setWeekStart(d.toISOString().split('T')[0]);
+    setWeekStart(formatDate(d));
   };
 
   const formatWeekRange = () => {
-    const start = new Date(weekStart);
+    const start = parseLocalDate(weekStart);
     const end = new Date(start);
     end.setDate(start.getDate() + 6);
     return `${start.toLocaleDateString('he-IL', { day: '2-digit', month: '2-digit' })} - ${end.toLocaleDateString('he-IL', { day: '2-digit', month: '2-digit' })}`;
@@ -1128,7 +1137,7 @@ const Availability: React.FC = () => {
               onClick={() => {
                 const d = new Date();
                 d.setDate(d.getDate() - d.getDay());
-                setWeekStart(d.toISOString().split('T')[0]);
+                setWeekStart(formatDate(d));
               }}
               className="text-xs font-bold text-blue-600 hover:underline"
             >
@@ -1603,8 +1612,8 @@ const Availability: React.FC = () => {
         <SlotInventoryModal
           slot={{
             id: slotModal.slotData.id,
-            startDateTime: `${slotModal.slotData.date}T${slotModal.slotData.startTime}:00`,
-            endDateTime: `${slotModal.slotData.date}T${slotModal.slotData.endTime}:00`,
+            startDateTime: `${slotModal.slotData.date ?? ''}T${slotModal.slotData.startTime ?? '00:00'}:00`,
+            endDateTime: `${slotModal.slotData.date ?? ''}T${slotModal.slotData.endTime ?? '01:00'}:00`,
             teacherId: slotModal.slotData.teacherId,
             status: slotModal.slotData.status as any,
           }}

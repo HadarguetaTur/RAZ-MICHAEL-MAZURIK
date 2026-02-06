@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { Lesson, LessonStatus, Teacher, Student, LessonType, SlotInventory } from '../types';
+import { Lesson, LessonStatus, Teacher, Student, LessonType, SlotInventory, WeeklySlot } from '../types';
 import { nexusApi, parseApiError } from '../services/nexusApi';
 import { updateLesson } from '../data/mutations';
 import { getLessons } from '../data/resources/lessons';
@@ -19,6 +19,8 @@ import { isOverlapping } from '../utils/overlaps';
 import { apiUrl } from '../config/api';
 import { useToast } from '../hooks/useToast';
 import { useConfirmDialog } from '../hooks/useConfirmDialog';
+import { useWeeklySlots } from '../data/hooks/useWeeklySlots';
+import { invalidateWeeklySlots } from '../data/resources/weeklySlots';
 import { sendTeacherCancelNotification, normalizePhoneNumber, triggerCancelLessonScenario } from '../services/makeApi';
 
 const HOURS = Array.from({ length: 14 }, (_, i) => i + 8); // 08:00 to 21:00
@@ -67,6 +69,10 @@ function shouldRenderOpenSlot(
   const slotTimeNormalized = slot.startTime.trim().padStart(5, '0'); // Ensure HH:mm format
   
   const hasMatchingLesson = allLessons.some(lesson => {
+    // Ignore cancelled lessons – they should not block showing the reopened slot
+    if (lesson.status === LessonStatus.CANCELLED || lesson.status === LessonStatus.PENDING_CANCEL) {
+      return false;
+    }
     const lessonDateNormalized = lesson.date.trim();
     const lessonTimeNormalized = lesson.startTime.trim().padStart(5, '0');
     
@@ -117,7 +123,8 @@ const Calendar: React.FC = () => {
   const [isCreating, setIsCreating] = useState(false);
   const [isOpeningWeek, setIsOpeningWeek] = useState(false);
   const [openWeekMessage, setOpenWeekMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
-  const [editState, setEditState] = useState<Partial<Lesson & { endDate?: string }>>({ studentIds: [], lessonType: 'private' });
+  type RecurringLessonType = 'private' | 'pair' | 'group';
+  const [editState, setEditState] = useState<Partial<Lesson & { endDate?: string; recurringLessonType?: RecurringLessonType }>>({ studentIds: [], lessonType: 'private' });
   const [isSaving, setIsSaving] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedStudent, setSelectedStudent] = useState<Student | null>(null);
@@ -127,6 +134,7 @@ const Calendar: React.FC = () => {
   const [isCheckingConflicts, setIsCheckingConflicts] = useState(false);
   const conflictCheckTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [priceManuallyEdited, setPriceManuallyEdited] = useState(false);
+  const [priceInputValue, setPriceInputValue] = useState<string>('');
   const [overlapConflicts, setOverlapConflicts] = useState<ConflictItem[]>([]);
   const [showOverlapModal, setShowOverlapModal] = useState(false);
   const [pendingSaveAction, setPendingSaveAction] = useState<(() => Promise<void>) | null>(null);
@@ -138,6 +146,9 @@ const Calendar: React.FC = () => {
   // Cancel lesson modal state
   const [showCancelModal, setShowCancelModal] = useState(false);
   const [cancelModalLesson, setCancelModalLesson] = useState<Lesson | null>(null);
+
+  const { data: weeklySlots } = useWeeklySlots();
+  const fixedWeeklySlots = useMemo(() => weeklySlots.filter(s => s.isFixed), [weeklySlots]);
 
   const weekDates = useMemo(() => {
     const dates = [];
@@ -354,11 +365,18 @@ const Calendar: React.FC = () => {
 
     if (isCreating && editState.date && editState.startTime && editState.duration) {
       conflictCheckTimeoutRef.current = setTimeout(() => {
+        // For pair/group lessons, check conflicts for the first student
+        // (conflict check API currently supports single student)
+        const recurringPrivate = editState.lessonType === 'recurring' && (editState.recurringLessonType ?? 'private') === 'private';
+        const studentIdToCheck = editState.lessonType === 'private' || recurringPrivate
+          ? (selectedStudent?.id || editState.studentId)
+          : (editState.studentIds?.[0] || editState.studentId);
+        
         checkConflicts(
           editState.date!,
           editState.startTime!,
           editState.duration || 60,
-          selectedStudent?.id || editState.studentId,
+          studentIdToCheck,
           editState.teacherId,
           selectedLesson?.id
         );
@@ -372,7 +390,7 @@ const Calendar: React.FC = () => {
         clearTimeout(conflictCheckTimeoutRef.current);
       }
     };
-  }, [editState.date, editState.startTime, editState.duration, selectedStudent, editState.teacherId, isCreating, selectedLesson, checkConflicts]);
+  }, [editState.date, editState.startTime, editState.duration, editState.lessonType, editState.recurringLessonType, selectedStudent, editState.studentIds, editState.studentId, editState.teacherId, isCreating, selectedLesson, checkConflicts]);
 
   // Real-time overlap detection for both lessons and slots (client-side, debounced)
   // Shows warning in the form before save
@@ -470,19 +488,58 @@ const Calendar: React.FC = () => {
   }, [editState.date, editState.startTime, editState.duration, editState.teacherId, filteredLessons, openSlots, selectedLesson, isCreating]);
 
   // Auto-update price when duration or lessonType changes (only if not manually edited)
+  const isPrivatePrice = editState.lessonType === 'private' || (editState.lessonType === 'recurring' && (editState.recurringLessonType ?? 'private') === 'private');
+  const isPairPrice = editState.lessonType === 'pair' || (editState.lessonType === 'recurring' && editState.recurringLessonType === 'pair');
   useEffect(() => {
-    if (editState.lessonType === 'private' && !priceManuallyEdited && editState.duration) {
+    if (isPrivatePrice && !priceManuallyEdited && editState.duration) {
       const calculatedPrice = Math.round(((editState.duration || 60) / 60) * 175 * 100) / 100;
       setEditState(p => ({ ...p, price: calculatedPrice }));
+      setPriceInputValue(calculatedPrice.toFixed(2));
     }
-  }, [editState.duration, editState.lessonType, priceManuallyEdited]);
+    if (isPairPrice && !priceManuallyEdited) {
+      setEditState(p => ({ ...p, price: 225 }));
+      setPriceInputValue('225.00');
+    }
+  }, [editState.duration, editState.lessonType, editState.recurringLessonType, priceManuallyEdited, isPrivatePrice, isPairPrice]);
 
   // Reset priceManuallyEdited when lesson type changes or when creating new lesson
   useEffect(() => {
-    if (isCreating || editState.lessonType !== 'private') {
+    const recurType = editState.recurringLessonType ?? 'private';
+    const showPrice = editState.lessonType === 'private' || editState.lessonType === 'pair'
+      || (editState.lessonType === 'recurring' && (recurType === 'private' || recurType === 'pair'));
+    if (isCreating || !showPrice) {
       setPriceManuallyEdited(false);
     }
-  }, [isCreating, editState.lessonType]);
+  }, [isCreating, editState.lessonType, editState.recurringLessonType]);
+
+  // Initialize priceInputValue when editState.price changes externally (e.g., when editing existing lesson)
+  useEffect(() => {
+    const recurType = editState.recurringLessonType ?? 'private';
+    const isPrivate = editState.lessonType === 'private' || (editState.lessonType === 'recurring' && recurType === 'private');
+    const isPair = editState.lessonType === 'pair' || (editState.lessonType === 'recurring' && recurType === 'pair');
+    if (isPrivate) {
+      if (editState.price !== undefined) {
+        setPriceInputValue(editState.price.toFixed(2));
+      } else if (editState.duration) {
+        const calculatedPrice = Math.round(((editState.duration / 60) * 175 * 100) / 100);
+        setPriceInputValue(calculatedPrice.toFixed(2));
+      } else {
+        setPriceInputValue('175.00');
+      }
+    } else if (isPair) {
+      // זוגי/מחזורי זוגי: ברירת מחדל 225; אם נשאר 175 מפרטי – להציג 225 עד שהאפקט יעדכן
+      const pairPrice = editState.price === 175 ? 225 : editState.price;
+      if (pairPrice !== undefined) {
+        setPriceInputValue(pairPrice.toFixed(2));
+      } else {
+        setPriceInputValue('225.00');
+      }
+    } else if (editState.lessonType === 'group' || (editState.lessonType === 'recurring' && recurType === 'group')) {
+      setPriceInputValue('');
+    } else {
+      setPriceInputValue('');
+    }
+  }, [editState.price, editState.duration, editState.lessonType, editState.recurringLessonType]);
 
   // Legacy conflict check for backward compatibility (client-side only)
   const checkConflict = (date: string, startTime: string, duration: number, excludeId?: string) => {
@@ -549,8 +606,13 @@ const Calendar: React.FC = () => {
         }
         return shouldRender;
       });
+      const outByStatus = inventoryData.filter(s => s.status !== 'open').length;
+      const outByLessons = inventoryData.filter(s => s.lessons && s.lessons.length > 0).length;
       // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:refreshData:afterFilter',message:'After filtering slots',data:{filteredOpenSlotsCount:filteredOpenSlots.length,filteredSlots:filteredOpenSlots.map(s=>({id:s.id,status:s.status,lessons:s.lessons}))},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'G'})}).catch(()=>{});
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:refreshData:afterFilter',message:'After filtering slots',data:{filteredOpenSlotsCount:filteredOpenSlots.length,inventoryTotal:inventoryData.length,outByStatusNotOpen:outByStatus,outByHasLessons:outByLessons,filteredSlots:filteredOpenSlots.map(s=>({id:s.id,status:s.status,lessons:s.lessons}))},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'G'})}).catch(()=>{});
+      // #endregion
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:refreshData:setState',message:'refreshData about to setOpenSlots',data:{lessonsSet:lessonsData.length,openSlotsToSet:filteredOpenSlots.length,forceRefresh},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H-cal-refresh'})}).catch(()=>{});
       // #endregion
       setOpenSlots(filteredOpenSlots);
       
@@ -577,6 +639,9 @@ const Calendar: React.FC = () => {
         });
       }
     } catch (err) {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:refreshData:catch',message:'refreshData threw',data:{errorMessage:err instanceof Error ? err.message : String(err),forceRefresh},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H-cal-refresh'})}).catch(()=>{});
+      // #endregion
       console.error('Error refreshing calendar data:', err);
     }
   };
@@ -637,40 +702,85 @@ const Calendar: React.FC = () => {
     try {
       if (selectedLesson) {
         // Update existing lesson
-        const updated = await updateLesson(selectedLesson.id, {
+        const updateData: Partial<Lesson> = {
           ...editState,
           studentId: studentId,
-          studentName: selectedStudent?.name || editState.studentName
-        });
+          studentName: editState.lessonType === 'private' || (editState.lessonType === 'recurring' && (editState.recurringLessonType ?? 'private') === 'private')
+            ? (selectedStudent?.name || editState.studentName)
+            : (editState.studentIds && editState.studentIds.length === 1 
+                ? students.find(s => s.id === editState.studentIds?.[0])?.name 
+                : undefined)
+        };
+        
+        // Include studentIds for pair/group lessons
+        if (editState.lessonType !== 'private' && editState.lessonType !== 'recurring') {
+          updateData.studentIds = editState.studentIds;
+        } else if (editState.lessonType === 'recurring' && (editState.recurringLessonType ?? 'private') !== 'private') {
+          updateData.studentIds = editState.studentIds;
+        }
+        
+        const updated = await updateLesson(selectedLesson.id, updateData);
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:performSave:afterUpdate',message:'After updateLesson, about to refreshData(false)',data:{lessonId:selectedLesson.id,forceRefresh:false},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H-cal-update'})}).catch(()=>{});
+        // #endregion
         // Refresh both lessons and slots (slots may have been auto-closed)
         await refreshData();
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:performSave:afterRefreshEdit',message:'refreshData() completed after edit',data:{},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H-cal-update'})}).catch(()=>{});
+        // #endregion
         setSelectedLesson(null);
         setIsCreating(false);
       } else {
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:performSave:beforeCreate',message:'About to call createLesson',data:{studentId,date:editState.date,startTime:editState.startTime,duration:editState.duration,teacherId:editState.teacherId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H2'})}).catch(()=>{});
-        // #endregion
-        // Create new lesson with server-side validation
-        const newLesson = await nexusApi.createLesson({
-          studentId: studentId,
-          date: editState.date!,
-          startTime: editState.startTime!,
-          duration: editState.duration || 60,
-          status: LessonStatus.SCHEDULED,
-          subject: editState.subject || 'מתמטיקה',
-          teacherId: editState.teacherId,
-          notes: editState.notes || '',
-          isPrivate: editState.lessonType === 'private',
-          lessonType: editState.lessonType || 'private',
-          price: editState.price !== undefined ? editState.price : (editState.lessonType === 'private' ? Math.round(((editState.duration || 60) / 60) * 175 * 100) / 100 : undefined),
-        });
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:performSave:afterCreate',message:'createLesson returned',data:{newLessonId:newLesson?.id,newLessonDate:newLesson?.date},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H2'})}).catch(()=>{});
-        // #endregion
-        
-        // Refresh both lessons and slots to get updated data (slots may have been auto-closed)
-        // Use forceRefresh=true to ensure we get the latest data after creating a lesson
-        await refreshData(true);
+        if (editState.lessonType === 'recurring') {
+          // Create recurring: weekly_slot template + lesson(s) for target date
+          const recurType = editState.recurringLessonType ?? 'private';
+          const duration = editState.duration || 60;
+          const startTime = editState.startTime!;
+          const [startH, startM] = startTime.split(':').map(Number);
+          const totalM = startH * 60 + startM + duration;
+          const endH = Math.floor(totalM / 60) % 24;
+          const endMin = totalM % 60;
+          const endTime = `${String(endH).padStart(2, '0')}:${String(endMin).padStart(2, '0')}`;
+          const dayOfWeek = new Date(editState.date!).getDay();
+          const reservedForIds = (recurType === 'private'
+            ? (studentId ? [studentId] : [])
+            : (editState.studentIds || [])
+          ).filter((id): id is string => Boolean(id));
+          if (!editState.teacherId || reservedForIds.length === 0) {
+            throw new Error('חסר מורה או תלמידים לשיעור מחזורי');
+          }
+          await nexusApi.reserveRecurringLesson({
+            teacherId: editState.teacherId,
+            dayOfWeek,
+            startTime,
+            endTime,
+            type: recurType,
+            reservedForIds,
+            durationMin: duration,
+            targetDate: new Date(editState.date!),
+          });
+          invalidateWeeklySlots();
+          await refreshWeeklySlots();
+          await refreshData(true);
+          toast.success('שיעור מחזורי נקבע בהצלחה');
+        } else {
+          // Create new lesson (non-recurring) with server-side validation
+          const newLesson = await nexusApi.createLesson({
+            studentId: studentId,
+            studentIds: editState.lessonType === 'private' ? undefined : editState.studentIds,
+            date: editState.date!,
+            startTime: editState.startTime!,
+            duration: editState.duration || 60,
+            status: LessonStatus.SCHEDULED,
+            subject: editState.subject || 'מתמטיקה',
+            teacherId: editState.teacherId,
+            notes: editState.notes || '',
+            isPrivate: editState.lessonType === 'private',
+            lessonType: editState.lessonType || 'private',
+            price: editState.lessonType === 'private' ? (editState.price !== undefined ? editState.price : Math.round(((editState.duration || 60) / 60) * 175 * 100) / 100) : (editState.lessonType === 'pair' ? (editState.price ?? 225) : undefined),
+          });
+          await refreshData(true);
+        }
       }
       setSelectedLesson(null);
       setSelectedStudent(null);
@@ -729,16 +839,51 @@ const Calendar: React.FC = () => {
       return;
     }
 
-    // For new lessons, require selectedStudent
-    if (isCreating && !selectedStudent) {
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:handleSave:noStudent',message:'No student selected for new lesson',data:{isCreating},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H1'})}).catch(()=>{});
-      // #endregion
-      toast.error('נא לבחור תלמיד');
-      return;
+    // Validate student selection based on lesson type
+    if (isCreating) {
+      if (editState.lessonType === 'private') {
+        if (!selectedStudent) {
+          // #region agent log
+          fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:handleSave:noStudent',message:'No student selected for private lesson',data:{isCreating,lessonType:editState.lessonType},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H1'})}).catch(()=>{});
+          // #endregion
+          toast.error('נא לבחור תלמיד');
+          return;
+        }
+      } else if (editState.lessonType === 'pair') {
+        if (!editState.studentIds || editState.studentIds.length !== 2) {
+          toast.error('שיעור זוגי דורש בדיוק 2 תלמידים');
+          return;
+        }
+      } else if (editState.lessonType === 'group') {
+        if (!editState.studentIds || editState.studentIds.length < 2) {
+          toast.error('שיעור קבוצתי דורש לפחות 2 תלמידים');
+          return;
+        }
+      } else if (editState.lessonType === 'recurring') {
+        const recurType = editState.recurringLessonType ?? (editState.isPrivate !== false ? 'private' : 'pair');
+        if (recurType === 'private') {
+          if (!selectedStudent) {
+            toast.error('נא לבחור תלמיד');
+            return;
+          }
+        } else if (recurType === 'pair') {
+          if (!editState.studentIds || editState.studentIds.length !== 2) {
+            toast.error('שיעור מחזורי זוגי דורש בדיוק 2 תלמידים');
+            return;
+          }
+        } else {
+          if (!editState.studentIds || editState.studentIds.length < 2) {
+            toast.error('שיעור מחזורי קבוצתי דורש לפחות 2 תלמידים');
+            return;
+          }
+        }
+      }
     }
 
-    const studentId = selectedStudent?.id || editState.studentId || editState.studentIds?.[0];
+    // Extract studentId based on lesson type
+    const studentId = editState.lessonType === 'private' || (editState.lessonType === 'recurring' && (editState.recurringLessonType ?? (editState.isPrivate !== false ? 'private' : 'pair')) === 'private')
+      ? (selectedStudent?.id || editState.studentId)
+      : (editState.studentIds?.[0] || editState.studentId);
     
     // Validate studentId is a valid Airtable record ID (must start with "rec")
     if (!studentId || typeof studentId !== 'string' || !studentId.startsWith('rec')) {
@@ -874,8 +1019,13 @@ const Calendar: React.FC = () => {
       }
       
       // Refresh data to show reopened slots (if any)
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:handleCancelOnly:beforeRefresh',message:'About to refreshData(true) after cancel',data:{lessonId:cancelModalLesson.id},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H-cal-cancel'})}).catch(()=>{});
+      // #endregion
       await refreshData(true);
-      
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:handleCancelOnly:afterRefresh',message:'refreshData(true) completed after cancel',data:{},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H-cal-cancel'})}).catch(()=>{});
+      // #endregion
       setSelectedLesson(null);
       setShowCancelModal(false);
       setCancelModalLesson(null);
@@ -999,8 +1149,8 @@ const Calendar: React.FC = () => {
         text: `נפתחו ${result.slotInventoryCount} חלונות ו-${result.fixedLessonsCount} שיעורים קבועים`
       });
       
-      // Refresh data after opening week
-      await refreshData();
+      // Refresh data after opening week (force refresh to invalidate cache and show new slots)
+      await refreshData(true);
       
       // Auto-dismiss success message after 5 seconds
       setTimeout(() => setOpenWeekMessage(null), 5000);
@@ -1098,10 +1248,50 @@ const Calendar: React.FC = () => {
 
       <div className="flex-1 bg-white rounded-[32px] border border-slate-200 shadow-sm flex flex-col w-full overflow-hidden">
         {(viewMode === 'agenda' || viewMode === 'recurring') ? (
+          viewMode === 'recurring' ? (
+            <div className="flex-1 overflow-y-auto p-6 space-y-6 custom-scrollbar">
+              <h2 className="text-sm font-bold text-slate-700 mb-4">תבניות שיעורים מחזוריים</h2>
+              {[0, 1, 2, 3, 4, 5, 6].map(dayOfWeek => {
+                const daySlotsList = fixedWeeklySlots.filter(s => s.dayOfWeek === dayOfWeek);
+                if (daySlotsList.length === 0) return null;
+                return (
+                  <div key={dayOfWeek} className="space-y-3">
+                    <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest pt-2 px-2">
+                      {DAYS_HEBREW[dayOfWeek]}
+                    </h3>
+                    {daySlotsList.map((slot: WeeklySlot) => (
+                      <div
+                        key={slot.id}
+                        className="w-full bg-indigo-50/50 p-5 rounded-2xl border border-indigo-100 shadow-sm flex items-center justify-between text-right"
+                      >
+                        <div className="flex items-center gap-6 flex-1 min-w-0">
+                          <div className="w-12 h-12 bg-indigo-100 text-indigo-700 rounded-xl flex items-center justify-center border border-indigo-200 shrink-0">
+                            <span className="text-xs font-bold">{slot.startTime}</span>
+                          </div>
+                          <div className="text-right flex-1 min-w-0">
+                            <div className="font-bold text-slate-900">{slot.teacherName || slot.teacherId || 'מורה'}</div>
+                            <div className="text-[10px] font-medium text-slate-500 mt-0.5">
+                              {slot.startTime}–{slot.endTime}
+                              {slot.durationMin != null && ` • ${slot.durationMin} דק׳`}
+                            </div>
+                            <div className="text-[10px] font-medium text-indigo-600 mt-1">
+                              {slot.type === 'private' ? 'פרטי' : slot.type === 'pair' ? 'זוגי' : 'קבוצתי'}
+                              {slot.reservedForNames && slot.reservedForNames.length > 0
+                                ? ` • ${slot.reservedForNames.join(', ')}`
+                                : ' • לא שויך'}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
           <div className="flex-1 overflow-y-auto p-6 space-y-6 custom-scrollbar">
             {weekDates.map((date, dayIdx) => {
               const dayLessons = filteredLessons.filter(l => new Date(l.date).toDateString() === date.toDateString());
-              // Filter slots by date AND ensure they should be rendered (double-check with shouldRenderOpenSlot)
               const daySlots = openSlots
                 .filter(s => new Date(s.date).toDateString() === date.toDateString())
                 .filter(slot => shouldRenderOpenSlot(slot, lessons));
@@ -1193,6 +1383,7 @@ const Calendar: React.FC = () => {
               );
             })}
           </div>
+          )
         ) : (
           <div className="flex-1 flex flex-col w-full overflow-x-auto overflow-y-hidden custom-scrollbar">
             <div className={`flex border-b border-slate-100 bg-slate-50/30 sticky top-0 z-20 shrink-0 ${viewMode === 'week' ? 'min-w-[800px] md:min-w-0' : 'min-w-full'}`}>
@@ -1354,7 +1545,12 @@ const Calendar: React.FC = () => {
                     <button 
                       key={type}
                       type="button"
-                      onClick={() => setEditState(p => ({ ...p, lessonType: type, studentIds: type === 'private' ? (p.studentIds?.slice(0, 1)) : p.studentIds }))}
+                      onClick={() => setEditState(p => ({
+                        ...p,
+                        lessonType: type,
+                        studentIds: type === 'private' ? (p.studentIds?.slice(0, 1)) : p.studentIds,
+                        recurringLessonType: type === 'recurring' ? (p.recurringLessonType ?? 'private') : undefined,
+                      }))}
                       className={`py-2 text-[10px] font-bold border rounded-xl transition-all ${
                         editState.lessonType === type ? 'bg-blue-600 border-blue-600 text-white shadow-sm' : 'bg-white border-slate-200 text-slate-500 hover:border-slate-300'
                       }`}
@@ -1371,18 +1567,21 @@ const Calendar: React.FC = () => {
                   <div className="space-y-3">
                     <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">סוג שיעור במחזור</label>
                     <div className="grid grid-cols-3 gap-2">
-                      {['private', 'pair', 'group'].map(t => (
-                        <button 
-                          key={t}
-                          type="button"
-                          onClick={() => setEditState(p => ({ ...p, isPrivate: t === 'private' }))}
-                          className={`py-2 text-[10px] font-bold border rounded-xl transition-all ${
-                            (t === 'private' && editState.isPrivate) || (t !== 'private' && !editState.isPrivate) ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-white border-slate-100 text-slate-400'
-                          }`}
-                        >
-                          {t === 'private' ? 'פרטי' : t === 'pair' ? 'זוגי' : 'קבוצתי'}
-                        </button>
-                      ))}
+                      {(['private', 'pair', 'group'] as RecurringLessonType[]).map(t => {
+                        const isSelected = (editState.recurringLessonType ?? (editState.isPrivate !== false ? 'private' : 'pair')) === t;
+                        return (
+                          <button
+                            key={t}
+                            type="button"
+                            onClick={() => setEditState(p => ({ ...p, recurringLessonType: t, isPrivate: t === 'private' }))}
+                            className={`py-2 text-[10px] font-bold border rounded-xl transition-all ${
+                              isSelected ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-white border-slate-100 text-slate-400'
+                            }`}
+                          >
+                            {t === 'private' ? 'פרטי' : t === 'pair' ? 'זוגי' : 'קבוצתי'}
+                          </button>
+                        );
+                      })}
                     </div>
                   </div>
                   <div className="space-y-2">
@@ -1398,10 +1597,27 @@ const Calendar: React.FC = () => {
               )}
 
               <div className="space-y-3">
+                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">מורה</label>
+                <select
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-4 font-bold outline-none focus:bg-white focus:ring-2 focus:ring-blue-100 transition-all"
+                  value={editState.teacherId ?? ''}
+                  onChange={(e) => setEditState(p => ({ ...p, teacherId: e.target.value || undefined }))}
+                >
+                  <option value="">בחר מורה...</option>
+                  {teachers.map((t) => (
+                    <option key={t.id} value={t.id}>{t.name}</option>
+                  ))}
+                </select>
+                {isCreating && (editState.lessonType === 'recurring' || !editState.teacherId) && !editState.teacherId && (
+                  <div className="text-xs font-bold text-amber-700">נא לבחור מורה לשיעור</div>
+                )}
+              </div>
+
+              <div className="space-y-3">
                 <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-                  {editState.lessonType === 'private' ? 'תלמיד' : 'תלמידים (בחירה מרובה)'}
+                  {editState.lessonType === 'private' || (editState.lessonType === 'recurring' && (editState.recurringLessonType ?? 'private') === 'private') ? 'תלמיד' : 'תלמידים (בחירה מרובה)'}
                 </label>
-                {editState.lessonType === 'private' ? (
+                {editState.lessonType === 'private' || (editState.lessonType === 'recurring' && (editState.recurringLessonType ?? 'private') === 'private') ? (
                   <StudentPicker
                     value={selectedStudent}
                     onChange={(student) => {
@@ -1418,20 +1634,51 @@ const Calendar: React.FC = () => {
                     filterActiveOnly={true}
                   />
                 ) : (
-                  <StudentsPicker
-                    values={editState.studentIds || []}
-                    onChange={(studentIds) => {
-                      setEditState(prev => ({
-                        ...prev,
-                        studentIds,
-                        studentId: studentIds[0] || undefined,
-                        studentName: studentIds.length === 1 ? students.find(s => s.id === studentIds[0])?.name : undefined
-                      }));
-                    }}
-                    placeholder="חפש תלמידים לפי שם או טלפון..."
-                    disabled={isSaving}
-                    filterActiveOnly={true}
-                  />
+                  <>
+                    <StudentsPicker
+                      values={editState.studentIds || []}
+                      onChange={(studentIds) => {
+                        const isPair = editState.lessonType === 'pair' || (editState.lessonType === 'recurring' && editState.recurringLessonType === 'pair');
+                        const ids = isPair && studentIds.length > 2 ? studentIds.slice(0, 2) : studentIds;
+                        setEditState(prev => ({
+                          ...prev,
+                          studentIds: ids,
+                          studentId: ids[0] || undefined,
+                          studentName: ids.length === 1 ? students.find(s => s.id === ids[0])?.name : undefined
+                        }));
+                      }}
+                      placeholder="חפש תלמידים לפי שם או טלפון..."
+                      disabled={isSaving}
+                      filterActiveOnly={true}
+                      maxSelection={editState.lessonType === 'pair' || (editState.lessonType === 'recurring' && editState.recurringLessonType === 'pair') ? 2 : undefined}
+                      fallbackNames={Object.fromEntries(
+                        (editState.studentIds || [])
+                          .map(id => [id, students.find(s => s.id === id)?.name ?? ''])
+                          .filter(([, n]) => n) as [string, string][]
+                      )}
+                    />
+                    {(editState.lessonType === 'pair' || (editState.lessonType === 'recurring' && editState.recurringLessonType === 'pair')) && (editState.studentIds?.length || 0) !== 2 && (
+                      <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl">
+                        <div className="text-xs font-bold text-amber-800">
+                          שיעור זוגי דורש בדיוק 2 תלמידים. נבחרו {editState.studentIds?.length || 0} תלמידים.
+                        </div>
+                      </div>
+                    )}
+                    {isCreating && editState.lessonType === 'group' && (editState.studentIds?.length || 0) < 2 && (
+                      <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl">
+                        <div className="text-xs font-bold text-amber-800">
+                          ⚠️ שיעור קבוצתי דורש לפחות 2 תלמידים. נבחרו {editState.studentIds?.length || 0} תלמידים.
+                        </div>
+                      </div>
+                    )}
+                    {isCreating && editState.lessonType === 'recurring' && editState.recurringLessonType === 'group' && (editState.studentIds?.length || 0) < 2 && (
+                      <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl">
+                        <div className="text-xs font-bold text-amber-800">
+                          ⚠️ שיעור מחזורי קבוצתי דורש לפחות 2 תלמידים. נבחרו {editState.studentIds?.length || 0} תלמידים.
+                        </div>
+                      </div>
+                    )}
+                  </>
                 )}
               </div>
 
@@ -1527,7 +1774,8 @@ const Calendar: React.FC = () => {
                       setEditState(p => {
                         // אם זה שיעור פרטי, עדכן גם את המחיר אוטומטית
                         const newState = { ...p, duration: newDuration };
-                        if ((p.lessonType === 'private' || p.isPrivate) && p.price === undefined) {
+                        const isPrivateRecur = p.lessonType === 'recurring' && (p.recurringLessonType ?? 'private') === 'private';
+                        if ((p.lessonType === 'private' || p.isPrivate || isPrivateRecur) && p.price === undefined) {
                           newState.price = Math.round((newDuration / 60) * 175 * 100) / 100;
                         }
                         return newState;
@@ -1541,7 +1789,7 @@ const Calendar: React.FC = () => {
                 </div>
               </div>
 
-              {editState.lessonType === 'private' && (
+              {(editState.lessonType === 'private' || (editState.lessonType === 'recurring' && (editState.recurringLessonType ?? 'private') === 'private')) && (
                 <div className="space-y-3">
                   <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
                     מחיר שיעור (₪) - ברירת מחדל: 175₪ ל-60 דקות
@@ -1552,11 +1800,34 @@ const Calendar: React.FC = () => {
                       step="0.01"
                       min="0"
                       className="flex-1 bg-slate-50 border border-slate-200 rounded-xl p-4 font-bold outline-none focus:bg-white focus:ring-2 focus:ring-blue-100 transition-all"
-                      value={editState.price !== undefined ? editState.price.toFixed(2) : (editState.duration ? ((editState.duration / 60) * 175).toFixed(2) : '175.00')}
+                      value={priceInputValue}
                       onChange={(e) => {
-                        const newPrice = parseFloat(e.target.value) || 0;
-                        setEditState(p => ({ ...p, price: newPrice }));
+                        setPriceInputValue(e.target.value);
                         setPriceManuallyEdited(true);
+                      }}
+                      onBlur={(e) => {
+                        const numValue = parseFloat(e.target.value);
+                        if (!isNaN(numValue) && numValue >= 0) {
+                          const formattedPrice = Math.round(numValue * 100) / 100;
+                          setEditState(p => ({ ...p, price: formattedPrice }));
+                          setPriceInputValue(formattedPrice.toFixed(2));
+                        } else if (e.target.value === '' || e.target.value === '.') {
+                          // Empty or just a dot - reset to calculated/default
+                          const calculatedPrice = editState.duration 
+                            ? Math.round(((editState.duration / 60) * 175 * 100)) / 100
+                            : 175;
+                          setEditState(p => ({ ...p, price: calculatedPrice }));
+                          setPriceInputValue(calculatedPrice.toFixed(2));
+                          setPriceManuallyEdited(false);
+                        } else {
+                          // Invalid input - restore to last valid price
+                          const lastValidPrice = editState.price !== undefined 
+                            ? editState.price 
+                            : (editState.duration 
+                              ? Math.round(((editState.duration / 60) * 175 * 100)) / 100
+                              : 175);
+                          setPriceInputValue(lastValidPrice.toFixed(2));
+                        }
                       }}
                     />
                     <button
@@ -1564,6 +1835,7 @@ const Calendar: React.FC = () => {
                       onClick={() => {
                         const calculatedPrice = Math.round(((editState.duration || 60) / 60) * 175 * 100) / 100;
                         setEditState(p => ({ ...p, price: calculatedPrice }));
+                        setPriceInputValue(calculatedPrice.toFixed(2));
                         setPriceManuallyEdited(false);
                       }}
                       className="px-4 py-4 bg-blue-50 text-blue-600 rounded-xl font-bold text-xs hover:bg-blue-100 transition-all"
@@ -1579,6 +1851,57 @@ const Calendar: React.FC = () => {
                 </div>
               )}
 
+              {(editState.lessonType === 'pair' || (editState.lessonType === 'recurring' && editState.recurringLessonType === 'pair')) && (
+                <div className="space-y-3">
+                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                    מחיר שיעור זוגי (סה&quot;כ) – כל תלמיד יחויב במחצית
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      className="flex-1 bg-slate-50 border border-slate-200 rounded-xl p-4 font-bold outline-none focus:bg-white focus:ring-2 focus:ring-blue-100 transition-all"
+                      value={priceInputValue}
+                      onChange={(e) => {
+                        setPriceInputValue(e.target.value);
+                        setPriceManuallyEdited(true);
+                      }}
+                      onBlur={(e) => {
+                        const numValue = parseFloat(e.target.value);
+                        if (!isNaN(numValue) && numValue >= 0) {
+                          const formattedPrice = Math.round(numValue * 100) / 100;
+                          setEditState(p => ({ ...p, price: formattedPrice }));
+                          setPriceInputValue(formattedPrice.toFixed(2));
+                        } else if (e.target.value === '' || e.target.value === '.') {
+                          setEditState(p => ({ ...p, price: 225 }));
+                          setPriceInputValue('225.00');
+                          setPriceManuallyEdited(false);
+                        } else {
+                          const lastValid = editState.price !== undefined ? editState.price : 225;
+                          setPriceInputValue(lastValid.toFixed(2));
+                        }
+                      }}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditState(p => ({ ...p, price: 225 }));
+                        setPriceInputValue('225.00');
+                        setPriceManuallyEdited(false);
+                      }}
+                      className="px-4 py-4 bg-blue-50 text-blue-600 rounded-xl font-bold text-xs hover:bg-blue-100 transition-all"
+                      title="איפוס לברירת מחדל 225₪"
+                    >
+                      ↻
+                    </button>
+                  </div>
+                  <div className="text-xs text-slate-400">
+                    ברירת מחדל: 225 ₪ סה&quot;כ (112.50 ₪ לתלמיד). עם מנוי זוגי – החיוב הוא של המנוי בלבד.
+                  </div>
+                </div>
+              )}
+
               <div className="space-y-3">
                 <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">הערות לשיעור</label>
                 <textarea className="w-full bg-slate-50 border border-slate-200 rounded-xl p-4 font-medium min-h-[120px] outline-none focus:bg-white focus:ring-2 focus:ring-blue-100 transition-all" placeholder="הערות..." value={editState.notes || ''} onChange={(e) => setEditState(p => ({ ...p, notes: e.target.value }))} />
@@ -1586,17 +1909,63 @@ const Calendar: React.FC = () => {
             </div>
 
             <div className="p-8 bg-slate-50 border-t border-slate-100 flex flex-col gap-3 shrink-0">
-              <button 
-                disabled={isSaving || isCheckingConflicts || (isCreating && (conflicts.length > 0 || !selectedStudent))} 
-                onClick={handleSave} 
-                className={`w-full py-4 rounded-2xl font-bold shadow-lg transition-all flex items-center justify-center ${
-                  isSaving || isCheckingConflicts || (isCreating && (conflicts.length > 0 || !selectedStudent))
-                    ? 'bg-slate-300 text-slate-500 cursor-not-allowed'
-                    : 'bg-blue-600 text-white hover:bg-blue-700'
-                }`}
-              >
-                {isCheckingConflicts ? 'בודק חפיפות...' : isSaving ? 'מעבד...' : (isCreating ? 'צור שיעור' : 'שמור שינויים')}
-              </button>
+              {(() => {
+                // Validation function to check if lesson can be created
+                const canCreateLesson = (): boolean => {
+                  if (isSaving || isCheckingConflicts || conflicts.length > 0) {
+                    return false;
+                  }
+                  
+                  if (!isCreating) {
+                    return true; // Editing existing lesson
+                  }
+                  
+                  // For new lessons, validate based on lesson type
+                  if (editState.lessonType === 'private') {
+                    return !!selectedStudent;
+                  }
+                  
+                  if (editState.lessonType === 'pair') {
+                    // Pair lesson requires exactly 2 students
+                    return (editState.studentIds?.length || 0) === 2;
+                  }
+                  
+                  if (editState.lessonType === 'group') {
+                    // Group lesson requires at least 2 students
+                    return (editState.studentIds?.length || 0) >= 2;
+                  }
+                  
+                  if (editState.lessonType === 'recurring') {
+                    // Recurring lesson - check based on recurringLessonType
+                    const recurType = editState.recurringLessonType ?? 'private';
+                    if (recurType === 'private') {
+                      return !!(selectedStudent || editState.studentId || editState.studentIds?.[0]);
+                    }
+                    if (recurType === 'pair') {
+                      return (editState.studentIds?.length || 0) === 2;
+                    }
+                    return (editState.studentIds?.length || 0) >= 2; // group
+                  }
+                  
+                  return false;
+                };
+                
+                const canCreate = canCreateLesson();
+                
+                return (
+                  <button 
+                    disabled={!canCreate} 
+                    onClick={handleSave} 
+                    className={`w-full py-4 rounded-2xl font-bold shadow-lg transition-all flex items-center justify-center ${
+                      !canCreate
+                        ? 'bg-slate-300 text-slate-500 cursor-not-allowed'
+                        : 'bg-blue-600 text-white hover:bg-blue-700'
+                    }`}
+                  >
+                    {isCheckingConflicts ? 'בודק חפיפות...' : isSaving ? 'מעבד...' : (isCreating ? 'צור שיעור' : 'שמור שינויים')}
+                  </button>
+                );
+              })()}
               {!isCreating && (
                 <button disabled={isSaving} onClick={handleCancel} className="w-full py-4 text-rose-600 font-bold hover:bg-rose-50 rounded-2xl transition-all">בטל שיעור</button>
               )}
@@ -1652,8 +2021,8 @@ const Calendar: React.FC = () => {
         <SlotInventoryModal
           slot={{
             id: clickedSlot.id,
-            startDateTime: `${clickedSlot.date}T${clickedSlot.startTime}:00`,
-            endDateTime: `${clickedSlot.date}T${clickedSlot.endTime}:00`,
+            startDateTime: `${clickedSlot.date ?? ''}T${clickedSlot.startTime ?? '00:00'}:00`,
+            endDateTime: `${clickedSlot.date ?? ''}T${clickedSlot.endTime ?? '01:00'}:00`,
             teacherId: clickedSlot.teacherId,
             status: clickedSlot.status as any,
           }}

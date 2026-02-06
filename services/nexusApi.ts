@@ -8,7 +8,7 @@ import { airtableClient } from './airtableClient';
 // Cache for table schema to avoid redundant discovery calls
 let cachedChargeSchema: ChargeTableSchema | null = null;
 import { getTableId, getField, isComputedField, filterComputedFields } from '../contracts/fieldMap';
-import { getWeeklySlots as getWeeklySlotsService, getSlotInventory as getSlotInventoryService, updateWeeklySlot as updateWeeklySlotService, updateSlotInventory as updateSlotInventoryService, createWeeklySlot as createWeeklySlotService, deleteWeeklySlot as deleteWeeklySlotService } from './slotManagementService';
+import { getWeeklySlots as getWeeklySlotsService, getSlotInventory as getSlotInventoryService, updateWeeklySlot as updateWeeklySlotService, updateSlotInventory as updateSlotInventoryService, createWeeklySlot as createWeeklySlotService, deleteWeeklySlot as deleteWeeklySlotService, reserveRecurringLesson as reserveRecurringLessonService } from './slotManagementService';
 import { openNewWeek as openNewWeekService } from './weeklyRolloverService';
 import { triggerCreateLessonScenario } from './makeApi';
 
@@ -253,6 +253,11 @@ function mapAirtableToLesson(record: any): Lesson {
     ? (typeof fields[priceField] === 'number' ? fields[priceField] : parseFloat(fields[priceField])) 
     : undefined;
   
+  // Normalize status: Airtable Single Select may return values with trailing space (e.g. "בוטל ")
+  const rawStatus = fields[statusField];
+  const statusKey = typeof rawStatus === 'string' ? rawStatus.trim() : String(rawStatus || '').trim();
+  const mappedStatus = statusMap[statusKey] || LessonStatus.SCHEDULED;
+  
   // Extract studentId from full_name field (primary) or fallback fields
   const fullNameField = getField('lessons', 'full_name');
   let studentIdFromFullName = '';
@@ -280,7 +285,7 @@ function mapAirtableToLesson(record: any): Lesson {
     date: date,
     startTime: startTime,
     duration: duration,
-    status: statusMap[fields[statusField]] || LessonStatus.SCHEDULED,
+    status: mappedStatus,
     subject: fields['Subject'] || fields['subject'] || 'מתמטיקה',
     isChargeable: fields['Is_Chargeable'] !== false,
     chargeReason: fields['Charge_Reason'] || fields['charge_reason'],
@@ -358,9 +363,12 @@ function mapLessonToAirtable(lesson: Partial<Lesson>): any {
   
   // Only map the fields that are allowed for updates: status, start_datetime, end_datetime
   
-  // Map status
+  // Map status (Single Select options in this base use trailing space, e.g. "מתוכנן ", "בוטל ")
   if (lesson.status !== undefined) {
-    fields[statusField] = lesson.status;
+    const raw = String(lesson.status);
+    const trimmed = raw.trim();
+    if (trimmed === 'מתוכנן' || trimmed === 'בוטל') fields[statusField] = trimmed + ' ';
+    else fields[statusField] = raw;
   }
   
   // Convert date + startTime to start_datetime (ISO format)
@@ -387,6 +395,12 @@ function mapLessonToAirtable(lesson: Partial<Lesson>): any {
       const endDate = new Date(startDate.getTime() + (lesson.duration * 60 * 1000));
       fields[endDatetimeField] = endDate.toISOString(); // UTC ISO string
     }
+  }
+
+  // Price - allow updating for private and pair/group lessons
+  if (lesson.price !== undefined) {
+    const priceField = getField('lessons', 'price');
+    fields[priceField] = Math.round(lesson.price * 100) / 100;
   }
   
   return { fields };
@@ -1075,8 +1089,10 @@ export const nexusApi = {
     }
     
     const lessons = response.records.map(mapAirtableToLesson);
-    console.log(`[Airtable] Fetched ${lessons.length} lessons`);
-    console.log(`[DEBUG] Mapped lessons:`, lessons.slice(0, 2)); // Log first 2 mapped lessons
+    // Exclude cancelled lessons so they don't appear in calendar or affect overlap logic
+    const lessonsFiltered = lessons.filter(l => l.status !== LessonStatus.CANCELLED && l.status !== LessonStatus.PENDING_CANCEL);
+    console.log(`[Airtable] Fetched ${lessons.length} lessons (${lessonsFiltered.length} after excluding cancelled)`);
+    console.log(`[DEBUG] Mapped lessons:`, lessonsFiltered.slice(0, 2)); // Log first 2 mapped lessons
     
     // Store raw records in a map for modal access
     const rawRecordsMap = new Map<string, any>();
@@ -1085,9 +1101,9 @@ export const nexusApi = {
     });
     
     // Return lessons with rawRecords attached (for backward compatibility)
-    (lessons as any).rawRecords = rawRecordsMap;
+    (lessonsFiltered as any).rawRecords = rawRecordsMap;
     
-    return lessons;
+    return lessonsFiltered;
   },
 
   getWeeklySlots: async (): Promise<WeeklySlot[]> => {
@@ -2182,10 +2198,30 @@ export const nexusApi = {
       endTime: slot.endTime,
       type: slot.type,
       isFixed: slot.isFixed,
+      isReserved: (slot as any).isReserved,
       reservedFor: slot.reservedFor,
       reservedForIds: slot.reservedForIds,
       durationMin: slot.durationMin,
     });
+  },
+
+  /**
+   * Reserve a recurring lesson: create/update weekly_slot and create lesson(s) for the target date.
+   * Resolves teacherId to Airtable record ID if it is a number (e.g. "1" for רז).
+   */
+  reserveRecurringLesson: async (params: {
+    teacherId: string;
+    dayOfWeek: number;
+    startTime: string;
+    endTime: string;
+    type: 'private' | 'group' | 'pair';
+    reservedForIds: string[];
+    durationMin?: number;
+    targetDate?: Date;
+    weeklySlotId?: string;
+  }): Promise<{ weeklySlot: WeeklySlot; lessonIds: string[] }> => {
+    const resolvedTeacherId = await resolveTeacherRecordId(params.teacherId) ?? params.teacherId;
+    return reserveRecurringLessonService({ ...params, teacherId: resolvedTeacherId });
   },
 
   deleteWeeklySlot: async (id: string): Promise<void> => {
@@ -2391,19 +2427,8 @@ export const nexusApi = {
         let lessonsAmount = typeof row.lessonsAmount === 'number' ? row.lessonsAmount : 0;
         let totalAmount = typeof row.totalAmount === 'number' ? row.totalAmount : 0;
 
-        // SMART RECOVERY LOGIC:
-        // If total is 0 or looks like a subtotal, we need to handle it.
-        // The user says Subscription is 480, Total is 280, Adjustment is -200.
-        // If we extracted Sub=280 and Total=480, they are likely swapped OR Total is Subtotal.
-        
-        if (totalAmount > 0 && Math.abs(totalAmount + adjustmentAmount - subscriptionsAmount) < 1) {
-          // Case: Total=480, Adj=-200, Subs=280. 
-          // Here 480 is actually the Subtotal (Subs+Lessons).
-          // We should swap them or recalculate.
-          const subtotal = totalAmount;
-          totalAmount = subtotal + adjustmentAmount; // 480 - 200 = 280 (Correct Total)
-          subscriptionsAmount = subtotal - lessonsAmount; // 480 - 0 = 480 (Correct Subs)
-        } else if (totalAmount === 0 && (subscriptionsAmount !== 0 || lessonsAmount !== 0)) {
+        // Only fill total when missing; do not swap total vs subscriptions (total is from "כולל מע\"מ ומנויים (from תלמיד)")
+        if (totalAmount === 0 && (subscriptionsAmount !== 0 || lessonsAmount !== 0)) {
           totalAmount = subscriptionsAmount + lessonsAmount + adjustmentAmount;
         }
 
@@ -3244,9 +3269,11 @@ export const nexusApi = {
       console.warn(`[DEBUG createLesson] Could not fetch sample lesson to check status values:`, sampleError);
     }
     
-    // Use valid status value if found, otherwise use the requested value
-    // If status field is required but we can't determine valid value, try common options
-    const finalStatusValue = validStatusValue || statusValue;
+    // Airtable Single Select options in this base use trailing space (e.g. "מתוכנן "). Send exact value to match existing option.
+    const statusValue = (lesson.status != null && String(lesson.status)) || 'מתוכנן ';
+    let finalStatusValue = (validStatusValue != null && String(validStatusValue)) || statusValue;
+    // Normalize: sampled value may come back as "מתוכנן" (no space); base option is "מתוכנן " (with space)
+    if (finalStatusValue.trim() === 'מתוכנן') finalStatusValue = 'מתוכנן ';
     airtableFields.fields[statusField] = finalStatusValue;
     airtableFields.fields[lessonDateField] = lesson.date;
 
@@ -3282,6 +3309,17 @@ export const nexusApi = {
       console.warn(`[nexusApi] source field not found in mapping, skipping`);
     }
 
+    // Link to weekly_slot when lesson is created from a recurring/fixed template
+    const weeklySlotId = lesson.weeklySlotId ?? (lesson as any).weeklySlotId;
+    if (weeklySlotId && typeof weeklySlotId === 'string' && weeklySlotId.startsWith('rec')) {
+      try {
+        const slotFieldName = getField('lessons', 'slot');
+        airtableFields.fields[slotFieldName] = [weeklySlotId];
+      } catch (e) {
+        console.warn(`[nexusApi] slot field not found in mapping, skipping weeklySlotId`);
+      }
+    }
+
     // Teacher link - OPTIONAL
     // Note: According to the report, the field is 'teacher_id' (linked record to teachers)
     if (lesson.teacherId) {
@@ -3299,15 +3337,20 @@ export const nexusApi = {
       airtableFields.fields[lessonDetailsField] = lesson.notes;
     }
 
-    // Price - OPTIONAL (only for private lessons)
+    // Price - for private: per-lesson amount; for pair/group: total amount (each student charged half when no subscription)
+    const priceField = getField('lessons', 'price');
     if (lesson.lessonType === 'private' || lesson.isPrivate) {
-      const priceField = getField('lessons', 'price');
       const calculatedPrice = lesson.price !== undefined 
         ? lesson.price 
         : ((lesson.duration || 60) / 60) * 175;
       airtableFields.fields[priceField] = Math.round(calculatedPrice * 100) / 100;
-      console.log(`[DEBUG createLesson] Added price field "${priceField}" = ${airtableFields.fields[priceField]}`);
+      console.log(`[DEBUG createLesson] Added price field "${priceField}" = ${airtableFields.fields[priceField]} (private)`);
+    } else if (lesson.lessonType === 'pair') {
+      const pairTotalPrice = lesson.price !== undefined ? lesson.price : 225;
+      airtableFields.fields[priceField] = Math.round(pairTotalPrice * 100) / 100;
+      console.log(`[DEBUG createLesson] Added price field "${priceField}" = ${airtableFields.fields[priceField]} (pair total)`);
     }
+    // Group (קבוצתי): fixed 120 per student at billing time - do not write price
 
     // Subject field - REMOVED (not in config, will cause "Unknown field name" error)
     // DO NOT add lesson.subject - field name must be discovered from existing records first
@@ -3316,10 +3359,9 @@ export const nexusApi = {
     //   addFieldIfMapped('lessonSubject', lesson.subject, airtableFields);
     // }
 
-    // Lesson type - map English values to Hebrew for Airtable
+    // Lesson type - map English to Hebrew for Airtable (options in this base are without trailing space: "פרטי", "זוגי", "קבוצתי")
     if (lesson.lessonType) {
       const lessonTypeField = getField('lessons', 'lesson_type');
-      // Map English to Hebrew
       const typeMap: Record<string, string> = {
         'private': 'פרטי',
         'pair': 'זוגי',

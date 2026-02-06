@@ -54,6 +54,8 @@ export interface Lesson {
   paymentStatus?: 'paid' | 'unpaid' | 'partial';
   attendanceConfirmed?: boolean;
   price?: number; // מחיר השיעור (ניתן לעריכה)
+  /** Optional: link to weekly_slot when lesson was created from a recurring template */
+  weeklySlotId?: string;
 }
 
 export interface WeeklySlot {

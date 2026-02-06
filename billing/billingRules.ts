@@ -135,39 +135,53 @@ function checkActiveSubscriptionForLesson(
 
 /**
  * Calculate lesson amount
+ * For pair/group: subscription is checked first — if active, 0; only then line_amount or default.
+ * For private: line_amount if present, else 175.
  */
 export function calculateLessonAmount(
   lesson: LessonsAirtableFields,
   subscriptions?: SubscriptionsAirtableFields[]
 ): number {
-  // Prefer line_amount if present
+  const normalized = (lesson.lesson_type || '').toLowerCase().trim();
+
+  // Group (קבוצתי): check subscription first — if active, do not charge regardless of line_amount
+  if (normalized === 'group' || normalized === 'קבוצתי') {
+    if (subscriptions && subscriptions.length > 0 && lesson.start_datetime) {
+      const studentId = extractStudentId(lesson.full_name);
+      const lessonDate = lesson.start_datetime.split('T')[0];
+      if (checkActiveSubscriptionForLesson(studentId, lessonDate, subscriptions)) {
+        return 0;
+      }
+    }
+    if (lesson.line_amount !== undefined && lesson.line_amount !== null) {
+      return lesson.line_amount;
+    }
+    return 120;
+  }
+
+  // Pair (זוגי): check subscription first — if active, do not charge regardless of line_amount
+  if (normalized === 'pair' || normalized === 'זוגי') {
+    if (subscriptions && subscriptions.length > 0 && lesson.start_datetime) {
+      const studentId = extractStudentId(lesson.full_name);
+      const lessonDate = lesson.start_datetime.split('T')[0];
+      if (checkActiveSubscriptionForLesson(studentId, lessonDate, subscriptions)) {
+        return 0;
+      }
+    }
+    if (lesson.line_amount !== undefined && lesson.line_amount !== null) {
+      return lesson.line_amount;
+    }
+    const totalPrice = lesson.price !== undefined && lesson.price !== null ? Number(lesson.price) : null;
+    if (totalPrice !== null && totalPrice >= 0) {
+      return Math.round((totalPrice / 2) * 100) / 100;
+    }
+    return 112.5;
+  }
+
+  // Private (פרטי): prefer line_amount if present, else 175
   if (lesson.line_amount !== undefined && lesson.line_amount !== null) {
     return lesson.line_amount;
   }
-  
-  // Check if pair/group lesson
-  const normalized = (lesson.lesson_type || '').toLowerCase().trim();
-  if (normalized === 'pair' || normalized === 'זוגי' || 
-      normalized === 'group' || normalized === 'קבוצתי') {
-    
-    if (subscriptions && subscriptions.length > 0 && lesson.start_datetime) {
-      // Extract student ID from lesson
-      const studentId = extractStudentId(lesson.full_name);
-      const lessonDate = lesson.start_datetime.split('T')[0];
-      
-      const hasActive = checkActiveSubscriptionForLesson(
-        studentId,
-        lessonDate,
-        subscriptions
-      );
-      return hasActive ? 0 : 120;
-    }
-    
-    // No subscriptions provided → assume no subscription → 120
-    return 120;
-  }
-  
-  // Default: 175 for private lessons
   return 175;
 }
 
@@ -207,20 +221,24 @@ export function calculateLessonsContribution(
   
   for (const lesson of lessons) {
     // Check if lesson belongs to billing month
-    // First check billing_month field, then fallback to start_datetime
+    // billing_month can be "2026-02" or date string "2026-02-01" from Airtable; also fallback to start_datetime
     let belongsToMonth = false;
-    
-    if (lesson.billing_month === billingMonth) {
-      // billing_month matches exactly
-      belongsToMonth = true;
-    } else if (!lesson.billing_month && lesson.start_datetime) {
-      // billing_month not set, check by start_datetime
+
+    if (lesson.billing_month) {
+      if (lesson.billing_month === billingMonth) {
+        belongsToMonth = true;
+      } else if (typeof lesson.billing_month === 'string' && lesson.billing_month.substring(0, 7) === billingMonth) {
+        // e.g. "2026-02-01" or "2026-02-15" -> same month as billingMonth "2026-02"
+        belongsToMonth = true;
+      }
+    }
+    if (!belongsToMonth && lesson.start_datetime) {
       const lessonDate = new Date(lesson.start_datetime);
       if (lessonDate >= startDate && lessonDate <= endDate) {
         belongsToMonth = true;
       }
     }
-    
+
     if (!belongsToMonth) {
       console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} skipped: not in billing month (billing_month=${lesson.billing_month}, start_datetime=${lesson.start_datetime})`);
       continue;
@@ -319,11 +337,8 @@ export function calculateCancellationAmount(
       return 175;
     }
     
-    // For pair/group lessons, check subscription
     const normalized = (linkedLesson.lesson_type || '').toLowerCase().trim();
-    if (normalized === 'pair' || normalized === 'זוגי' || 
-        normalized === 'group' || normalized === 'קבוצתי') {
-      
+    if (normalized === 'group' || normalized === 'קבוצתי') {
       if (subscriptions && subscriptions.length > 0 && linkedLesson.start_datetime) {
         const studentId = extractStudentId(linkedLesson.full_name);
         const lessonDate = linkedLesson.start_datetime.split('T')[0];
@@ -334,11 +349,22 @@ export function calculateCancellationAmount(
         );
         return hasActive ? 0 : 120;
       }
-      
-      // No subscriptions provided → assume no subscription → 120
       return 120;
     }
-    
+    if (normalized === 'pair' || normalized === 'זוגי') {
+      if (subscriptions && subscriptions.length > 0 && linkedLesson.start_datetime) {
+        const studentId = extractStudentId(linkedLesson.full_name);
+        const lessonDate = linkedLesson.start_datetime.split('T')[0];
+        const hasActive = checkActiveSubscriptionForLesson(
+          studentId,
+          lessonDate,
+          subscriptions
+        );
+        return hasActive ? 0 : 112.5;
+      }
+      return 112.5;
+    }
+
     // Unknown lesson type
     return null;
   }

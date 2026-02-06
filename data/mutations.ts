@@ -93,7 +93,9 @@ export async function updateLesson(
   // Invalidate both lessons and slot inventory (slots may have been auto-closed or reopened)
   invalidateLessons();
   invalidateSlotInventory();
-  
+  // #region agent log
+  fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'data/mutations.ts:updateLesson:afterInvalidate',message:'updateLesson: invalidateLessons and invalidateSlotInventory called',data:{lessonId:id},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H-cal-update'})}).catch(()=>{});
+  // #endregion
   if (import.meta.env.DEV) {
     const stats = getApiStats();
     console.log(`[Mutations] updateLesson | invalidated: lessons:*, slot_inventory:* | calls/min: ${stats.callsPerMinute}`);

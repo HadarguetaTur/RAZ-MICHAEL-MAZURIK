@@ -136,6 +136,9 @@ export interface LessonsAirtableFields {
   
   /** Unit price (optional - may not exist) */
   unit_price?: number;
+  
+  /** Price: for private = per-lesson; for pair/group = total (each student charged half when no subscription) */
+  price?: number;
 }
 
 export type LessonsRecord = AirtableRecord<LessonsAirtableFields>;
@@ -253,8 +256,8 @@ export type BillingRecord = AirtableRecord<BillingAirtableFields>;
  * ============================================================================
  */
 export interface WeeklySlotAirtableFields {
-  /** Primary field - day of week (Select field - expects string) */
-  day_of_week: string | number; // Can be "0"-"6" or 0-6 (0 = Sunday)
+  /** Primary field - day of week: number 0-6, string "0"-"6", or Single Select "ראשון".."שבת" (verify in Airtable) */
+  day_of_week: string | number;
   
   /** Normalized day number - 1-7 where 1=Sunday, 7=Saturday */
   day_num?: number; // 1-7 format (1 = Sunday)
@@ -268,8 +271,8 @@ export interface WeeklySlotAirtableFields {
   /** Reserved for (linked record to students) */
   reserved_for?: LinkedRecord;
   
-  /** Is reserved (boolean) */
-  is_reserved?: boolean | 0 | 1;
+  /** Is reserved: boolean/0|1, or Single Select "לא פנוי" | "פנוי" (verify in Airtable) */
+  is_reserved?: boolean | 0 | 1 | 'לא פנוי' | 'פנוי';
   
   /** Type: פרטי, זוגי, קבוצתי */
   type?: string;

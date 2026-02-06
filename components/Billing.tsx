@@ -627,9 +627,9 @@ const Billing: React.FC = () => {
             </thead>
             <tbody className="divide-y divide-slate-100">
               {loading ? (
-                <tr><td colSpan={6} className="py-16 text-center text-slate-400">טוען...</td></tr>
+                <tr><td colSpan={8} className="py-16 text-center text-slate-400">טוען...</td></tr>
               ) : filteredBills.length === 0 ? (
-                <tr><td colSpan={6} className="py-16 text-center text-slate-400">
+                <tr><td colSpan={8} className="py-16 text-center text-slate-400">
                   <div className="flex flex-col items-center gap-2">
                     <div className="text-lg font-bold">אין חיובים להצגה</div>
                     <div className="text-sm">נסה לשנות את החודש או את הפילטרים</div>

@@ -7,7 +7,7 @@ import { airtableClient } from './airtableClient';
 import { getTableId, getField } from '../contracts/fieldMap';
 import { WeeklySlot, SlotInventory } from '../types';
 import { WeeklySlotAirtableFields, SlotInventoryAirtableFields, LinkedRecord } from '../contracts/types';
-import { formatDate, generateNaturalKey, getDateForDayOfWeek, calculateDuration } from './dateUtils';
+import { formatDate, generateNaturalKey, getDateForDayOfWeek, getWeekStart, calculateDuration, DAYS_HEBREW, DAY_HEBREW_TO_NUM } from './dateUtils';
 import { LessonStatus } from '../types';
 import { preventSlotOpeningIfLessonsOverlap } from './conflictValidationService';
 
@@ -35,12 +35,26 @@ function mapAirtableToWeeklySlot(record: { id: string; fields: WeeklySlotAirtabl
   const isFixed = fields[fixedField] === true || fields[fixedField] === 1;
   
   const reservedForField = getField('weeklySlot', 'reserved_for');
-  const reservedFor = fields[reservedForField] 
-    ? (Array.isArray(fields[reservedForField]) ? (fields[reservedForField] as string[])[0] : (fields[reservedForField] as string))
-    : undefined;
-  
+  const reservedForValue = fields[reservedForField];
+  const reservedForIds: string[] = [];
+  if (reservedForValue) {
+    if (Array.isArray(reservedForValue)) {
+      reservedForIds.push(
+        ...reservedForValue.map((item: unknown) =>
+          typeof item === 'string' ? item : (item as { id?: string })?.id ?? ''
+        ).filter(Boolean)
+      );
+    } else if (typeof reservedForValue === 'string' && reservedForValue.startsWith('rec')) {
+      reservedForIds.push(reservedForValue);
+    } else if (typeof reservedForValue === 'object' && reservedForValue !== null && 'id' in reservedForValue && typeof (reservedForValue as { id: string }).id === 'string') {
+      reservedForIds.push((reservedForValue as { id: string }).id);
+    }
+  }
+  const reservedFor = reservedForIds.length > 0 ? reservedForIds[0] : undefined;
+
   const isReservedField = getField('weeklySlot', 'is_reserved');
-  const isReserved = fields[isReservedField] === true || fields[isReservedField] === 1;
+  const isReservedRaw = fields[isReservedField];
+  const isReserved = isReservedRaw === true || isReservedRaw === 1 || isReservedRaw === 'לא פנוי';
   
   // Extract type - NO FALLBACK, use actual value from Airtable
   // Type values in Airtable are in Hebrew: "פרטי", "זוגי", "קבוצתי"
@@ -87,8 +101,15 @@ function mapAirtableToWeeklySlot(record: { id: string; fields: WeeklySlotAirtabl
       dayOfWeek = 0;
     }
   } else if (fields.day_of_week !== null && fields.day_of_week !== undefined && fields.day_of_week !== '') {
-    const num = typeof fields.day_of_week === 'string' ? parseInt(fields.day_of_week, 10) : fields.day_of_week;
-    dayOfWeek = isNaN(num) ? 0 : Math.max(0, Math.min(6, Math.floor(num)));
+    const raw = fields.day_of_week;
+    const str = typeof raw === 'string' ? raw.trim() : String(raw);
+    const fromHebrew = DAY_HEBREW_TO_NUM[str];
+    if (fromHebrew !== undefined) {
+      dayOfWeek = fromHebrew;
+    } else {
+      const num = typeof raw === 'string' ? parseInt(raw, 10) : Number(raw);
+      dayOfWeek = isNaN(num) ? 0 : Math.max(0, Math.min(6, Math.floor(num)));
+    }
   } else {
     dayOfWeek = 0;
   }
@@ -104,6 +125,7 @@ function mapAirtableToWeeklySlot(record: { id: string; fields: WeeklySlotAirtabl
     status: status,
     isFixed: isFixed,
     reservedFor: reservedFor,
+    reservedForIds: reservedForIds.length > 0 ? reservedForIds : undefined,
     durationMin: durationMin,
     isReserved: isReserved,
   };
@@ -322,10 +344,9 @@ export async function createSlotInventory(slot: {
         if (preventError.code === 'CONFLICT_ERROR') {
           throw preventError;
         }
-        // Log but don't fail slot creation if other errors occur
+        // Log but don't fail slot creation; keep finalStatus as 'open' so slot is created open
+        // (Technical/network errors should not force slots to be created as closed.)
         console.warn(`[createSlotInventory] Failed to check for lesson overlaps before creating slot ${slot.natural_key}:`, preventError);
-        // Default to "closed" if check fails (safer - prevents duplicates)
-        finalStatus = 'closed';
       }
     }
     
@@ -507,6 +528,7 @@ export async function createFixedLessonsForWeek(weekStart: Date): Promise<number
             lessonType: slot.type,
             subject: 'מתמטיקה', // Default subject
             isPrivate: true,
+            weeklySlotId: slot.id,
           });
           
           createdCount++;
@@ -532,8 +554,10 @@ export async function createFixedLessonsForWeek(weekStart: Date): Promise<number
             lessonType: slot.type,
             subject: 'מתמטיקה',
             isPrivate: false,
+            price: 225, // Default pair total (each student charged 112.5 when no subscription)
+            weeklySlotId: slot.id,
           });
-          
+
           createdCount++;
         } else {
           console.warn(`[createFixedLessonsForWeek] Slot ${slot.id} is type 'pair' but has ${studentIds.length} students (expected 2). Skipping.`);
@@ -559,8 +583,10 @@ export async function createFixedLessonsForWeek(weekStart: Date): Promise<number
             lessonType: slot.type,
             subject: 'מתמטיקה',
             isPrivate: false,
+            weeklySlotId: slot.id,
+            // Group: fixed 120 per student at billing - no price field
           });
-          
+
           createdCount++;
         }
       }
@@ -570,6 +596,124 @@ export async function createFixedLessonsForWeek(weekStart: Date): Promise<number
   } catch (error) {
     throw error;
   }
+}
+
+/**
+ * Reserve a recurring lesson: create/update weekly_slot and create lesson(s) for the target date.
+ * One operation that (a) creates or updates the weekly_slot template with all required fields,
+ * (b) creates lesson(s) for the given week with slot linked to the weekly_slot.
+ */
+export async function reserveRecurringLesson(params: {
+  teacherId: string;
+  dayOfWeek: number;
+  startTime: string;
+  endTime: string;
+  type: 'private' | 'group' | 'pair';
+  reservedForIds: string[];
+  durationMin?: number;
+  /** Week of this date is used to compute the lesson date; default current week */
+  targetDate?: Date;
+  /** If provided, update this weekly_slot instead of creating a new one */
+  weeklySlotId?: string;
+}): Promise<{ weeklySlot: WeeklySlot; lessonIds: string[] }> {
+  const nexusApi = await getNexusApi();
+  const targetWeekStart = getWeekStart(params.targetDate || new Date());
+  const lessonDate = getDateForDayOfWeek(targetWeekStart, params.dayOfWeek);
+
+  let weeklySlot: WeeklySlot;
+  if (params.weeklySlotId) {
+    weeklySlot = await updateWeeklySlot(params.weeklySlotId, {
+      teacherId: params.teacherId,
+      dayOfWeek: params.dayOfWeek,
+      startTime: params.startTime,
+      endTime: params.endTime,
+      type: params.type,
+      isFixed: true,
+      isReserved: true,
+      reservedForIds: params.reservedForIds,
+      durationMin: params.durationMin,
+    });
+  } else {
+    weeklySlot = await createWeeklySlot({
+      teacherId: params.teacherId,
+      dayOfWeek: params.dayOfWeek,
+      startTime: params.startTime,
+      endTime: params.endTime,
+      type: params.type,
+      isFixed: true,
+      isReserved: true,
+      reservedForIds: params.reservedForIds,
+      durationMin: params.durationMin,
+    });
+  }
+
+  const studentIds = params.reservedForIds;
+  if (studentIds.length === 0) {
+    return { weeklySlot, lessonIds: [] };
+  }
+
+  let duration = params.durationMin;
+  if (duration == null && params.startTime && params.endTime) {
+    try {
+      duration = calculateDuration(params.startTime, params.endTime);
+    } catch {
+      duration = 60;
+    }
+  }
+  duration = duration ?? 60;
+
+  const lessonIds: string[] = [];
+
+  if (params.type === 'private') {
+    for (const studentId of studentIds) {
+      const lesson = await nexusApi.createLesson({
+        studentId,
+        date: formatDate(lessonDate),
+        startTime: params.startTime,
+        duration,
+        status: LessonStatus.SCHEDULED,
+        teacherId: params.teacherId,
+        lessonType: params.type,
+        subject: 'מתמטיקה',
+        isPrivate: true,
+        weeklySlotId: weeklySlot.id,
+      });
+      lessonIds.push(lesson.id);
+    }
+  } else if (params.type === 'pair' && studentIds.length === 2) {
+    const lesson = await nexusApi.createLesson({
+      studentId: studentIds[0],
+      studentIds,
+      date: formatDate(lessonDate),
+      startTime: params.startTime,
+      duration,
+      status: LessonStatus.SCHEDULED,
+      teacherId: params.teacherId,
+      lessonType: params.type,
+      subject: 'מתמטיקה',
+      isPrivate: false,
+      price: 225,
+      weeklySlotId: weeklySlot.id,
+    });
+    lessonIds.push(lesson.id);
+  } else if (params.type === 'group' && studentIds.length > 0) {
+    const lesson = await nexusApi.createLesson({
+      studentId: studentIds[0],
+      studentIds,
+      date: formatDate(lessonDate),
+      startTime: params.startTime,
+      duration,
+      status: LessonStatus.SCHEDULED,
+      teacherId: params.teacherId,
+      lessonType: params.type,
+      subject: 'מתמטיקה',
+      isPrivate: false,
+      weeklySlotId: weeklySlot.id,
+    });
+    lessonIds.push(lesson.id);
+  }
+
+  return { weeklySlot, lessonIds };
 }
 
 /**
@@ -586,11 +730,11 @@ export async function updateWeeklySlot(
     const fields: Partial<WeeklySlotAirtableFields> = {};
     
     if (updates.dayOfWeek !== undefined) {
-      // Update day_num (1-7 format) and day_of_week (for backward compatibility)
+      // Update day_num (1-7 format) and day_of_week (Hebrew text per API spec)
       // dayOfWeek is 0-6 (0=Sunday), day_num is 1-7 (1=Sunday)
       const dayNum = updates.dayOfWeek + 1; // 0->1, 1->2, ..., 6->7
       (fields as any).day_num = dayNum;
-      fields.day_of_week = String(updates.dayOfWeek); // Airtable Select field expects string
+      fields.day_of_week = DAYS_HEBREW[updates.dayOfWeek] ?? DAYS_HEBREW[0]; // Airtable: Hebrew day name (e.g. "שני")
     }
     if (updates.startTime !== undefined) {
       fields.start_time = updates.startTime;
@@ -695,6 +839,7 @@ export async function createWeeklySlot(slot: {
   endTime: string;
   type: 'private' | 'group' | 'pair';
   isFixed?: boolean;
+  isReserved?: boolean;
   reservedFor?: string;
   reservedForIds?: string[];
   durationMin?: number;
@@ -713,7 +858,7 @@ export async function createWeeklySlot(slot: {
     };
     
     const fields: Partial<WeeklySlotAirtableFields> = {
-      day_of_week: String(slot.dayOfWeek), // Airtable Select field expects string
+      day_of_week: DAYS_HEBREW[slot.dayOfWeek] ?? DAYS_HEBREW[0], // Airtable: Hebrew day name (e.g. "שני")
       start_time: slot.startTime,
       end_time: slot.endTime,
       type: typeMap[slot.type] || slot.type, // Convert to Hebrew
@@ -748,6 +893,13 @@ export async function createWeeklySlot(slot: {
     } else if (slot.reservedFor !== undefined && slot.reservedFor) {
       const reservedForField = getField('weeklySlot', 'reserved_for');
       fields[reservedForField] = [slot.reservedFor];
+    }
+    // is_reserved: when reserved (recurring), send "לא פנוי" for Single Select or true for Checkbox (Airtable may accept either)
+    const isReservedField = getField('weeklySlot', 'is_reserved');
+    if (slot.isReserved !== undefined) {
+      (fields as any)[isReservedField] = slot.isReserved ? 'לא פנוי' : 'פנוי';
+    } else if (slot.reservedForIds?.length || slot.reservedFor) {
+      (fields as any)[isReservedField] = 'לא פנוי';
     }
     
     const result = await airtableClient.createRecord<WeeklySlotAirtableFields>(

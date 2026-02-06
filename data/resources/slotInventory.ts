@@ -16,6 +16,31 @@ export interface SlotInventoryRange {
 }
 
 /**
+ * Normalize slot inventory response so UI never gets undefined date/startTime/endTime
+ */
+function normalizeSlotInventoryList(raw: unknown): SlotInventory[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((item: any) => {
+    if (!item || typeof item !== 'object' || !item.id) return null;
+    const date = item.date != null ? String(item.date) : (item.lessonDate != null ? String(item.lessonDate) : '');
+    const startTime = item.startTime != null ? String(item.startTime) : '';
+    const endTime = item.endTime != null ? String(item.endTime) : '';
+    return {
+      ...item,
+      id: item.id || '',
+      date,
+      startTime,
+      endTime,
+      teacherId: item.teacherId ?? '',
+      teacherName: item.teacherName ?? '',
+      status: item.status ?? 'open',
+      students: Array.isArray(item.students) ? item.students : [],
+      lessons: Array.isArray(item.lessons) ? item.lessons : [],
+    } as SlotInventory;
+  }).filter(Boolean) as SlotInventory[];
+}
+
+/**
  * Get slot inventory for a date range
  */
 export async function getSlotInventory(
@@ -47,32 +72,36 @@ export async function getSlotInventory(
     key,
     ttlMs: SLOT_INVENTORY_TTL,
     fetcher: async () => {
-      // Try API server first (production-safe)
       try {
-        const apiPath = apiUrl('/api/slot-inventory');
-        const url = apiPath.startsWith('http') 
-          ? new URL(apiPath)
-          : new URL(apiPath, window.location.origin);
-        url.searchParams.set('start', start);
-        url.searchParams.set('end', end);
-        if (teacherId) {
-          url.searchParams.set('teacherId', teacherId);
+        // Try API server first (production-safe)
+        try {
+          const apiPath = apiUrl('/api/slot-inventory');
+          const url = apiPath.startsWith('http') 
+            ? new URL(apiPath)
+            : new URL(apiPath, window.location.origin);
+          url.searchParams.set('start', start);
+          url.searchParams.set('end', end);
+          if (teacherId) {
+            url.searchParams.set('teacherId', teacherId);
+          }
+          
+          const response = await fetch(url.toString());
+          if (response.ok) {
+            const data = await response.json();
+            return normalizeSlotInventoryList(data);
+          }
+          const errBody = await response.text();
+          console.warn('[getSlotInventory] API server failed', response.status, errBody?.slice(0, 200));
+        } catch (err) {
+          console.warn('[getSlotInventory] API server unavailable, falling back to direct Airtable:', err);
         }
         
-        const response = await fetch(url.toString());
-        if (response.ok) {
-          const data = await response.json();
-          return data as SlotInventory[];
-        }
-        // If API server fails, fall back to direct Airtable (for dev)
-        console.warn('[getSlotInventory] API server failed, falling back to direct Airtable');
+        const fallback = await nexusApi.getSlotInventory(start, end, teacherId);
+        return normalizeSlotInventoryList(fallback);
       } catch (err) {
-        // Fall back to direct Airtable if API server is unavailable
-        console.warn('[getSlotInventory] API server unavailable, falling back to direct Airtable:', err);
+        console.error('[getSlotInventory] Fetcher error:', err);
+        return [];
       }
-      
-      // Fallback: direct Airtable call (for dev/local)
-      return nexusApi.getSlotInventory(start, end, teacherId);
     },
     staleWhileRevalidate: true,
   });

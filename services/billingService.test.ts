@@ -58,24 +58,21 @@ test('calculateLessonPrice - Private (Hebrew)', () => {
 });
 
 test('calculateLessonPrice - Pair (English) - No subscription (default)', () => {
-  // Without subscription info, defaults to 120 (no subscription)
-  assertEquals(calculateLessonPrice('pair'), 120);
-  assertEquals(calculateLessonPrice('Pair'), 120);
+  // Without subscription info, defaults to 112.5 (225/2 per student)
+  assertEquals(calculateLessonPrice('pair'), 112.5);
+  assertEquals(calculateLessonPrice('Pair'), 112.5);
 });
 
 test('calculateLessonPrice - Pair (Hebrew) - No subscription (default)', () => {
-  // Without subscription info, defaults to 120 (no subscription)
-  assertEquals(calculateLessonPrice('זוגי'), 120);
+  assertEquals(calculateLessonPrice('זוגי'), 112.5);
 });
 
-test('calculateLessonPrice - Group (English) - No subscription (default)', () => {
-  // Without subscription info, defaults to 120 (no subscription)
+test('calculateLessonPrice - Group (English) - No subscription (fixed 120)', () => {
   assertEquals(calculateLessonPrice('group'), 120);
   assertEquals(calculateLessonPrice('Group'), 120);
 });
 
-test('calculateLessonPrice - Group (Hebrew) - No subscription (default)', () => {
-  // Without subscription info, defaults to 120 (no subscription)
+test('calculateLessonPrice - Group (Hebrew) - No subscription (fixed 120)', () => {
   assertEquals(calculateLessonPrice('קבוצתי'), 120);
 });
 
@@ -99,10 +96,16 @@ test('calculateLessonPrice - Pair with active subscription', () => {
 
 test('calculateLessonPrice - Pair without subscription', () => {
   const subscriptions: Subscription[] = [];
-  
-  // Without subscription, should return 120
-  assertEquals(calculateLessonPrice('pair', 60, 's1', subscriptions, '2024-03-15'), 120);
-  assertEquals(calculateLessonPrice('זוגי', 60, 's1', subscriptions, '2024-03-15'), 120);
+
+  // Without subscription, should return 112.5 (default when no pairTotalPrice)
+  assertEquals(calculateLessonPrice('pair', 60, 's1', subscriptions, '2024-03-15'), 112.5);
+  assertEquals(calculateLessonPrice('זוגי', 60, 's1', subscriptions, '2024-03-15'), 112.5);
+});
+
+test('calculateLessonPrice - Pair with pairTotalPrice (charge half per student)', () => {
+  const subscriptions: Subscription[] = [];
+  assertEquals(calculateLessonPrice('pair', 60, 's1', subscriptions, '2024-03-15', 200), 100);
+  assertEquals(calculateLessonPrice('זוגי', 60, 's1', subscriptions, '2024-03-15', 240), 120);
 });
 
 test('calculateLessonPrice - Pair with paused subscription', () => {
@@ -118,8 +121,8 @@ test('calculateLessonPrice - Pair with paused subscription', () => {
     },
   ];
   
-  // With paused subscription, should return 120 (no active subscription)
-  assertEquals(calculateLessonPrice('pair', 60, 's1', subscriptions, '2024-03-15'), 120);
+  // With paused subscription, should return 112.5 (no active subscription)
+  assertEquals(calculateLessonPrice('pair', 60, 's1', subscriptions, '2024-03-15'), 112.5);
 });
 
 test('calculateLessonPrice - Pair with expired subscription', () => {
@@ -135,8 +138,8 @@ test('calculateLessonPrice - Pair with expired subscription', () => {
     },
   ];
   
-  // With expired subscription, should return 120 (no active subscription)
-  assertEquals(calculateLessonPrice('pair', 60, 's1', subscriptions, '2024-03-15'), 120);
+  // With expired subscription, should return 112.5 (no active subscription)
+  assertEquals(calculateLessonPrice('pair', 60, 's1', subscriptions, '2024-03-15'), 112.5);
 });
 
 test('calculateLessonPrice - Default/Unknown', () => {
@@ -195,9 +198,9 @@ test('calculateCancellationCharge - Billable cancellation (pair) - No subscripti
   const cancellationTime = '2024-03-15T10:00:00';
   const subscriptions: Subscription[] = [];
   
-  // Without subscription, should charge 120
-  assertEquals(calculateCancellationCharge(lessonStart, 'pair', cancellationTime, 60, 's1', subscriptions), 120);
-  assertEquals(calculateCancellationCharge(lessonStart, 'זוגי', cancellationTime, 60, 's1', subscriptions), 120);
+  // Without subscription, should charge 112.5 (225/2)
+  assertEquals(calculateCancellationCharge(lessonStart, 'pair', cancellationTime, 60, 's1', subscriptions), 112.5);
+  assertEquals(calculateCancellationCharge(lessonStart, 'זוגי', cancellationTime, 60, 's1', subscriptions), 112.5);
 });
 
 test('calculateCancellationCharge - Billable cancellation (pair) - With active subscription', () => {
@@ -321,7 +324,7 @@ test('calculateStudentBilling - Private lessons only', () => {
   assertEquals(result.lineItems.length, 2);
 });
 
-test('calculateStudentBilling - Pair/Group lessons without subscription (charged 120)', () => {
+test('calculateStudentBilling - Pair/Group lessons without subscription (charged 112.5)', () => {
   const lessons: Lesson[] = [
     {
       id: 'l1',
@@ -341,9 +344,59 @@ test('calculateStudentBilling - Pair/Group lessons without subscription (charged
   const subscriptions: Subscription[] = [];
   const result = calculateStudentBilling(lessons, subscriptions, 's1', '2024-03');
 
-  // Without subscription, pair lesson should be charged 120
+  // Without subscription, pair lesson (no price set) should be charged 112.5 (225/2)
+  assertEquals(result.lessonsTotal, 112.5);
+  assertEquals(result.total, 112.5);
+});
+
+test('calculateStudentBilling - Group lesson without subscription (charged 120)', () => {
+  const lessons: Lesson[] = [
+    {
+      id: 'l1',
+      studentId: 's1',
+      studentName: 'Test Student',
+      date: '2024-03-15',
+      startTime: '10:00',
+      duration: 60,
+      status: LessonStatus.COMPLETED,
+      subject: 'Math',
+      isChargeable: true,
+      isPrivate: false,
+      lessonType: 'group',
+      // no price - group uses fixed 120 per student
+    },
+  ];
+
+  const subscriptions: Subscription[] = [];
+  const result = calculateStudentBilling(lessons, subscriptions, 's1', '2024-03');
+
   assertEquals(result.lessonsTotal, 120);
   assertEquals(result.total, 120);
+});
+
+test('calculateStudentBilling - Pair lesson with price (total) - each student charged half', () => {
+  const lessons: Lesson[] = [
+    {
+      id: 'l1',
+      studentId: 's1',
+      studentName: 'Test Student',
+      date: '2024-03-15',
+      startTime: '10:00',
+      duration: 60,
+      status: LessonStatus.COMPLETED,
+      subject: 'Math',
+      isChargeable: true,
+      isPrivate: false,
+      lessonType: 'pair',
+      price: 200, // total for pair; each student charged 100
+    },
+  ];
+
+  const subscriptions: Subscription[] = [];
+  const result = calculateStudentBilling(lessons, subscriptions, 's1', '2024-03');
+
+  assertEquals(result.lessonsTotal, 100);
+  assertEquals(result.total, 100);
 });
 
 test('calculateStudentBilling - Pair/Group lessons with active subscription (not charged)', () => {
@@ -466,31 +519,38 @@ test('calculateStudentBilling - Total calculation (no VAT)', () => {
 
 // ==================== Test Runner ====================
 
-async function runTests() {
-  console.log('Running billing service tests...\n');
-
-  for (const test of tests) {
+async function runTests(): Promise<{ passed: number; failed: number }> {
+  let p = 0;
+  let f = 0;
+  for (const t of tests) {
     try {
-      test.fn();
-      passed++;
-      console.log(`✓ ${test.name}`);
+      t.fn();
+      p++;
     } catch (error: any) {
-      failed++;
-      console.error(`✗ ${test.name}`);
-      console.error(`  ${error.message}`);
+      f++;
+      console.error(`✗ ${t.name}: ${error.message}`);
     }
   }
-
-  console.log(`\n${passed} passed, ${failed} failed`);
-  
-  if (failed > 0) {
-    process.exit(1);
+  if (typeof require !== 'undefined' && require.main === module) {
+    console.log(`\n${p} passed, ${f} failed`);
+    if (f > 0) process.exit(1);
   }
+  return { passed: p, failed: f };
 }
 
-// Run tests if this file is executed directly
-if (require.main === module || import.meta.url === `file://${process.argv[1]}`) {
+// Run tests if this file is executed directly (Node)
+if (typeof require !== 'undefined' && require.main === module) {
   runTests().catch(console.error);
 }
 
+// Jest: expose a single test that runs all custom tests
 export { runTests };
+if (typeof expect !== 'undefined') {
+  (describe as any)('billingService', () => {
+    it('calculateLessonPrice, calculateStudentBilling, and helpers', async () => {
+      const result = await runTests();
+      expect(result.failed).toBe(0);
+      expect(result.passed).toBeGreaterThan(0);
+    });
+  });
+}
