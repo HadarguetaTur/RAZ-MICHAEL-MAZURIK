@@ -402,6 +402,18 @@ function mapLessonToAirtable(lesson: Partial<Lesson>): any {
     const priceField = getField('lessons', 'price');
     fields[priceField] = Math.round(lesson.price * 100) / 100;
   }
+
+  // Student link (same field and format as createLesson) - only when provided so we don't overwrite on status-only updates (e.g. cancel)
+  if (lesson.studentIds && Array.isArray(lesson.studentIds) && lesson.studentIds.length > 0) {
+    const validIds = lesson.studentIds.filter((id): id is string => Boolean(id && typeof id === 'string' && id.startsWith('rec')));
+    if (validIds.length > 0) {
+      const studentFieldName = getField('lessons', 'full_name');
+      fields[studentFieldName] = validIds;
+    }
+  } else if (lesson.studentId && typeof lesson.studentId === 'string' && lesson.studentId.startsWith('rec')) {
+    const studentFieldName = getField('lessons', 'full_name');
+    fields[studentFieldName] = [lesson.studentId];
+  }
   
   return { fields };
 }
@@ -921,68 +933,51 @@ export const nexusApi = {
 
     console.log(`[DEBUG] getLessons called with start=${start}, end=${end}, teacherId=${teacherId}`);
     const lessonsTableId = getTableId('lessons');
+    const startDatetimeField = getField('lessons', 'start_datetime');
+    const statusField = getField('lessons', 'status');
     console.log(`[DEBUG] Table ID: ${lessonsTableId}`);
     console.log(`[DEBUG] Base ID: ${AIRTABLE_BASE_ID}`);
 
-    // TEMPORARY: Fetch all records without filtering (for debugging)
-    // Build Airtable filter formula
-    // Show ALL records where status is 'מתוכנן', 'אישר הגעה', or 'בוצע'
-    // Format dates as YYYY-MM-DD for Airtable
+    // Filter by date range (inclusive of start and end day) with pagination
     const startDate = start.split('T')[0];
-    const endDate = end.split('T')[0];
-    
-    // TEMPORARILY COMMENTED OUT - Fetch all records for debugging
-    // Filter by date range and status (no topic filtering)
-    // let filterFormula = `AND(
-    //   IS_AFTER({${startDatetimeField}}, '${startDate}'),
-    //   IS_BEFORE({${startDatetimeField}}, '${endDate}'),
-    //   OR(
-    //     {${statusField}} = 'מתוכנן',
-    //     {${statusField}} = 'אישר הגעה',
-    //     {${statusField}} = 'בוצע'
-    //   )
-    // )`;
-    
-    // if (teacherId) {
-    //   filterFormula = `AND(${filterFormula}, {Teacher} = '${teacherId}')`;
-    // }
-    
-    const params = new URLSearchParams({
-      // TEMPORARILY REMOVED: filterByFormula: filterFormula,
-      pageSize: '100', // Fetch all records (up to 100 per page)
-    });
-    // Add sort parameter separately
-    const startDatetimeField = getField('lessons', 'start_datetime');
-    params.append('sort[0][field]', startDatetimeField);
-    params.append('sort[0][direction]', 'asc');
-    
-    const endpoint = `/${lessonsTableId}?${params}`;
-    const fullUrl = `${API_BASE_URL}/${AIRTABLE_BASE_ID}${endpoint}`;
-    console.log(`[DEBUG] Full URL being called: ${fullUrl}`);
-    console.log(`[DEBUG] Endpoint: ${endpoint}`);
-    console.log(`[DEBUG] Params: ${params.toString()}`);
-    
-    const response = await airtableRequest<{ records: any[] }>(endpoint);
-    
-    // Log raw response
-    console.log(`[DEBUG] Raw Airtable response:`, JSON.stringify(response, null, 2));
-    console.log(`[DEBUG] Number of records in response: ${response.records?.length || 0}`);
-    
-    if (!response.records || response.records.length === 0) {
-      console.warn(`[DEBUG] Airtable returned 0 records for table ${lessonsTableId}`);
-      console.warn(`[DEBUG] Response structure:`, response);
+    const endDateStr = end.split('T')[0];
+    const endDateExclusive = new Date(endDateStr + 'T00:00:00.000Z');
+    endDateExclusive.setUTCDate(endDateExclusive.getUTCDate() + 1);
+    const endDateExclusiveStr = endDateExclusive.toISOString().split('T')[0];
+
+    let filterFormula = `AND(
+      IS_AFTER({${startDatetimeField}}, '${startDate}'),
+      IS_BEFORE({${startDatetimeField}}, '${endDateExclusiveStr}')
+    )`;
+    if (teacherId && teacherId !== 'all') {
+      const teacherField = getField('lessons', 'teacher_id');
+      filterFormula = `AND(${filterFormula}, {${teacherField}} = '${teacherId}')`;
+    }
+
+    const params: Record<string, string> = {
+      filterByFormula: filterFormula,
+      pageSize: '100',
+      'sort[0][field]': startDatetimeField,
+      'sort[0][direction]': 'asc',
+    };
+
+    const records = await listAllAirtableRecords<Record<string, unknown>>(lessonsTableId, params);
+    console.log(`[DEBUG] getLessons: fetched ${records.length} records in date range ${startDate}..${endDateStr}`);
+
+    if (records.length === 0) {
+      console.warn(`[DEBUG] Airtable returned 0 records for table ${lessonsTableId} in range`);
       return [];
     }
-    
-    // Log first record details
-    if (response.records.length > 0) {
-      const firstRecord = response.records[0];
+
+    // Log first record details (dev)
+    if (records.length > 0) {
+      const firstRecord = records[0];
       const lessonDetailsField = getField('lessons', 'פרטי_השיעור' as any);
       const statusField = getField('lessons', 'status');
       const existingStatusValue = firstRecord.fields?.[statusField];
       
       // Collect all unique status values from all records
-      const allStatusValues = [...new Set(response.records.map((r: any) => r.fields?.[statusField]).filter((v: any) => v))];
+      const allStatusValues = [...new Set(records.map((r: any) => r.fields?.[statusField]).filter((v: any) => v))];
       
       console.log(`[DEBUG] First record ID: ${firstRecord.id}`);
       console.log(`[DEBUG] First record fields:`, JSON.stringify(firstRecord.fields, null, 2));
@@ -1088,15 +1083,15 @@ export const nexusApi = {
       });
     }
     
-    const lessons = response.records.map(mapAirtableToLesson);
+    const lessons = records.map((r: any) => mapAirtableToLesson(r));
     // Exclude cancelled lessons so they don't appear in calendar or affect overlap logic
     const lessonsFiltered = lessons.filter(l => l.status !== LessonStatus.CANCELLED && l.status !== LessonStatus.PENDING_CANCEL);
     console.log(`[Airtable] Fetched ${lessons.length} lessons (${lessonsFiltered.length} after excluding cancelled)`);
     console.log(`[DEBUG] Mapped lessons:`, lessonsFiltered.slice(0, 2)); // Log first 2 mapped lessons
-    
+
     // Store raw records in a map for modal access
     const rawRecordsMap = new Map<string, any>();
-    response.records.forEach(record => {
+    records.forEach((record: any) => {
       rawRecordsMap.set(record.id, record);
     });
     
