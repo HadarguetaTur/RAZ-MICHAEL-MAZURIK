@@ -602,6 +602,7 @@ export async function syncSlots(options: SyncSlotsOptions = {}): Promise<{
     for (const { existing, generated: gen } of diff.toUpdate) {
       try {
         const fields: Partial<SlotInventoryAirtableFields> = {
+          natural_key: gen.naturalKey, // Always keep natural_key in sync with startTime/date/teacherId
           'מורה': [gen.teacherId], // Use 'מורה' Linked Record field instead of 'מזהה_מורה'
           'תאריך_שיעור': gen.date,
           'שעת_התחלה': gen.startTime,
@@ -676,7 +677,7 @@ export async function syncSlots(options: SyncSlotsOptions = {}): Promise<{
           slotInventoryTableId,
           existing.id,
           {
-            'סטטוס': 'blocked', // Deactivate by setting status to blocked (field name matches TypeScript interface)
+            'סטטוס': 'חסום ע"י מנהל', // Deactivate by setting status to blocked (Hebrew value for Airtable Single Select)
           },
           { typecast: true } // Enable automatic option creation for Single Select fields
         );

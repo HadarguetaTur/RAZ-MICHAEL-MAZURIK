@@ -379,6 +379,38 @@ export async function createSlotInventory(slot: {
       { typecast: true } // Enable automatic option creation for Single Select fields (e.g., time fields)
     );
     
+    // POST-CREATION VERIFICATION: Re-check for conflicts that may have appeared between
+    // the pre-create check and the actual creation (reduces TOCTOU window).
+    // If a conflict appeared, update the just-created slot to "סגור" instead of leaving it open.
+    if (finalStatus === 'open' || finalStatus === 'פתוח') {
+      try {
+        const { canOpen: canStillOpen } = await preventSlotOpeningIfLessonsOverlap(
+          slot.teacherId,
+          dateStr,
+          slot.startTime,
+          slot.endTime,
+          result.id // Exclude the just-created slot itself
+        );
+        
+        if (!canStillOpen) {
+          // A conflict appeared between pre-check and creation - close the slot
+          console.warn(`[createSlotInventory] Post-creation conflict detected for ${slot.natural_key}. Closing slot ${result.id}.`);
+          await airtableClient.updateRecord<SlotInventoryAirtableFields>(
+            tableId,
+            result.id,
+            { [getField('slotInventory', 'סטטוס')]: 'סגור' },
+            { typecast: true }
+          );
+          // Update the returned result to reflect the closed status
+          const closedResult = { ...result, fields: { ...result.fields, [getField('slotInventory', 'סטטוס')]: 'סגור' } };
+          return mapAirtableToSlotInventory(closedResult, teachersMap);
+        }
+      } catch (verifyError) {
+        // Don't fail the creation if post-verification fails - the slot was already created
+        console.warn(`[createSlotInventory] Post-creation conflict check failed for ${slot.natural_key}:`, verifyError);
+      }
+    }
+    
     return mapAirtableToSlotInventory(result, teachersMap);
   } catch (error) {
     throw error;
@@ -386,8 +418,44 @@ export async function createSlotInventory(slot: {
 }
 
 /**
+ * Find slot inventory by createdFrom (weekly_slot ID) and date.
+ * This catches cases where a weekly_slot template's start time changed,
+ * causing the natural_key to differ, but the same template+date slot exists.
+ */
+async function findSlotInventoryByCreatedFromAndDate(
+  createdFromId: string,
+  dateStr: string
+): Promise<SlotInventory | null> {
+  try {
+    const tableId = getTableId('slotInventory');
+    const teachersMap = await getTeachersMap();
+    const createdFromField = getField('slotInventory', 'נוצר_מתוך');
+    const dateField = getField('slotInventory', 'תאריך_שיעור');
+    
+    const records = await airtableClient.getRecords<SlotInventoryAirtableFields>(
+      tableId,
+      {
+        filterByFormula: `AND({${createdFromField}} = "${createdFromId}", {${dateField}} = "${dateStr}")`,
+        maxRecords: 1,
+      }
+    );
+    
+    if (records.length === 0) {
+      return null;
+    }
+    
+    return mapAirtableToSlotInventory(records[0], teachersMap);
+  } catch (error) {
+    console.error('[slotManagementService] Error finding slot inventory by createdFrom+date:', error);
+    return null;
+  }
+}
+
+/**
  * Create slot inventory for a specific week
- * Only creates slots for non-fixed weekly_slot entries
+ * Only creates slots for non-fixed weekly_slot entries.
+ * Uses two-level dedup: first by natural_key, then by createdFrom+date
+ * (matching slotSync.diffInventory strategy to prevent duplicates).
  */
 export async function createSlotInventoryForWeek(weekStart: Date): Promise<number> {
   try {
@@ -405,11 +473,29 @@ export async function createSlotInventoryForWeek(weekStart: Date): Promise<numbe
       }
       
       const slotDate = getDateForDayOfWeek(weekStart, slot.dayOfWeek);
+      const dateStr = formatDate(slotDate);
       const naturalKey = generateNaturalKey(slot.teacherId, slotDate, slot.startTime);
       
-      // Check if already exists (idempotency)
-      const existing = await findSlotInventoryByKey(naturalKey);
-      if (existing) {
+      // Check if already exists by natural_key (primary dedup)
+      const existingByKey = await findSlotInventoryByKey(naturalKey);
+      if (existingByKey) {
+        continue;
+      }
+      
+      // Secondary dedup: check by createdFrom + date (catches template time changes)
+      const existingByCreatedFrom = await findSlotInventoryByCreatedFromAndDate(slot.id, dateStr);
+      if (existingByCreatedFrom) {
+        // Slot exists from this template on this date but with different time.
+        // Update the existing slot's time and natural_key instead of creating a duplicate.
+        try {
+          await updateSlotInventory(existingByCreatedFrom.id, {
+            startTime: slot.startTime,
+            endTime: slot.endTime,
+          });
+          console.log(`[createSlotInventoryForWeek] Updated existing slot ${existingByCreatedFrom.id} (template time changed): ${existingByCreatedFrom.startTime} -> ${slot.startTime}`);
+        } catch (updateError) {
+          console.warn(`[createSlotInventoryForWeek] Failed to update existing slot ${existingByCreatedFrom.id}:`, updateError);
+        }
         continue;
       }
       
@@ -814,6 +900,46 @@ export async function updateSlotInventory(
     }
     if (updates.endTime !== undefined) {
       fields[getField('slotInventory', 'שעת_סיום')] = updates.endTime;
+    }
+    if (updates.date !== undefined) {
+      fields[getField('slotInventory', 'תאריך_שיעור')] = updates.date;
+    }
+    if (updates.teacherId !== undefined) {
+      fields[getField('slotInventory', 'מורה')] = [updates.teacherId];
+    }
+    
+    // AUTO-RECOMPUTE natural_key when key-forming fields change (startTime, date, teacherId)
+    const keyFieldsChanging = updates.startTime !== undefined || updates.date !== undefined || updates.teacherId !== undefined;
+    if (keyFieldsChanging) {
+      try {
+        // Fetch current record to get non-changing components for natural_key
+        const currentRecords = await airtableClient.getRecords<SlotInventoryAirtableFields>(
+          tableId,
+          { filterByFormula: `RECORD_ID() = "${id}"`, maxRecords: 1 }
+        );
+        if (currentRecords.length > 0) {
+          const currentFields = currentRecords[0].fields;
+          const currentTeacherIdVal = currentFields[getField('slotInventory', 'מורה')];
+          const currentTeacherId = Array.isArray(currentTeacherIdVal) ? String(currentTeacherIdVal[0]) : String(currentTeacherIdVal || '');
+          const currentDate = currentFields[getField('slotInventory', 'תאריך_שיעור')] || '';
+          const currentStartTime = currentFields[getField('slotInventory', 'שעת_התחלה')] || '';
+          
+          const finalTeacherId = updates.teacherId || currentTeacherId;
+          const finalDate = updates.date || currentDate;
+          const finalStartTime = updates.startTime || currentStartTime;
+          
+          if (finalTeacherId && finalDate && finalStartTime) {
+            const newNaturalKey = generateNaturalKey(
+              finalTeacherId,
+              new Date(finalDate + 'T00:00:00'),
+              finalStartTime
+            );
+            fields.natural_key = newNaturalKey;
+          }
+        }
+      } catch (nkError) {
+        console.warn('[slotManagementService.updateSlotInventory] Failed to recompute natural_key:', nkError);
+      }
     }
     
     const result = await airtableClient.updateRecord<SlotInventoryAirtableFields>(

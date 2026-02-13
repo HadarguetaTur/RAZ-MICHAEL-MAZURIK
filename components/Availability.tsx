@@ -802,23 +802,40 @@ const Availability: React.FC = () => {
         }
       } else {
         // CREATE MODE: Create new slot
-        const newSlot = await nexusApi.createWeeklySlot(formData);
-        
-        // Check overlaps after creation
-        const overlaps = detectWeeklySlotOverlaps(
-          {
-            id: newSlot.id,
-            dayOfWeek: newSlot.dayOfWeek,
-            startTime: newSlot.startTime,
-            endTime: newSlot.endTime,
-          },
-          weeklySlots
-        );
-        
-        newSlot.hasOverlap = overlaps.length > 0;
-        
-        // Add to local state
-        setWeeklySlots(prev => [...prev, newSlot]);
+        if (formData.date && activeTab === 'exceptions') {
+          // Creating a one-time exception slot (slot_inventory)
+          const newInventorySlot = await nexusApi.createSlotInventory({
+            teacherId: formData.teacherId,
+            date: formData.date,
+            startTime: formData.startTime,
+            endTime: formData.endTime,
+            type: formData.type as 'private' | 'group' | 'pair',
+            status: 'open',
+          });
+          
+          // Add to local state
+          setSlotInventory(prev => [...prev, newInventorySlot]);
+          toast.success('חלון חד-פעמי נוצר בהצלחה');
+        } else {
+          // Creating a weekly slot template
+          const newSlot = await nexusApi.createWeeklySlot(formData);
+          
+          // Check overlaps after creation
+          const overlaps = detectWeeklySlotOverlaps(
+            {
+              id: newSlot.id,
+              dayOfWeek: newSlot.dayOfWeek,
+              startTime: newSlot.startTime,
+              endTime: newSlot.endTime,
+            },
+            weeklySlots
+          );
+          
+          newSlot.hasOverlap = overlaps.length > 0;
+          
+          // Add to local state
+          setWeeklySlots(prev => [...prev, newSlot]);
+        }
       }
       
       // Close modal and reset state
@@ -1133,16 +1150,45 @@ const Availability: React.FC = () => {
               <div className="px-4 text-sm font-black text-slate-700">{formatWeekRange()}</div>
               <button onClick={() => changeWeek(1)} className="p-2 hover:bg-slate-50 rounded-xl transition-all text-slate-400">→</button>
             </div>
-            <button 
-              onClick={() => {
-                const d = new Date();
-                d.setDate(d.getDate() - d.getDay());
-                setWeekStart(formatDate(d));
-              }}
-              className="text-xs font-bold text-blue-600 hover:underline"
-            >
-              חזור לשבוע הנוכחי
-            </button>
+            <div className="flex items-center gap-4">
+              <button 
+                onClick={() => {
+                  const d = new Date();
+                  d.setDate(d.getDate() - d.getDay());
+                  setWeekStart(formatDate(d));
+                }}
+                className="text-xs font-bold text-blue-600 hover:underline"
+              >
+                חזור לשבוע הנוכחי
+              </button>
+              <button
+                onClick={() => {
+                  // Open create modal for one-time exception slot
+                  const startOfWeek = parseLocalDate(weekStart);
+                  const defaultDate = formatDate(startOfWeek); // Default to first day of shown week
+                  setSelectedSlot({ id: '', teacherId: '', teacherName: '', date: defaultDate, startTime: '16:00', endTime: '17:00', status: 'open' } as SlotInventory);
+                  setModalMode('create');
+                  setFormData({
+                    dayOfWeek: startOfWeek.getDay(),
+                    startTime: '16:00',
+                    endTime: '17:00',
+                    type: 'private',
+                    teacherId: teachers.length > 0 ? teachers[0].id : '',
+                    isFixed: false,
+                    reservedFor: undefined,
+                    reservedForIds: [],
+                    date: defaultDate,
+                  });
+                  setIsCheckingConflicts(false);
+                  setSlotInventoryValidationError(null);
+                  setSlotInventoryOverlapWarning(null);
+                  setTimeout(() => setIsModalOpen(true), 0);
+                }}
+                className="px-4 py-2 bg-blue-600 text-white text-sm font-bold rounded-xl hover:bg-blue-700 transition-all shadow-sm"
+              >
+                + חלון חד-פעמי
+              </button>
+            </div>
           </div>
 
           {isInventoryLoading ? (

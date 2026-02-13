@@ -94,8 +94,10 @@ function checkActiveSubscriptionForLesson(
   lessonDateObj.setHours(0, 0, 0, 0);
   
   for (const subscription of subscriptions) {
-    // Extract student ID from linked record
-    const subscriptionStudentId = extractStudentId(subscription.student_id);
+    // Extract student ID from linked record (support both student_id and תלמידים)
+    const studentLink = subscription.student_id ?? (subscription as any)['תלמידים'] ?? (subscription as any).תלמיד;
+    if (!studentLink) continue;
+    const subscriptionStudentId = extractStudentId(studentLink);
     
     // בדוק שהמנוי שייך לתלמיד הנכון
     if (subscriptionStudentId !== studentId) {
@@ -136,19 +138,23 @@ function checkActiveSubscriptionForLesson(
 /**
  * Calculate lesson amount
  * For pair/group: subscription is checked first — if active, 0; only then line_amount or default.
- * For private: line_amount if present, else 175.
+ * For private: line_amount if present, then price (manual override), else 175.
  */
 export function calculateLessonAmount(
   lesson: LessonsAirtableFields,
-  subscriptions?: SubscriptionsAirtableFields[]
+  subscriptions?: SubscriptionsAirtableFields[],
+  targetStudentId?: string
 ): number {
   const normalized = (lesson.lesson_type || '').toLowerCase().trim();
 
+  // Resolve lesson date: prefer start_datetime, fall back to lesson_date
+  const lessonDateStr = lesson.start_datetime || lesson.lesson_date;
+
   // Group (קבוצתי): check subscription first — if active, do not charge regardless of line_amount
   if (normalized === 'group' || normalized === 'קבוצתי') {
-    if (subscriptions && subscriptions.length > 0 && lesson.start_datetime) {
-      const studentId = extractStudentId(lesson.full_name);
-      const lessonDate = lesson.start_datetime.split('T')[0];
+    if (subscriptions && subscriptions.length > 0 && lessonDateStr) {
+      const studentId = targetStudentId ?? extractStudentId(lesson.full_name);
+      const lessonDate = lessonDateStr.split('T')[0];
       if (checkActiveSubscriptionForLesson(studentId, lessonDate, subscriptions)) {
         return 0;
       }
@@ -161,9 +167,9 @@ export function calculateLessonAmount(
 
   // Pair (זוגי): check subscription first — if active, do not charge regardless of line_amount
   if (normalized === 'pair' || normalized === 'זוגי') {
-    if (subscriptions && subscriptions.length > 0 && lesson.start_datetime) {
-      const studentId = extractStudentId(lesson.full_name);
-      const lessonDate = lesson.start_datetime.split('T')[0];
+    if (subscriptions && subscriptions.length > 0 && lessonDateStr) {
+      const studentId = targetStudentId ?? extractStudentId(lesson.full_name);
+      const lessonDate = lessonDateStr.split('T')[0];
       if (checkActiveSubscriptionForLesson(studentId, lessonDate, subscriptions)) {
         return 0;
       }
@@ -178,7 +184,10 @@ export function calculateLessonAmount(
     return 112.5;
   }
 
-  // Private (פרטי): prefer line_amount if present, else 175
+  // Private (פרטי): prefer price (manual override by Raz), then line_amount, else 175
+  if (lesson.price !== undefined && lesson.price !== null) {
+    return Number(lesson.price);
+  }
   if (lesson.line_amount !== undefined && lesson.line_amount !== null) {
     return lesson.line_amount;
   }
@@ -277,8 +286,8 @@ export function calculateLessonsContribution(
         continue; // Skip this lesson until rule is defined
       }
       // For זוגי/קבוצתי with multiple students: check subscription and charge if no subscription
-      // Note: For pair/group lessons with multiple students, we check subscription for the primary student
-      const amount = calculateLessonAmount(lesson, subscriptions);
+      // Pass targetStudentId so subscription check uses the correct student (not just the first linked one)
+      const amount = calculateLessonAmount(lesson, subscriptions, targetStudentId);
       if (amount > 0) {
         console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} INCLUDED: group/pair lesson with multiple students, status=${lesson.status}, amount=${amount}`);
         lessonsTotal += amount;
@@ -290,7 +299,7 @@ export function calculateLessonsContribution(
     }
 
     // Include private lessons and pair/group lessons (pair/group will be charged if no subscription)
-    const amount = calculateLessonAmount(lesson, subscriptions);
+    const amount = calculateLessonAmount(lesson, subscriptions, targetStudentId);
     
     if (isPrivateLesson(lesson.lesson_type)) {
       console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} INCLUDED: private lesson, status=${lesson.status}, amount=${amount}`);
@@ -334,6 +343,12 @@ export function calculateCancellationAmount(
   // If we have a linked lesson, use its lesson_type
   if (linkedLesson) {
     if (isPrivateLesson(linkedLesson.lesson_type)) {
+      if (linkedLesson.price !== undefined && linkedLesson.price !== null) {
+        return Number(linkedLesson.price);
+      }
+      if (linkedLesson.line_amount !== undefined && linkedLesson.line_amount !== null) {
+        return linkedLesson.line_amount;
+      }
       return 175;
     }
     
@@ -347,7 +362,10 @@ export function calculateCancellationAmount(
           lessonDate,
           subscriptions
         );
-        return hasActive ? 0 : 120;
+        if (hasActive) return 0;
+      }
+      if (linkedLesson.line_amount !== undefined && linkedLesson.line_amount !== null) {
+        return linkedLesson.line_amount;
       }
       return 120;
     }
@@ -360,7 +378,13 @@ export function calculateCancellationAmount(
           lessonDate,
           subscriptions
         );
-        return hasActive ? 0 : 112.5;
+        if (hasActive) return 0;
+      }
+      if (linkedLesson.line_amount !== undefined && linkedLesson.line_amount !== null) {
+        return linkedLesson.line_amount;
+      }
+      if (linkedLesson.price !== undefined && linkedLesson.price !== null) {
+        return Math.round((Number(linkedLesson.price) / 2) * 100) / 100;
       }
       return 112.5;
     }

@@ -250,16 +250,24 @@ export async function buildStudentMonth(
     );
   }
 
-  // 4. Fetch subscriptions
+  // 4. Fetch subscriptions (try student_id first; fallback to תלמידים if Airtable uses that)
   let subscriptions: AirtableRecord<SubscriptionsAirtableFields>[];
   if (prefetchedData?.subscriptions) {
     subscriptions = prefetchedData.subscriptions;
   } else {
-    const subscriptionsFilter = `{student_id} = "${studentRecordId}"`;
+    let subscriptionsFilter = `{student_id} = "${studentRecordId}"`;
     subscriptions = await client.listRecords<SubscriptionsAirtableFields>(
       subscriptionsTableId,
       { filterByFormula: subscriptionsFilter }
     );
+    // Fallback: some bases use "תלמידים" (students) instead of student_id
+    if (subscriptions.length === 0) {
+      subscriptionsFilter = `{תלמידים} = "${studentRecordId}"`;
+      subscriptions = await client.listRecords<SubscriptionsAirtableFields>(
+        subscriptionsTableId,
+        { filterByFormula: subscriptionsFilter }
+      );
+    }
   }
 
   // Calculate lessons contribution
@@ -405,10 +413,17 @@ export async function buildStudentMonth(
   // NOTE: 'חודש חיוב' field may be Date or Text - try Date format first (YYYY-MM-01)
   // Airtable will accept this format for Date fields, and if it's Text, we'll handle it in error handling
   const billingMonthValue = convertBillingMonthToAirtableValue(billingMonth, true);
-  
+
+  // Include manual adjustment in total when updating existing bill (preserves user-set adjustments)
+  const manualAdjustment =
+    existingFields?.manual_adjustment_amount != null
+      ? Number(existingFields.manual_adjustment_amount)
+      : 0;
+  const totalToWrite = total + manualAdjustment;
+
   // Preserve manual adjustment fields if they exist in existing bill
   // IMPORTANT: These fields are set manually by users and should NOT be overwritten
-  
+
   const billingFields: Partial<BillingAirtableFields> = {
     'חודש חיוב': billingMonthValue as any, // Cast to any to allow both string and Date formats
     'שולם': isPaid,
@@ -417,7 +432,7 @@ export async function buildStudentMonth(
     'lessons_amount': lessonsContribution.lessonsTotal,
     'subscriptions_amount': subscriptionsResult.subscriptionsTotal,
     'cancellations_amount': cancellationsResult.cancellationsTotal,
-    'total_amount': total,
+    'total_amount': totalToWrite,
     'lessons_count': lessonsContribution.lessonsCount,
     // Preserve manual adjustment fields if they exist (CRITICAL: don't overwrite user-set values)
     ...(existingFields?.manual_adjustment_amount !== undefined && existingFields.manual_adjustment_amount !== null && {
@@ -475,7 +490,7 @@ export async function buildStudentMonth(
     pendingCancellationsCount: cancellationsResult.pendingCancellationsCount,
     subscriptionsTotal: subscriptionsResult.subscriptionsTotal,
     subscriptionsCount: subscriptionsResult.activeSubscriptionsCount,
-    total,
+    total: totalToWrite,
     status,
     created,
   };
@@ -592,9 +607,10 @@ export async function buildMonthForAllActiveStudents(
 
   const subscriptionsByStudent = new Map<string, AirtableRecord<SubscriptionsAirtableFields>[]>();
   for (const sub of allSubscriptions) {
-    if (!sub.fields.student_id) continue;
+    const studentLink = sub.fields.student_id ?? (sub.fields as any)['תלמידים'] ?? (sub.fields as any).תלמיד;
+    if (!studentLink) continue;
     try {
-      const sId = extractStudentId(sub.fields.student_id);
+      const sId = extractStudentId(studentLink);
       if (!subscriptionsByStudent.has(sId)) subscriptionsByStudent.set(sId, []);
       subscriptionsByStudent.get(sId)!.push(sub);
     } catch (e) {

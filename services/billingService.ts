@@ -18,7 +18,8 @@ import { AIRTABLE_CONFIG } from '../config/airtable';
 import { getField } from '../contracts/fieldMap';
 import { Lesson, Subscription, MonthlyBill } from '../types';
 import { LessonStatus } from '../types';
-import { buildMonthForAllActiveStudents } from '../billing/billingEngine';
+import { buildMonthForAllActiveStudents, buildStudentMonth } from '../billing/billingEngine';
+import { MissingFieldsError, DuplicateBillingRecordsError } from '../billing/domainErrors';
 
 export interface BillingCalculationResult {
   lessonsTotal: number;
@@ -1215,6 +1216,48 @@ export async function createMonthlyCharges(
   }
 }
 
+/** Result of recalculating a single student's bill */
+export interface RecalculateBillResult {
+  billingRecordId: string;
+  studentRecordId: string;
+  billingMonth: string;
+  lessonsTotal: number;
+  lessonsCount: number;
+  cancellationsTotal: number;
+  subscriptionsTotal: number;
+  total: number;
+  created: boolean;
+}
+
+/**
+ * Recalculate and update a single student's bill for a month.
+ * Uses the billing engine (including subscription coverage for pair/group lessons).
+ */
+export async function recalculateBill(
+  client: AirtableClient,
+  studentId: string,
+  billingMonth: string
+): Promise<RecalculateBillResult> {
+  const result = await buildStudentMonth(client, studentId, billingMonth);
+  if (result instanceof MissingFieldsError) {
+    throw result;
+  }
+  if (result instanceof DuplicateBillingRecordsError) {
+    throw result;
+  }
+  return {
+    billingRecordId: result.billingRecordId,
+    studentRecordId: result.studentRecordId,
+    billingMonth: result.billingMonth,
+    lessonsTotal: result.lessonsTotal,
+    lessonsCount: result.lessonsCount,
+    cancellationsTotal: result.cancellationsTotal,
+    subscriptionsTotal: result.subscriptionsTotal,
+    total: result.total,
+    created: result.created,
+  };
+}
+
 /**
  * Charges Report - Query and format charge records from "חיובים" table
  * 
@@ -1723,10 +1766,10 @@ export async function getChargesReport(
       const fields = record.fields as any;
       const studentRecordId = extractStudentRecordId(record, schema.studentField) || '';
       const displayName = extractDisplayName(record, lookupFields);
-      // Canonical total: "כולל מע"מ ומנויים (from תלמיד)" first, then fieldMap total_amount, then discovery
+      // Total from total_amount only (as requested - no lookup override)
       const totalAmount =
-        extractNumericValue(record, getField('monthlyBills', 'total_amount_from_student')) ??
         extractNumericValue(record, getField('monthlyBills', 'total_amount')) ??
+        extractNumericValue(record, getField('monthlyBills', 'total_amount_from_student')) ??
         extractNumericValue(record, lookupFields.totalAmountField);
       const subscriptionsAmount =
         extractNumericValue(record, getField('monthlyBills', 'subscriptions_amount')) ??

@@ -724,7 +724,7 @@ const Calendar: React.FC = () => {
         fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:performSave:afterUpdate',message:'After updateLesson, about to refreshData(false)',data:{lessonId:selectedLesson.id,forceRefresh:false},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H-cal-update'})}).catch(()=>{});
         // #endregion
         // Refresh both lessons and slots (slots may have been auto-closed)
-        await refreshData();
+        await refreshData(true);
         // #region agent log
         fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:performSave:afterRefreshEdit',message:'refreshData() completed after edit',data:{},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H-cal-update'})}).catch(()=>{});
         // #endregion
@@ -1902,10 +1902,6 @@ const Calendar: React.FC = () => {
                 </div>
               )}
 
-              <div className="space-y-3">
-                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">הערות לשיעור</label>
-                <textarea className="w-full bg-slate-50 border border-slate-200 rounded-xl p-4 font-medium min-h-[120px] outline-none focus:bg-white focus:ring-2 focus:ring-blue-100 transition-all" placeholder="הערות..." value={editState.notes || ''} onChange={(e) => setEditState(p => ({ ...p, notes: e.target.value }))} />
-              </div>
             </div>
 
             <div className="p-8 bg-slate-50 border-t border-slate-100 flex flex-col gap-3 shrink-0">

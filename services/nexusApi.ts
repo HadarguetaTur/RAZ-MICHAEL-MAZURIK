@@ -2,7 +2,8 @@
 import { Lesson, Student, Teacher, Subscription, MonthlyBill, LessonStatus, HomeworkLibraryItem, HomeworkAssignment, WeeklySlot, SlotInventory, Entity, EntityPermission } from '../types';
 import { mockData } from './mockApi';
 import { AIRTABLE_CONFIG } from '../config/airtable';
-import { getChargesReport, createMonthlyCharges, CreateMonthlyChargesResult, discoverChargeTableSchema, ChargeTableSchema, getChargesReportKPIs, ChargesReportKPIs } from './billingService';
+import { getChargesReport, createMonthlyCharges, CreateMonthlyChargesResult, recalculateBill, RecalculateBillResult, discoverChargeTableSchema, ChargeTableSchema, getChargesReportKPIs, ChargesReportKPIs } from './billingService';
+import { getBillingBreakdown, BillingBreakdown } from './billingDetailsService';
 import { airtableClient } from './airtableClient';
 
 // Cache for table schema to avoid redundant discovery calls
@@ -273,6 +274,23 @@ function mapAirtableToLesson(record: any): Lesson {
     studentIdFromFullName = fullNameValue;
   }
   
+  // Extract teacherId from teacher_id linked record (Airtable returns array of rec IDs)
+  const teacherIdField = getField('lessons', 'teacher_id');
+  const teacherIdRaw = fields[teacherIdField];
+  const teacherId = Array.isArray(teacherIdRaw) && teacherIdRaw.length > 0
+    ? (typeof teacherIdRaw[0] === 'string' ? teacherIdRaw[0] : teacherIdRaw[0]?.id || '')
+    : (typeof teacherIdRaw === 'string' ? teacherIdRaw : '');
+
+  // Map lesson_type from Hebrew to English (Airtable: "פרטי","זוגי","קבוצתי" -> "private","pair","group")
+  const lessonTypeField = getField('lessons', 'lesson_type');
+  const lessonTypeRaw = (fields[lessonTypeField] || '').trim();
+  const lessonTypeMap: Record<string, string> = {
+    'פרטי': 'private',
+    'זוגי': 'pair',
+    'קבוצתי': 'group',
+  };
+  const lessonType = lessonTypeMap[lessonTypeRaw] || lessonTypeRaw || 'private';
+
   const mappedLesson = {
     id: record.id,
     studentId: studentIdFromFullName || 
@@ -280,7 +298,7 @@ function mapAirtableToLesson(record: any): Lesson {
               fields['Student']?.[0]?.id || 
               '',
     studentName: studentName,
-    teacherId: fields['Teacher_ID'] || fields['Teacher']?.[0]?.id || '',
+    teacherId: teacherId,
     teacherName: fields['Teacher_Name'] || fields['Teacher']?.[0]?.name || '',
     date: date,
     startTime: startTime,
@@ -289,8 +307,8 @@ function mapAirtableToLesson(record: any): Lesson {
     subject: fields['Subject'] || fields['subject'] || 'מתמטיקה',
     isChargeable: fields['Is_Chargeable'] !== false,
     chargeReason: fields['Charge_Reason'] || fields['charge_reason'],
-    isPrivate: fields['Is_Private'] !== false,
-    lessonType: fields['Lesson_Type'] || fields['lesson_type'] || 'private',
+    isPrivate: lessonType === 'private',
+    lessonType: lessonType as 'private' | 'pair' | 'group',
     notes: lessonDetails, // Use 'פרטי השיעור' as primary notes field
     paymentStatus: fields['Payment_Status'] || fields['payment_status'],
     attendanceConfirmed: fields['Attendance_Confirmed'] || false,
@@ -401,6 +419,36 @@ function mapLessonToAirtable(lesson: Partial<Lesson>): any {
   if (lesson.price !== undefined) {
     const priceField = getField('lessons', 'price');
     fields[priceField] = Math.round(lesson.price * 100) / 100;
+  }
+
+  // Teacher link - when provided (use same format as createLesson)
+  if (lesson.teacherId !== undefined && lesson.teacherId && lesson.teacherId.startsWith('rec')) {
+    const teacherFieldName = getField('lessons', 'teacher_id');
+    fields[teacherFieldName] = [lesson.teacherId];
+  }
+
+  // Lesson type - map English to Hebrew for Airtable (same as createLesson)
+  if (lesson.lessonType !== undefined && lesson.lessonType) {
+    const lessonTypeField = getField('lessons', 'lesson_type');
+    const typeMap: Record<string, string> = {
+      'private': 'פרטי',
+      'pair': 'זוגי',
+      'group': 'קבוצתי',
+    };
+    const hebrewType = typeMap[lesson.lessonType] || lesson.lessonType;
+    fields[lessonTypeField] = hebrewType;
+  }
+
+  // Duration - when provided
+  if (lesson.duration !== undefined) {
+    const durationField = getField('lessons', 'duration');
+    fields[durationField] = lesson.duration;
+  }
+
+  // Notes (פרטי השיעור) - when provided
+  if (lesson.notes !== undefined) {
+    const lessonDetailsField = getField('lessons', 'פרטי_השיעור' as any);
+    fields[lessonDetailsField] = lesson.notes;
   }
 
   // Student link (same field and format as createLesson) - only when provided so we don't overwrite on status-only updates (e.g. cancel)
@@ -1632,10 +1680,29 @@ export const nexusApi = {
       'canceled': 1,
     };
     
+    // Helper: normalize natural key to canonical pipe-separated format
+    // Handles legacy underscore-separated keys: teacherId_YYYY-MM-DD_HH:mm -> teacherId|YYYY-MM-DD|HH:mm
+    const normalizeNK = (key: string): string => {
+      if (!key) return key;
+      if (key.includes('|')) return key;
+      const lastUnderscore = key.lastIndexOf('_');
+      if (lastUnderscore === -1) return key;
+      const startTime = key.substring(lastUnderscore + 1);
+      const rest = key.substring(0, lastUnderscore);
+      const secondLastUnderscore = rest.lastIndexOf('_');
+      if (secondLastUnderscore === -1) return key;
+      const dateStr = rest.substring(secondLastUnderscore + 1);
+      const teacherId = rest.substring(0, secondLastUnderscore);
+      if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr) && /^\d{2}:\d{2}$/.test(startTime)) {
+        return `${teacherId}|${dateStr}|${startTime}`;
+      }
+      return key;
+    };
+    
     // Helper to get dedupe key for a slot
     const getDedupeKey = (slot: SlotInventory & { naturalKey?: string }): string => {
       if (slot.naturalKey && slot.naturalKey.trim() !== '') {
-        return `natural_key:${slot.naturalKey}`;
+        return `natural_key:${normalizeNK(slot.naturalKey)}`;
       }
       const teacherId = slot.teacherId || 'none';
       return `composite:${slot.date}|${slot.startTime}|${slot.endTime}|${teacherId}`;
@@ -2050,6 +2117,46 @@ export const nexusApi = {
       fields.is_locked = (updates as any).isLocked ? 1 : 0;
     }
     
+    // AUTO-RECOMPUTE natural_key when key-forming fields change (startTime, date, teacherId)
+    // This prevents stale natural_keys after edits, which would cause duplicate records on next sync/rollover
+    const keyFieldsChanging = updates.startTime !== undefined || updates.date !== undefined || (updates as any).lessonDate !== undefined || updates.teacherId !== undefined;
+    const hasExplicitNaturalKey = (updates as any).naturalKey !== undefined;
+    
+    if (keyFieldsChanging && !hasExplicitNaturalKey) {
+      try {
+        // Fetch current record to get non-changing components
+        const currentRecord = await airtableRequest<{ id: string; fields: any }>(`/${tableId}/${id}`);
+        const currentFields = currentRecord.fields || {};
+        const currentTeacherIdVal = currentFields[teacherIdField];
+        const currentTeacherId = Array.isArray(currentTeacherIdVal)
+          ? (typeof currentTeacherIdVal[0] === 'string' ? currentTeacherIdVal[0] : currentTeacherIdVal[0]?.id || '')
+          : (typeof currentTeacherIdVal === 'string' ? currentTeacherIdVal : currentTeacherIdVal?.id || '');
+        const currentDate = currentFields[getField('slotInventory', 'תאריך_שיעור')] || '';
+        const currentStartTime = currentFields[getField('slotInventory', 'שעת_התחלה')] || '';
+        
+        // Use updated values where provided, fall back to current
+        const finalTeacherId = updates.teacherId || currentTeacherId;
+        const finalDate = updates.date || (updates as any).lessonDate || currentDate;
+        const finalStartTime = updates.startTime || currentStartTime;
+        
+        if (finalTeacherId && finalDate && finalStartTime) {
+          const { generateNaturalKeyFromStrings } = await import('./dateUtils');
+          const newNaturalKey = generateNaturalKeyFromStrings(finalTeacherId, finalDate, finalStartTime);
+          fields.natural_key = newNaturalKey;
+          
+          if (import.meta.env?.DEV) {
+            const oldNaturalKey = currentFields.natural_key || '';
+            if (oldNaturalKey !== newNaturalKey) {
+              console.log(`[updateSlotInventory] natural_key updated: "${oldNaturalKey}" -> "${newNaturalKey}"`);
+            }
+          }
+        }
+      } catch (nkError: any) {
+        // Don't fail the update if natural_key recomputation fails - log and continue
+        console.warn(`[updateSlotInventory] Failed to recompute natural_key:`, nkError);
+      }
+    }
+    
     // Update record in Airtable
     // Use typecast: true to allow Airtable to automatically add new options to Single Select fields
     // This enables adding new time values like "18:05" to the select field options
@@ -2162,6 +2269,45 @@ export const nexusApi = {
     
     console.log(`[nexusApi] Updated slot inventory ${id}`);
     return updatedInventory;
+  },
+
+  /**
+   * Create a new one-time slot inventory record (exception/ad-hoc availability).
+   * Used when manually creating availability outside the weekly template system.
+   */
+  createSlotInventory: async (params: {
+    teacherId: string;
+    date: string; // YYYY-MM-DD
+    startTime: string; // HH:mm
+    endTime: string; // HH:mm
+    type?: 'private' | 'group' | 'pair';
+    status?: string; // Default: 'open'
+  }): Promise<SlotInventory> => {
+    if (!params.teacherId || !params.date || !params.startTime || !params.endTime) {
+      throw { message: 'Missing required fields: teacherId, date, startTime, endTime', code: 'VALIDATION_ERROR', status: 400 };
+    }
+    
+    const { createSlotInventory: createSlotInventorySvc } = await import('./slotManagementService');
+    const { generateNaturalKeyFromStrings } = await import('./dateUtils');
+    
+    const naturalKey = generateNaturalKeyFromStrings(params.teacherId, params.date, params.startTime);
+    
+    // Map English type to Hebrew for Airtable
+    const typeMap: Record<string, string> = {
+      'private': 'פרטי',
+      'pair': 'זוגי',
+      'group': 'קבוצתי',
+    };
+    
+    return createSlotInventorySvc({
+      natural_key: naturalKey,
+      teacherId: params.teacherId,
+      date: new Date(params.date + 'T00:00:00'),
+      startTime: params.startTime,
+      endTime: params.endTime,
+      type: params.type ? (typeMap[params.type] || params.type) : undefined,
+      status: params.status || 'open',
+    });
   },
 
   deleteSlotInventory: async (id: string): Promise<void> => {
@@ -2461,13 +2607,14 @@ export const nexusApi = {
 
         // Calculate amounts correctly
         const adjustmentAmount = typeof row.manualAdjustmentAmount === 'number' ? row.manualAdjustmentAmount : 0;
+        const cancellationsAmount = typeof row.cancellationsAmount === 'number' ? row.cancellationsAmount : 0;
         let subscriptionsAmount = typeof row.subscriptionsAmount === 'number' ? row.subscriptionsAmount : 0;
         let lessonsAmount = typeof row.lessonsAmount === 'number' ? row.lessonsAmount : 0;
         let totalAmount = typeof row.totalAmount === 'number' ? row.totalAmount : 0;
 
-        // Only fill total when missing; do not swap total vs subscriptions (total is from "כולל מע\"מ ומנויים (from תלמיד)")
-        if (totalAmount === 0 && (subscriptionsAmount !== 0 || lessonsAmount !== 0)) {
-          totalAmount = subscriptionsAmount + lessonsAmount + adjustmentAmount;
+        // Only fill total when missing (total from total_amount; include all components per subscription logic)
+        if (totalAmount === 0 && (subscriptionsAmount !== 0 || lessonsAmount !== 0 || cancellationsAmount !== 0)) {
+          totalAmount = lessonsAmount + subscriptionsAmount + cancellationsAmount + adjustmentAmount;
         }
 
         // Build line items
@@ -2508,6 +2655,7 @@ export const nexusApi = {
           lessonsAmount,
           lessonsCount: row.lessonsCount,
           subscriptionsAmount,
+          cancellationsAmount: row.cancellationsAmount,
           adjustmentAmount,
           totalAmount,
           status,
@@ -2548,6 +2696,10 @@ export const nexusApi = {
       // Return empty array or fallback to mock
       return mockData.getMonthlyBills(month);
     }
+  },
+
+  getBillingBreakdown: async (studentId: string, month: string): Promise<BillingBreakdown> => {
+    return getBillingBreakdown(airtableClient, studentId, month);
   },
 
   updateBillStatus: async (billId: string, fields: { approved?: boolean; linkSent?: boolean; paid?: boolean }): Promise<void> => {
@@ -3487,6 +3639,13 @@ export const nexusApi = {
     }
     
     return await createMonthlyCharges(airtableClient, billingMonth);
+  },
+
+  recalculateBill: async (studentId: string, billingMonth: string): Promise<RecalculateBillResult> => {
+    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
+      throw new Error('Airtable API Key or Base ID not configured');
+    }
+    return await recalculateBill(airtableClient, studentId, billingMonth);
   },
 
   updateBillAdjustment: async (billId: string, adjustment: { amount: number; reason: string }): Promise<void> => {

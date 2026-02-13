@@ -6,7 +6,7 @@
  */
 
 import type { AirtableClient } from './airtableClient';
-import { TABLES, FIELDS } from '../contracts/fieldMap';
+import { TABLES, FIELDS, getField } from '../contracts/fieldMap';
 
 // --- Types (output of getBillingBreakdown) ---
 
@@ -140,10 +140,13 @@ export async function getBillingBreakdown(
     totals: { lessonsTotal: 0, subscriptionsTotal: 0, cancellationsTotal: null },
   };
 
-  // --- A) Lessons: billing_month = monthKey AND student link contains studentId ---
+  // --- A) Lessons: billing_month = monthKey OR start_datetime in month range ---
   const lessonsTableId = TABLES.lessons.id;
-  // Make filter more flexible to handle both YYYY-MM and YYYY-MM-DD
-  const lessonsFilter = `OR({${L.billing_month}} = "${monthKey}", FIND("${monthKey}", {${L.billing_month}}) = 1)`;
+  // Filter by billing_month (text match) OR start_datetime date range (fallback)
+  const startDateStr = `${monthKey}-01`;
+  const lastDay = new Date(year, month, 0).getDate();
+  const endDateStr = `${monthKey}-${String(lastDay).padStart(2, '0')}`;
+  const lessonsFilter = `OR({${L.billing_month}} = "${monthKey}", FIND("${monthKey}", {${L.billing_month}}) = 1, AND(IS_AFTER({${L.start_datetime}}, "${startDateStr}"), IS_BEFORE({${L.start_datetime}}, "${endDateStr}T23:59:59")))`;
   let lessonsRaw: Array<{ id: string; fields: Record<string, unknown> }> = [];
   try {
     lessonsRaw = await client.getRecords(lessonsTableId, {
@@ -178,20 +181,49 @@ export async function getBillingBreakdown(
 
   const lessons: BreakdownLesson[] = [];
   let lessonsTotal = 0;
+  const lessonsStudentField = getField('lessons', 'full_name');
   for (const r of lessonsRaw) {
     const f = r.fields;
-    const studentIds = linkedRecordIds(f[L.full_name]);
+    const rawStudentLink = f[lessonsStudentField] ?? (f as Record<string, unknown>)['Student'];
+    const studentIds = linkedRecordIds(rawStudentLink);
     if (!studentIds.includes(studentId)) continue;
+    // Application-level month check (double-check Airtable filter results)
+    const billingMonthVal = f[L.billing_month] ? String(f[L.billing_month]) : '';
+    const lessonDatetime = f[L.start_datetime] ? String(f[L.start_datetime]) : '';
+    let belongsToMonth = false;
+    if (billingMonthVal === monthKey || billingMonthVal.substring(0, 7) === monthKey) {
+      belongsToMonth = true;
+    }
+    if (!belongsToMonth && lessonDatetime) {
+      const lessonDate = new Date(lessonDatetime);
+      if (lessonDate >= monthStart && lessonDate <= monthEndInclusive) {
+        belongsToMonth = true;
+      }
+    }
+    if (!belongsToMonth) continue;
     const dateVal = f[L.lesson_date] ?? f[L.start_datetime];
     const date = dateVal ? String(dateVal).split('T')[0] : '';
     let lineAmount = parseAmount(f[L.line_amount] as string | number);
     const lessonType = String(f[L.lesson_type] ?? '').toLowerCase().trim();
     const isPair = lessonType === 'pair' || lessonType === 'זוגי';
     const isGroup = lessonType === 'group' || lessonType === 'קבוצתי';
+    const isPrivate = lessonType === 'private' || lessonType === 'פרטי';
+    // Private: prefer price (manual override by Raz), then line_amount (formula), then 175
+    // MUST match billingRules.ts which checks price FIRST (price > line_amount > 175)
+    if (isPrivate) {
+      const manualPrice = parseAmount(f[L.price] as string | number);
+      if (manualPrice > 0) {
+        lineAmount = manualPrice;
+      } else if (lineAmount <= 0) {
+        lineAmount = 175;
+      }
+    }
+    // Pair: line_amount, then price/2, then 112.5
     if (lineAmount <= 0 && isPair) {
       const totalPrice = parseAmount(f[L.price] as string | number);
-      if (totalPrice > 0) lineAmount = Math.round((totalPrice / 2) * 100) / 100;
+      lineAmount = totalPrice > 0 ? Math.round((totalPrice / 2) * 100) / 100 : 112.5;
     }
+    // Group: line_amount, then 120
     if (lineAmount <= 0 && isGroup) {
       lineAmount = 120;
     }
@@ -203,7 +235,9 @@ export async function getBillingBreakdown(
     lessons.push({
       date,
       type: String(f[L.lesson_type] ?? ''),
-      unitPrice: parseAmount(f[L.unit_price] as string | number) || (isPair || isGroup ? lineAmount : 0),
+      unitPrice: isPrivate
+        ? (parseAmount(f[L.price] as string | number) || parseAmount(f[L.unit_price] as string | number) || lineAmount)
+        : (parseAmount(f[L.unit_price] as string | number) || (isPair || isGroup ? lineAmount : 0)),
       lineAmount,
       status: String(f[L.status] ?? ''),
     });
@@ -234,9 +268,11 @@ export async function getBillingBreakdown(
   }
 
   const paidCancellations: PaidCancellation[] = [];
+  const cancellationsStudentField = getField('cancellations', 'student');
   for (const r of cancellationsRaw) {
     const f = r.fields;
-    const linkId = extractLinkedId(f[C.student]);
+    const rawStudentLink = f[cancellationsStudentField] ?? (f as Record<string, unknown>)['student'];
+    const linkId = extractLinkedId(rawStudentLink);
     if (linkId !== studentId) continue;
     const lessonLink = f[C.lesson];
     const linkedLessonId = extractLinkedId(lessonLink) ?? undefined;
@@ -265,9 +301,11 @@ export async function getBillingBreakdown(
 
   const subscriptions: BreakdownSubscription[] = [];
   let subscriptionsTotal = 0;
+  const subsStudentField = getField('subscriptions', 'student_id');
   for (const r of subsRaw) {
     const f = r.fields;
-    const linkId = extractLinkedId(f[S.student_id]);
+    const rawStudentLink = f[subsStudentField] ?? (f as Record<string, unknown>)['student_id'];
+    const linkId = extractLinkedId(rawStudentLink);
     if (import.meta.env.DEV && subsRaw.length > 0) {
       console.log('[getBillingBreakdown] Checking subscription', {
         subId: r.id,
@@ -327,6 +365,7 @@ export async function getBillingBreakdown(
       cancellationsTotal: null,
     },
   };
+
 
   if (import.meta.env.DEV) {
     console.log('[getBillingBreakdown] Result', {

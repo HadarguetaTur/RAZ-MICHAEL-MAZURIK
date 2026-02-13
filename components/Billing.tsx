@@ -1,13 +1,12 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect } from 'react';
 import { MonthlyBill, BillLineItem } from '../types';
 import { nexusApi, parseApiError } from '../services/nexusApi';
-import { getBillingBreakdown, BillingBreakdown } from '../services/billingDetailsService';
+import { BillingBreakdown } from '../services/billingDetailsService';
 import { ChargesReportKPIs } from '../services/billingService';
 import { getMonthlyBills, getBillingKPIs } from '../data/resources/billing';
 import { updateBillStatus, createMonthlyCharges as createMonthlyChargesMutation, updateBillAdjustment, deleteBill as deleteBillMutation } from '../data/mutations';
 import { generateBillingPdf } from '../services/pdfGenerator';
 import { openWhatsApp, normalizePhoneToE164 } from '../services/whatsappUtils';
-import { AirtableClient } from '../services/airtableClient';
 import { useToast } from '../hooks/useToast';
 import { useConfirmDialog } from '../hooks/useConfirmDialog';
 
@@ -27,8 +26,11 @@ const Billing: React.FC = () => {
   const [savingAdjustment, setSavingAdjustment] = useState(false);
   const [billingDetails, setBillingDetails] = useState<BillingBreakdown | null>(null);
   const [loadingDetails, setLoadingDetails] = useState(false);
+  /** Cache breakdowns by billId so table shows correct total even when drawer is closed */
+  const [breakdownsCache, setBreakdownsCache] = useState<Record<string, BillingBreakdown>>({});
   const [updatingIds, setUpdatingIds] = useState<Set<string>>(new Set());
   const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set());
+  const [recalculatingBillId, setRecalculatingBillId] = useState<string | null>(null);
   const [kpis, setKpis] = useState<ChargesReportKPIs | null>(null);
   const [loadingKpis, setLoadingKpis] = useState(false);
 
@@ -56,6 +58,19 @@ const Billing: React.FC = () => {
         {labels[status] || status}
       </span>
     );
+  };
+
+  /** Display total: use cached or current billingDetails (with subscription logic) when available, else table value */
+  const getDisplayTotal = (bill: MonthlyBill): number => {
+    const breakdown = billingDetails && bill.id === selectedBill?.id ? billingDetails : breakdownsCache[bill.id];
+    if (breakdown) {
+      const computedTotal = breakdown.totals.lessonsTotal +
+        breakdown.totals.subscriptionsTotal +
+        (bill.cancellationsAmount || 0) +
+        (bill.manualAdjustmentAmount || 0);
+      return computedTotal;
+    }
+    return bill.totalAmount;
   };
 
   const StatusCheckbox = ({ 
@@ -123,17 +138,8 @@ const Billing: React.FC = () => {
     }
   }, []);
 
-  // Initialize AirtableClient for billing details
-  const airtableClient = useMemo(() => {
-    try {
-      return new AirtableClient();
-    } catch (error) {
-      console.warn('[Billing] AirtableClient initialization failed:', error);
-      return null;
-    }
-  }, []);
-
   useEffect(() => {
+    setBreakdownsCache({});
     loadBills();
     loadKPIs();
   }, [selectedMonth, statusFilter, searchTerm]);
@@ -247,49 +253,32 @@ const Billing: React.FC = () => {
         });
     }
 
-    if (airtableClient) {
-      setLoadingDetails(true);
-      try {
-        const breakdown = await getBillingBreakdown(airtableClient, bill.studentId, bill.month);
-        setBillingDetails(breakdown);
+    setLoadingDetails(true);
+    try {
+      const breakdown = await nexusApi.getBillingBreakdown(bill.studentId, bill.month);
+      setBillingDetails(breakdown);
+      setBreakdownsCache(prev => ({ ...prev, [bill.id]: breakdown }));
 
-        if (import.meta.env.DEV) {
-          console.log('[Billing] Loaded billingDetails breakdown', {
-            billId: bill.id,
-            studentId: bill.studentId,
-            month: bill.month,
-            fromRow: {
-              lessonsAmount: bill.lessonsAmount,
-              subscriptionsAmount: bill.subscriptionsAmount,
-              totalAmount: bill.totalAmount,
-              manualAdjustmentAmount: bill.manualAdjustmentAmount,
-            },
-            breakdownTotals: breakdown?.totals || null,
-            lessonsCount: breakdown?.lessons.length ?? 0,
-            subscriptionsCount: breakdown?.subscriptions.length ?? 0,
-            paidCancellationsCount: breakdown?.paidCancellations.length ?? 0,
-            breakdown: breakdown,
-          });
-        }
-      } catch (error) {
-        console.error('[Billing] Failed to load billing details:', error);
-        // Continue without details - fail-open, fallback to lineItems
-        // Set empty breakdown to show fallback UI
-        setBillingDetails({
-          lessons: [],
-          subscriptions: [],
-          paidCancellations: [],
-          totals: {
-            lessonsTotal: 0,
-            subscriptionsTotal: 0,
-            cancellationsTotal: null,
+      if (import.meta.env.DEV) {
+        console.log('[Billing] Loaded billingDetails breakdown', {
+          billId: bill.id,
+          studentId: bill.studentId,
+          month: bill.month,
+          fromRow: {
+            lessonsAmount: bill.lessonsAmount,
+            subscriptionsAmount: bill.subscriptionsAmount,
+            totalAmount: bill.totalAmount,
+            manualAdjustmentAmount: bill.manualAdjustmentAmount,
           },
+          breakdownTotals: breakdown?.totals || null,
+          lessonsCount: breakdown?.lessons.length ?? 0,
+          subscriptionsCount: breakdown?.subscriptions.length ?? 0,
+          paidCancellationsCount: breakdown?.paidCancellations.length ?? 0,
         });
-      } finally {
-        setLoadingDetails(false);
       }
-    } else {
-      // If no airtableClient, set empty breakdown to show fallback
+    } catch (error) {
+      console.error('[Billing] Failed to load billing details:', error);
+      toast.error('לא ניתן לטעון את פירוט החיוב. נסו שוב או רעננו את העמוד.');
       setBillingDetails({
         lessons: [],
         subscriptions: [],
@@ -300,6 +289,8 @@ const Billing: React.FC = () => {
           cancellationsTotal: null,
         },
       });
+    } finally {
+      setLoadingDetails(false);
     }
   };
 
@@ -347,20 +338,24 @@ const Billing: React.FC = () => {
               }
             : undefined,
         totals: {
-          lessonsTotal: selectedBill.lessonsAmount || billingDetails.totals.lessonsTotal || 0,
-          // Subscriptions total should align with "כולל מע"מ ומנויים (from תלמיד)"
-          subscriptionsTotal: selectedBill.subscriptionsAmount || billingDetails.totals.subscriptionsTotal || 0,
-          cancellationsTotal: billingDetails.totals.cancellationsTotal,
+          lessonsTotal: billingDetails.totals.lessonsTotal,
+          subscriptionsTotal: billingDetails.totals.subscriptionsTotal,
+          cancellationsTotal: billingDetails.totals.cancellationsTotal ?? selectedBill.cancellationsAmount ?? 0,
           manualAdjustmentTotal: selectedBill.manualAdjustmentAmount || 0,
-          // Grand total is always the table total from charges
-          grandTotal: selectedBill.totalAmount || 0,
+          // Grand total: same calculation as summary (prefer billingDetails for consistency)
+          grandTotal:
+            billingDetails.totals.lessonsTotal +
+            billingDetails.totals.subscriptionsTotal +
+            (billingDetails.totals.cancellationsTotal ?? selectedBill.cancellationsAmount ?? 0) +
+            (selectedBill.manualAdjustmentAmount || 0),
         },
       };
 
+      const pdfGrandTotal = sanitizedBreakdown.totals.grandTotal;
       const blob = await generateBillingPdf(
         selectedBill.studentName || '',
         selectedBill.month || '',
-        selectedBill.totalAmount || 0,
+        pdfGrandTotal,
         sanitizedBreakdown
       );
 
@@ -388,7 +383,7 @@ const Billing: React.FC = () => {
     // 2. Prepare WhatsApp message (with payment link)
     const paymentLink = import.meta.env.VITE_PAYMENT_LINK || 'https://pay.grow.link/0caae66323d44f2feb12b471e167be5a-Mjk5ODA4OQ';
     const parentName = selectedBill.parentName || selectedBill.studentName;
-    const totalAmount = selectedBill.totalAmount;
+    const totalAmount = getDisplayTotal(selectedBill);
     const phone = selectedBill.parentPhone;
 
     const message = `היי ${parentName} מצורף קישור לתשלום, ופירוט החיוב. הסכום לתשלום החודש הוא ₪${totalAmount}. קישור לתשלום: ${paymentLink} אודה להסדרת התשלום בהקדם.`;
@@ -655,7 +650,7 @@ const Billing: React.FC = () => {
                       <div className="text-[10px] text-rose-400">ביטולים: ₪{bill.cancellationsAmount}</div>
                     ) : null}
                   </td>
-                  <td className="px-6 py-5 font-black text-slate-900 text-lg">₪{bill.totalAmount}</td>
+                  <td className="px-6 py-5 font-black text-slate-900 text-lg">₪{getDisplayTotal(bill)}</td>
                   <td className="px-2 py-5 text-center">
                     <StatusCheckbox 
                       billId={bill.id} 
@@ -743,7 +738,7 @@ const Billing: React.FC = () => {
                 </div>
                 <div className="text-lg font-black text-slate-900 text-left">
                   <div className="text-[9px] text-slate-400 font-black uppercase text-left">סה"כ</div>
-                  ₪{bill.totalAmount}
+                  ₪{getDisplayTotal(bill)}
                 </div>
               </div>
             </div>
@@ -792,7 +787,7 @@ const Billing: React.FC = () => {
                  </div>
                  <div className="text-left">
                     <div className="text-[9px] md:text-[10px] text-slate-400 font-black uppercase mb-1">סה"כ</div>
-                    <div className="text-2xl md:text-4xl font-black text-slate-900 leading-none">₪{selectedBill.totalAmount}</div>
+                    <div className="text-2xl md:text-4xl font-black text-slate-900 leading-none">₪{getDisplayTotal(selectedBill)}</div>
                  </div>
               </div>
             </div>
@@ -806,7 +801,7 @@ const Billing: React.FC = () => {
                 <div className="grid grid-cols-2 gap-4">
                   <div className="bg-white p-4 rounded-xl border border-blue-50">
                     <div className="text-[9px] font-black text-slate-400 uppercase mb-1">סה&quot;כ לתשלום החודש</div>
-                    <div className="text-xl font-black text-slate-900">₪{selectedBill.totalAmount}</div>
+                    <div className="text-xl font-black text-slate-900">₪{getDisplayTotal(selectedBill)}</div>
                   </div>
                   <div className="bg-white p-4 rounded-xl border border-blue-50">
                     <div className="text-[9px] font-black text-slate-400 uppercase mb-1">שיעורים שבוצעו</div>
@@ -1171,52 +1166,91 @@ const Billing: React.FC = () => {
                     )}
                   </section>
 
-                  {/* Totals Summary - use table row as source of truth */}
+                  {/* Totals Summary - prefer billingDetails (with subscription logic) when available */}
                   <section className="p-6 bg-slate-50 rounded-2xl md:rounded-3xl border border-slate-100">
-                    <h3 className="text-xs font-black text-slate-800 mb-4">סיכום</h3>
+                    {(() => {
+                      const summaryLessons = billingDetails ? billingDetails.totals.lessonsTotal : (selectedBill.lessonsAmount || 0);
+                      const summarySubs = billingDetails ? billingDetails.totals.subscriptionsTotal : (selectedBill.subscriptionsAmount || 0);
+                      const summaryCancellations = selectedBill.cancellationsAmount || 0;
+                      const summaryAdjustment = selectedBill.manualAdjustmentAmount || 0;
+                      const summaryTotal = summaryLessons + summarySubs + summaryCancellations + summaryAdjustment;
+                      return (
+                    <>
+                    <div className="flex items-center justify-between mb-4">
+                      <h3 className="text-xs font-black text-slate-800">סיכום</h3>
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          if (!selectedBill?.studentId || !selectedBill?.month || recalculatingBillId) return;
+                          setRecalculatingBillId(selectedBill.id);
+                          try {
+                            await nexusApi.recalculateBill(selectedBill.studentId, selectedBill.month);
+                            toast.success('החיוב חושב מחדש בהצלחה');
+                            const filters = {
+                              statusFilter: statusFilter as 'all' | 'draft' | 'sent' | 'paid',
+                              searchQuery: searchTerm || undefined,
+                            };
+                            const updatedBills = await getMonthlyBills(selectedMonth, filters);
+                            setBills(updatedBills);
+                            const updated = updatedBills.find(b => b.id === selectedBill.id);
+                            if (updated) setSelectedBill(updated);
+                            await loadKPIs();
+                          } catch (err) {
+                            toast.error(parseApiError(err));
+                          } finally {
+                            setRecalculatingBillId(null);
+                          }
+                        }}
+                        disabled={!!recalculatingBillId}
+                        className="text-[10px] font-bold text-blue-600 hover:text-blue-700 px-3 py-1.5 rounded-lg hover:bg-blue-50 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {recalculatingBillId === selectedBill?.id ? 'מחשב...' : 'חשב מחדש'}
+                      </button>
+                    </div>
                     <div className="space-y-2 text-sm">
                       <div className="flex items-center justify-between">
                         <span className="text-slate-600">שיעורים:</span>
                         <span className="font-bold text-slate-800">
-                          ₪{(selectedBill.lessonsAmount || 0).toLocaleString()}
+                          ₪{summaryLessons.toLocaleString()}
                         </span>
                       </div>
                       <div className="flex items-center justify-between">
                         <span className="text-slate-600">מנויים:</span>
                         <span className="font-bold text-slate-800">
-                          ₪{(selectedBill.subscriptionsAmount || 0).toLocaleString()}
+                          ₪{summarySubs.toLocaleString()}
                         </span>
                       </div>
                       <div className="flex items-center justify-between">
                         <span className="text-slate-600">ביטולים:</span>
                         <span className="font-bold text-slate-800">
-                          ₪{(selectedBill.cancellationsAmount || 0).toLocaleString()}
+                          ₪{summaryCancellations.toLocaleString()}
                         </span>
                       </div>
-                      {selectedBill.manualAdjustmentAmount !== undefined &&
-                        selectedBill.manualAdjustmentAmount !== null &&
-                        selectedBill.manualAdjustmentAmount !== 0 && (
+                      {summaryAdjustment !== 0 && (
                           <div className="flex items-center justify-between">
                             <span className="text-slate-600">התאמה ידנית:</span>
                             <span
                               className={`font-bold ${
-                                selectedBill.manualAdjustmentAmount >= 0
+                                summaryAdjustment >= 0
                                   ? 'text-blue-800'
                                   : 'text-emerald-800'
                               }`}
                             >
-                              {selectedBill.manualAdjustmentAmount >= 0 ? '+' : ''}
-                              ₪{selectedBill.manualAdjustmentAmount}
+                              {summaryAdjustment >= 0 ? '+' : ''}
+                              ₪{summaryAdjustment}
                             </span>
                           </div>
                         )}
                       <div className="flex items-center justify-between text-lg pt-2 border-t border-slate-200">
                         <span className="font-black text-slate-900">סה&quot;כ:</span>
                         <span className="font-black text-slate-900">
-                          ₪{selectedBill.totalAmount.toLocaleString()}
+                          ₪{summaryTotal.toLocaleString()}
                         </span>
                       </div>
                     </div>
+                    </>
+                    );
+                    })()}
                   </section>
                 </>
               ) : (
@@ -1257,7 +1291,37 @@ const Billing: React.FC = () => {
 
                   {/* Totals Summary - always show, even in fallback */}
                   <section className="p-6 bg-slate-50 rounded-2xl md:rounded-3xl border border-slate-100">
-                    <h3 className="text-xs font-black text-slate-800 mb-4">סיכום</h3>
+                    <div className="flex items-center justify-between mb-4">
+                      <h3 className="text-xs font-black text-slate-800">סיכום</h3>
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          if (!selectedBill?.studentId || !selectedBill?.month || recalculatingBillId) return;
+                          setRecalculatingBillId(selectedBill.id);
+                          try {
+                            await nexusApi.recalculateBill(selectedBill.studentId, selectedBill.month);
+                            toast.success('החיוב חושב מחדש בהצלחה');
+                            const filters = {
+                              statusFilter: statusFilter as 'all' | 'draft' | 'sent' | 'paid',
+                              searchQuery: searchTerm || undefined,
+                            };
+                            const updatedBills = await getMonthlyBills(selectedMonth, filters);
+                            setBills(updatedBills);
+                            const updated = updatedBills.find(b => b.id === selectedBill.id);
+                            if (updated) setSelectedBill(updated);
+                            await loadKPIs();
+                          } catch (err) {
+                            toast.error(parseApiError(err));
+                          } finally {
+                            setRecalculatingBillId(null);
+                          }
+                        }}
+                        disabled={!!recalculatingBillId}
+                        className="text-[10px] font-bold text-blue-600 hover:text-blue-700 px-3 py-1.5 rounded-lg hover:bg-blue-50 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {recalculatingBillId === selectedBill?.id ? 'מחשב...' : 'חשב מחדש'}
+                      </button>
+                    </div>
                     <div className="space-y-2 text-sm">
                       <div className="flex items-center justify-between">
                         <span className="text-slate-600">שיעורים:</span>

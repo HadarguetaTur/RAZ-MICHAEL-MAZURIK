@@ -127,6 +127,46 @@ export function generateNaturalKey(teacherId: string, date: Date, startTime: str
     throw new Error(`generateNaturalKey: missing required parameters. teacherId=${teacherId}, startTime=${startTime}`);
   }
   const dateStr = formatDate(date);
-  return `${teacherId}_${dateStr}_${startTime}`;
+  return `${teacherId}|${dateStr}|${startTime}`;
+}
+
+/**
+ * Generate natural key from string date (no Date object needed)
+ * Format: teacherId|YYYY-MM-DD|HH:mm
+ * Matches slotSync.buildNaturalKey format
+ */
+export function generateNaturalKeyFromStrings(teacherId: string, dateStr: string, startTime: string): string {
+  if (!teacherId || !dateStr || !startTime) {
+    throw new Error(`generateNaturalKeyFromStrings: missing required parameters. teacherId=${teacherId}, dateStr=${dateStr}, startTime=${startTime}`);
+  }
+  return `${teacherId}|${dateStr}|${startTime}`;
+}
+
+/**
+ * Normalize a natural key to the canonical format (pipe-separated).
+ * Handles legacy underscore-separated keys: teacherId_YYYY-MM-DD_HH:mm -> teacherId|YYYY-MM-DD|HH:mm
+ */
+export function normalizeNaturalKey(key: string): string {
+  if (!key) return key;
+  // Legacy format used underscore separators. Detect by checking for rec..._YYYY-MM-DD_HH:mm pattern.
+  // Airtable record IDs start with 'rec' and are ~17 chars, so split on first '_' after the record ID.
+  // New format uses '|', so if it already contains '|', it's already normalized.
+  if (key.includes('|')) return key;
+  // Try to split: teacherId_YYYY-MM-DD_startTime
+  // The date part is always YYYY-MM-DD (10 chars), startTime is HH:mm (5 chars)
+  // So we split from the right: last segment is startTime, second-to-last is date, rest is teacherId
+  const lastUnderscore = key.lastIndexOf('_');
+  if (lastUnderscore === -1) return key;
+  const startTime = key.substring(lastUnderscore + 1);
+  const rest = key.substring(0, lastUnderscore);
+  const secondLastUnderscore = rest.lastIndexOf('_');
+  if (secondLastUnderscore === -1) return key;
+  const dateStr = rest.substring(secondLastUnderscore + 1);
+  const teacherId = rest.substring(0, secondLastUnderscore);
+  // Validate: date should be YYYY-MM-DD, startTime should be HH:mm
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr) && /^\d{2}:\d{2}$/.test(startTime)) {
+    return `${teacherId}|${dateStr}|${startTime}`;
+  }
+  return key;
 }
 
