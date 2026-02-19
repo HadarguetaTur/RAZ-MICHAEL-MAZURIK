@@ -24,9 +24,6 @@ export function useOpenSlotModal() {
       return;
     }
 
-    if (import.meta.env?.DEV) {
-      console.log('[useOpenSlotModal] Opening modal for slotId:', slotId, 'preloadedSlot:', preloadedSlot ? 'yes' : 'no');
-    }
 
     setActiveSlotId(slotId);
 

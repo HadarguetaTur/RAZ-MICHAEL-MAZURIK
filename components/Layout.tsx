@@ -1,5 +1,12 @@
 
 import React, { useState, useEffect } from 'react';
+import { useAuth } from '../hooks/useAuth';
+
+interface NavItem {
+  id: string;
+  label: string;
+  disabled?: boolean;
+}
 
 interface LayoutProps {
   children: React.ReactNode;
@@ -7,7 +14,7 @@ interface LayoutProps {
   setActiveTab: (tab: string) => void;
 }
 
-const NAV_ITEMS = [
+const NAV_ITEMS: NavItem[] = [
   { id: 'calendar', label: 'יומן שיעורים' },
   { id: 'dashboard', label: 'לוח בקרה' },
   { id: 'billing', label: 'חיובים ותשלומים' },
@@ -19,6 +26,7 @@ const NAV_ITEMS = [
 ];
 
 const Layout: React.FC<LayoutProps> = ({ children, activeTab, setActiveTab }) => {
+  const { user, logout } = useAuth();
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
   useEffect(() => {
@@ -42,11 +50,14 @@ const Layout: React.FC<LayoutProps> = ({ children, activeTab, setActiveTab }) =>
         {NAV_ITEMS.map((item) => (
           <button
             key={item.id}
-            onClick={() => { setActiveTab(item.id); setIsMobileMenuOpen(false); }}
+            onClick={() => { if (!item.disabled) { setActiveTab(item.id); setIsMobileMenuOpen(false); } }}
+            disabled={item.disabled}
             className={`w-full flex items-center justify-between px-4 py-3 rounded-xl transition-all duration-200 group ${
-              activeTab === item.id 
-                ? 'bg-blue-600 text-white font-bold shadow-md' 
-                : 'text-slate-500 hover:bg-slate-50 hover:text-slate-900'
+              item.disabled
+                ? 'text-slate-300 cursor-not-allowed opacity-50'
+                : activeTab === item.id 
+                  ? 'bg-blue-600 text-white font-bold shadow-md' 
+                  : 'text-slate-500 hover:bg-slate-50 hover:text-slate-900'
             }`}
           >
             <span className="text-[14px] font-semibold">{item.label}</span>
@@ -54,8 +65,18 @@ const Layout: React.FC<LayoutProps> = ({ children, activeTab, setActiveTab }) =>
         ))}
       </nav>
       
-      <div className="p-6 border-t border-slate-100 text-center shrink-0">
-        <div className="text-[10px] font-bold text-slate-300 tracking-widest uppercase">Nexus Lessons v2.0</div>
+      <div className="p-4 border-t border-slate-100 shrink-0">
+        <div className="flex items-center justify-between mb-2 px-2">
+          <span className="text-xs font-semibold text-slate-500">{user?.username || ''}</span>
+          <span className="text-[10px] font-bold text-slate-300 uppercase">{user?.role || ''}</span>
+        </div>
+        <button
+          onClick={logout}
+          className="w-full px-4 py-2 rounded-xl text-sm font-semibold text-red-500 hover:bg-red-50 transition-colors"
+        >
+          התנתק
+        </button>
+        <div className="text-[10px] font-bold text-slate-300 tracking-widest uppercase text-center mt-2">Nexus Lessons v2.0</div>
       </div>
     </div>
   );

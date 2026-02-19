@@ -9,32 +9,18 @@ const API_BASE_URL = 'https://api.airtable.com/v0';
 const MAX_RETRIES = 3;
 const INITIAL_BACKOFF_MS = 1000;
 
-// Environment variable access
+// Environment variable access — server-side only, never expose to frontend
 const getApiKey = () => {
   if (typeof process !== 'undefined' && process.env) {
-    return process.env.AIRTABLE_API_KEY || process.env.VITE_AIRTABLE_API_KEY || '';
+    return process.env.AIRTABLE_API_KEY || '';
   }
-  try {
-    // @ts-ignore
-    if (import.meta?.env) {
-      // @ts-ignore
-      return import.meta.env.VITE_AIRTABLE_API_KEY || '';
-    }
-  } catch (e) {}
   return '';
 };
 
 const getBaseId = () => {
   if (typeof process !== 'undefined' && process.env) {
-    return process.env.AIRTABLE_BASE_ID || process.env.VITE_AIRTABLE_BASE_ID || '';
+    return process.env.AIRTABLE_BASE_ID || '';
   }
-  try {
-    // @ts-ignore
-    if (import.meta?.env) {
-      // @ts-ignore
-      return import.meta.env.VITE_AIRTABLE_BASE_ID || '';
-    }
-  } catch (e) {}
   return '';
 };
 

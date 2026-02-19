@@ -72,7 +72,7 @@ export function buildConflictSummary(conflicts: ConflictItem[]): string {
 }
 
 const CANCELLED_STATUS = LessonStatus.CANCELLED; // 'בוטל' — from existing code
-const PENDING_CANCEL_STATUS = LessonStatus.PENDING_CANCEL; // 'ממתין לאישור ביטול' — from existing code
+const CANCELLED_BY_ADMIN_STATUS = LessonStatus.CANCELLED_BY_ADMIN; // 'בוטל ע"י מנהל'
 
 function toISO(date: string, timeOrIso: string): string {
   const s = String(timeOrIso).trim();
@@ -86,8 +86,8 @@ function lessonToInterval(
   excludeRecordId?: string,
   excludeLinkedLessonIds?: string[]
 ): ExistingInterval | null {
-  // Exclude cancelled lessons: 'בוטל' (CANCELLED) and 'ממתין לאישור ביטול' (PENDING_CANCEL)
-  if (l.status === CANCELLED_STATUS || l.status === PENDING_CANCEL_STATUS) return null;
+  // Exclude cancelled lessons: 'בוטל' (CANCELLED) and 'בוטל ע"י מנהל' (CANCELLED_BY_ADMIN)
+  if (l.status === CANCELLED_STATUS || l.status === CANCELLED_BY_ADMIN_STATUS) return null;
   
   // PART 4A: Exclude self if editing existing lesson
   if (excludeRecordId && l.id === excludeRecordId) return null;

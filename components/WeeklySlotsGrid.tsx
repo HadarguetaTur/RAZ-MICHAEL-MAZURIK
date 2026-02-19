@@ -20,12 +20,13 @@ type OneTimeModeProps = {
   mode: 'onetime';
   slots: SlotInventory[];
   weekStart: string;
-  students?: Student[]; // For reservation modal
+  students?: Student[];
   onSlotEdit?: (slot: SlotInventory) => void;
-  onSlotDelete?: (slot: SlotInventory) => void;
+  onSlotDelete?: (slotId: string) => void;
   onSlotToggleStatus?: (slot: SlotInventory) => void;
-  onReserveSlot?: (slotId: string) => void; // Changed: now just opens modal, doesn't reserve directly
-  onAddSlot?: never;
+  onSlotBlock?: (slotId: string) => void;
+  onReserveSlot?: (slotId: string) => void;
+  onAddSlot?: (dayIdx: number) => void;
 };
 
 type WeeklySlotsGridProps = WeeklyModeProps | OneTimeModeProps;
@@ -37,16 +38,16 @@ const WeeklySlotsGrid: React.FC<WeeklySlotsGridProps> = (props) => {
     students,
     onSlotEdit,
     onSlotDelete,
-    onSlotBlock,
     onSlotToggleStatus,
     onAddSlot,
-    onReserveSlot,
-  } = props as WeeklyModeProps & OneTimeModeProps;
+  } = props;
+  const onSlotBlock = 'onSlotBlock' in props ? props.onSlotBlock : undefined;
+  const onReserveSlot = 'onReserveSlot' in props ? props.onReserveSlot : undefined;
 
   const isWeeklyMode = mode === 'weekly';
 
   const renderSlotCard = (slot: WeeklySlot | SlotInventory) => {
-    const isWeeklySlot = 'dayOfWeek' in slot;
+    const isWeeklySlot = !('date' in slot);
 
     if (isWeeklySlot) {
       const weeklySlot = slot as WeeklySlot;
@@ -152,21 +153,6 @@ const WeeklySlotsGrid: React.FC<WeeklySlotsGridProps> = (props) => {
                 <button
                   onClick={() => {
                     // STEP 1: Trace click event
-                    if (import.meta.env.DEV) {
-                      console.log('[EDIT_CLICK]', {
-                        slotId: weeklySlot.id,
-                        dayOfWeek: weeklySlot.dayOfWeek,
-                        teacherId: weeklySlot.teacherId,
-                        teacherName: weeklySlot.teacherName,
-                        startTime: weeklySlot.startTime,
-                        endTime: weeklySlot.endTime,
-                        type: weeklySlot.type,
-                        reservedForIds: weeklySlot.reservedForIds?.length || 0,
-                        reservedFor: weeklySlot.reservedFor ? 1 : 0,
-                        isFixed: weeklySlot.isFixed,
-                        fullSlot: weeklySlot,
-                      });
-                    }
                     onSlotEdit(weeklySlot);
                   }}
                   className="text-[10px] font-black text-blue-600 underline"
@@ -207,8 +193,8 @@ const WeeklySlotsGrid: React.FC<WeeklySlotsGridProps> = (props) => {
         isBlocked={isBlocked}
         slotStudents={slotStudents}
         onReserveSlot={onReserveSlot}
-        onSlotEdit={onSlotEdit}
-        onSlotDelete={onSlotDelete}
+        onSlotEdit={onSlotEdit as ((slot: SlotInventory) => void) | undefined}
+        onSlotDelete={onSlotDelete as ((slotId: string) => void) | undefined}
         onSlotBlock={onSlotBlock}
       />
     );
@@ -247,7 +233,7 @@ const WeeklySlotsGrid: React.FC<WeeklySlotsGridProps> = (props) => {
             <div className="space-y-3">
               {daySlots.map(renderSlotCard)}
 
-              {isWeeklyMode && onAddSlot && (
+              {onAddSlot && (
                 <button
                   onClick={() => onAddSlot(dayIdx)}
                   className="w-full py-4 border-2 border-dashed border-slate-200 rounded-2xl flex flex-col items-center justify-center gap-1 group hover:border-blue-300 hover:bg-blue-50/30 transition-all"
@@ -373,9 +359,6 @@ const SlotInventoryCard: React.FC<{
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
-                      if (import.meta.env?.DEV) {
-                        console.log('[SlotInventoryCard] Reserve button clicked:', slot.id);
-                      }
                       onReserveSlot(slot.id);
                     }}
                     className="text-[10px] font-black text-teal-600 hover:text-teal-700 underline transition-colors"

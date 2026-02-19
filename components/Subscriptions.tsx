@@ -111,9 +111,6 @@ const Subscriptions: React.FC = () => {
   const resolveStudentName = (subscription: Subscription): string => {
     // 1. Try lookup field first (if present and non-empty)
     if (subscription.fullName && subscription.fullName.trim() !== '') {
-      if (import.meta.env.DEV) {
-        console.log(`[Subscriptions] Using lookup field for subscription ${subscription.id}: "${subscription.fullName}"`);
-      }
       return subscription.fullName;
     }
 
@@ -141,18 +138,12 @@ const Subscriptions: React.FC = () => {
         // Try cache map first (most efficient)
         const cachedName = studentsByIdMap.get(studentId);
         if (cachedName) {
-          if (import.meta.env.DEV) {
-            console.log(`[Subscriptions] Found student name in cache for ${studentId}: "${cachedName}"`);
-          }
           return cachedName;
         }
         
         // Fallback to getStudentById (in case cache hasn't loaded yet)
         const student = getStudentById(studentId);
         if (student?.name) {
-          if (import.meta.env.DEV) {
-            console.log(`[Subscriptions] Found student via getStudentById for ${studentId}: "${student.name}"`);
-          }
           return student.name;
         }
         // Fallback: name fetched by record ID when not in bulk cache
@@ -162,9 +153,6 @@ const Subscriptions: React.FC = () => {
         // Try to refresh students cache if not already loading this student
         // This helps in case the student was added after initial load
         if (!loadingStudentIds.has(studentId) && !isLoadingStudents) {
-          if (import.meta.env.DEV) {
-            console.log(`[Subscriptions] Student ${studentId} not found in cache, attempting to refresh students...`);
-          }
           setLoadingStudentIds(prev => new Set(prev).add(studentId));
           refreshStudents().finally(() => {
             setLoadingStudentIds(prev => {

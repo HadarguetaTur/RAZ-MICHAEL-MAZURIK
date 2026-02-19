@@ -44,9 +44,6 @@ export async function validateConflicts(
   params: ValidationParams
 ): Promise<ConflictValidationResult> {
   const { teacherId, date, startTime, endTime, excludeLessonId, excludeSlotId } = params;
-  // #region agent log
-  fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'conflictValidationService.ts:46',message:'validateConflicts: entry',data:{teacherId,date,startTime,endTime,excludeLessonId,excludeSlotId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
-  // #endregion
   
   // Calculate time range
   const startISO = toISO(date, startTime);
@@ -60,25 +57,16 @@ export async function validateConflicts(
   } else {
     endISO = toISO(date, endTime);
   }
-  // #region agent log
-  fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'conflictValidationService.ts:59',message:'validateConflicts: calculated time range',data:{startISO,endISO,date,startTime,endTime},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
-  // #endregion
 
   // Fetch lessons and open slots for the same teacher and date
   // If teacherId is undefined, check all teachers (no filter)
   const dayStartISO = new Date(`${date}T00:00:00`).toISOString();
   const dayEndISO = new Date(`${date}T23:59:59.999`).toISOString();
-  // #region agent log
-  fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'conflictValidationService.ts:65',message:'validateConflicts: fetching slots',data:{date,dayStartISO,dayEndISO,teacherId,requestedDate:date},timestamp:Date.now(),sessionId:'debug-session',runId:'run3',hypothesisId:'C'})}).catch(()=>{});
-  // #endregion
 
   const [lessons, slots] = await Promise.all([
     nexusApi.getLessons(dayStartISO, dayEndISO, teacherId),
     nexusApi.getSlotInventory(dayStartISO, dayEndISO, teacherId), // undefined teacherId means all teachers
   ]);
-  // #region agent log
-  fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'conflictValidationService.ts:72',message:'validateConflicts: loaded slots',data:{slotsCount:slots.length,slots:slots.map(s=>({id:s.id,status:s.status,date:s.date,startTime:s.startTime,endTime:s.endTime,lessons:s.lessons,teacherId:s.teacherId})),lessonsCount:lessons.length,requestedDate:date},timestamp:Date.now(),sessionId:'debug-session',runId:'run3',hypothesisId:'C,E'})}).catch(()=>{});
-  // #endregion
 
   // Filter out excluded records
   const filteredLessons = excludeLessonId
@@ -109,9 +97,6 @@ export async function validateConflicts(
   const conflictingOpenSlots = filteredSlots.filter(slot => {
     // Check status: must be 'open' (normalized) or 'פתוח' (Hebrew from Airtable)
     const isOpenStatus = slot.status === 'open' || slot.status === 'פתוח';
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'conflictValidationService.ts:95',message:'validateConflicts: checking slot',data:{slotId:slot.id,slotStatus:slot.status,isOpenStatus,hasLessons:!!(slot.lessons && slot.lessons.length > 0),slotDate:slot.date,slotStartTime:slot.startTime,slotEndTime:slot.endTime,slotTeacherId:slot.teacherId,requestedTeacherId:teacherId,proposedStartISO:startISO,proposedEndISO:endISO},timestamp:Date.now(),sessionId:'debug-session',runId:'run2',hypothesisId:'A,E'})}).catch(()=>{});
-    // #endregion
     if (!isOpenStatus) {
       return false;
     }
@@ -130,9 +115,6 @@ export async function validateConflicts(
     const slotStartISO = toISO(slot.date, slot.startTime);
     const slotEndISO = toISO(slot.date, slot.endTime);
     const overlaps = hasOverlap(startISO, endISO, slotStartISO, slotEndISO);
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'conflictValidationService.ts:110',message:'validateConflicts: overlap check result',data:{slotId:slot.id,overlaps,slotStartISO,slotEndISO,proposedStartISO:startISO,proposedEndISO:endISO},timestamp:Date.now(),sessionId:'debug-session',runId:'run2',hypothesisId:'D'})}).catch(()=>{});
-    // #endregion
     return overlaps;
   });
 
@@ -183,9 +165,6 @@ export async function autoCloseOverlappingSlots(
     return [];
   }
 
-  if (import.meta.env.DEV) {
-    console.log(`[autoCloseOverlappingSlots] Found ${overlappingSlots.length} overlapping open slots, closing them...`);
-  }
 
   // Close each overlapping slot and link lesson if provided
   const closedSlots: SlotInventory[] = [];
@@ -235,9 +214,6 @@ export async function autoCloseOverlappingSlots(
         closedSlots.push(updatedSlot);
       }
 
-      if (import.meta.env.DEV) {
-        console.log(`[autoCloseOverlappingSlots] Closed slot ${slot.id} (${slot.date} ${slot.startTime}-${slot.endTime})${lessonId ? ` and linked lesson ${lessonId}` : ''}`);
-      }
     } catch (error: any) {
       console.error(`[autoCloseOverlappingSlots] Error closing slot ${slot.id}:`, error);
       // Continue with other slots even if one fails

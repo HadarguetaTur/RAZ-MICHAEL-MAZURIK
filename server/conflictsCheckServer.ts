@@ -1,7 +1,7 @@
 /**
  * Standalone HTTP server for POST /api/conflicts/check.
  * Run: npx tsx server/conflictsCheckServer.ts
- * Uses process.env.VITE_AIRTABLE_API_KEY and VITE_AIRTABLE_BASE_ID (or AIRTABLE_API_KEY / AIRTABLE_BASE_ID).
+ * Uses process.env.AIRTABLE_API_KEY and AIRTABLE_BASE_ID.
  *
  * Example curl (after starting the server):
  *   curl -s -X POST http://localhost:3001/api/conflicts/check -H "Content-Type: application/json" -d "{\"entity\":\"lesson\",\"teacherId\":\"recXXX\",\"date\":\"2025-01-27\",\"start\":\"10:00\",\"end\":\"11:00\"}"
@@ -11,12 +11,14 @@ import http from 'node:http';
 import { checkConflicts } from '../services/conflictsCheckService';
 import type { CheckConflictsParams, ConflictsCheckFetchers, LessonLike, OpenSlotLike } from '../services/conflictsCheckService';
 import { getTableId, getField } from '../contracts/fieldMap';
+import { getAuthFromRequest } from './auth';
+import { assertJsonContentType, isValidRecordId, readJsonBodyWithLimit } from './httpSecurity';
 
 const API_BASE = 'https://api.airtable.com/v0';
 const CANCELLED_STATUS = 'בוטל';
 
 function env(name: string): string {
-  const v = process.env[name] ?? process.env[name.replace('VITE_', '')] ?? '';
+  const v = process.env[name] ?? '';
   return String(v).trim();
 }
 
@@ -52,7 +54,7 @@ async function getLessonsForConflicts(
   const studentF = getField('lessons', 'full_name');
 
   let formula = `AND({${statusF}} != "${escapeFormula(CANCELLED_STATUS)}", IS_AFTER({${startDtF}}, "${escapeFormula(startDate)}"), IS_BEFORE({${endDtF}}, "${escapeFormula(endDate)}"))`;
-  if (teacherId && teacherId.startsWith('rec')) {
+  if (teacherId && isValidRecordId(teacherId)) {
     formula = `AND(${formula}, FIND("${escapeFormula(teacherId)}", ARRAYJOIN({${teacherF}})) > 0)`;
   }
   const params: Record<string, string> = {
@@ -106,7 +108,7 @@ async function getOpenSlotsForConflicts(
   const teacherF = getField('slotInventory', 'מורה');
 
   let formula = `AND({${startDtF}} < "${escapeFormula(endISO)}", {${endDtF}} > "${escapeFormula(startISO)}", {${statusF}} = "open")`;
-  if (teacherId && teacherId.startsWith('rec')) {
+  if (teacherId && isValidRecordId(teacherId)) {
     formula = `AND(${formula}, FIND("${escapeFormula(teacherId)}", ARRAYJOIN({${teacherF}})) > 0)`;
   }
   const params: Record<string, string> = {
@@ -135,23 +137,37 @@ async function getOpenSlotsForConflicts(
 const PORT = Number(process.env.CONFLICTS_CHECK_PORT || '3001');
 
 const server = http.createServer(async (req, res) => {
+  const user = getAuthFromRequest(req);
+  if (!user) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Unauthorized' }));
+    return;
+  }
   if (req.method !== 'POST' || req.url !== '/api/conflicts/check') {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Not Found' }));
     return;
   }
-  let body = '';
-  for await (const chunk of req) body += chunk;
   let params: CheckConflictsParams;
   try {
-    params = JSON.parse(body || '{}') as CheckConflictsParams;
+    if (!assertJsonContentType(req)) {
+      res.writeHead(415, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Content-Type must be application/json' }));
+      return;
+    }
+    params = await readJsonBodyWithLimit<CheckConflictsParams>(req);
   } catch {
     res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+    res.end(JSON.stringify({ error: 'Invalid or oversized JSON body' }));
     return;
   }
-  const baseId = env('VITE_AIRTABLE_BASE_ID') || env('AIRTABLE_BASE_ID');
-  const token = env('VITE_AIRTABLE_API_KEY') || env('AIRTABLE_API_KEY');
+  if (typeof params.teacherId !== 'string' || !isValidRecordId(params.teacherId)) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Invalid teacherId format' }));
+    return;
+  }
+  const baseId = env('AIRTABLE_BASE_ID');
+  const token = env('AIRTABLE_API_KEY');
   if (!baseId || !token) {
     res.writeHead(500, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ message: 'שגיאה בבדיקת חפיפות. נסה שוב.' }));

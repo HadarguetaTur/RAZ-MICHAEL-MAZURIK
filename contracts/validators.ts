@@ -11,6 +11,7 @@ import {
   CancellationsAirtableFields,
   SubscriptionsAirtableFields,
   BillingAirtableFields,
+  StudentGroupsAirtableFields,
   LinkedRecord,
   LessonTypeValue,
   ValidationResult,
@@ -189,7 +190,7 @@ export function validateLessonsFields(
       table: 'lessons',
       field: 'status',
       why_needed: 'Lesson status',
-      example_values: ['מתוכנן', 'הסתיים', 'בוטל'],
+      example_values: ['מתוכנן', 'אישר הגעה', 'בוצע', 'בוטל', 'בוטל ע"י מנהל'],
     });
     errors.push('Missing or invalid: status');
   }
@@ -632,6 +633,59 @@ export function validateBillingFields(
       'שולם': fields['שולם'],
       'מאושר לחיוב': fields['מאושר לחיוב'],
       'תלמיד': fields['תלמיד'],
+    },
+  };
+}
+
+/**
+ * ============================================================================
+ * STUDENT GROUPS VALIDATOR
+ * ============================================================================
+ */
+export function validateStudentGroupsFields(
+  fields: any
+): ValidationResult<StudentGroupsAirtableFields> {
+  const errors: string[] = [];
+  const missingFields: MissingField[] = [];
+
+  if (!isString(fields.group_name)) {
+    missingFields.push({
+      table: 'StudentGroups',
+      field: 'group_name',
+      why_needed: 'Primary field - group display name',
+      example_values: ['קבוצה א', 'מתמטיקה מתקדמת'],
+    });
+    errors.push('Missing or invalid: group_name');
+  }
+
+  if (fields.status !== 'active' && fields.status !== 'paused') {
+    missingFields.push({
+      table: 'StudentGroups',
+      field: 'status',
+      why_needed: 'Group status flag',
+      example_values: ['active', 'paused'],
+    });
+    errors.push('Missing or invalid: status (must be "active" or "paused")');
+  }
+
+  if (fields.students !== undefined && !isLinkedRecord(fields.students)) {
+    errors.push('Invalid format: students (must be string or array of record IDs)');
+  }
+
+  if (errors.length > 0 || missingFields.length > 0) {
+    return {
+      success: false,
+      errors,
+      missingFields: missingFields.length > 0 ? missingFields : undefined,
+    };
+  }
+
+  return {
+    success: true,
+    data: {
+      group_name: fields.group_name,
+      status: fields.status,
+      students: fields.students,
     },
   };
 }

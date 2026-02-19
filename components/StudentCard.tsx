@@ -1,7 +1,8 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Student, Lesson, Subscription, MonthlyBill, HomeworkAssignment } from '../types';
 import { nexusApi } from '../services/nexusApi';
 import { useToast } from '../hooks/useToast';
+import { exportToCsv } from '../utils/csvExport';
 
 interface StudentCardProps {
   student: Student;
@@ -22,6 +23,9 @@ const StudentCard: React.FC<StudentCardProps> = ({ student, onClose, onEdit }) =
   const [financialLoading, setFinancialLoading] = useState(false);
   const [homework, setHomework] = useState<HomeworkAssignment[]>([]);
   const [homeworkLoading, setHomeworkLoading] = useState(false);
+  const lessonsLoadedRef = useRef(false);
+  const financialLoadedRef = useRef(false);
+  const homeworkLoadedRef = useRef(false);
 
   useEffect(() => {
     setEditedStudent(student);
@@ -46,12 +50,6 @@ const StudentCard: React.FC<StudentCardProps> = ({ student, onClose, onEdit }) =
         notes: editedStudent.notes,
       };
 
-      console.log('[StudentCard] Saving student updates:', {
-        studentId: student.id,
-        updates,
-        originalStudent: student,
-        editedStudent,
-      });
 
       const updatedStudent = await nexusApi.updateStudent(student.id, updates);
       setIsEditing(false);
@@ -79,11 +77,14 @@ const StudentCard: React.FC<StudentCardProps> = ({ student, onClose, onEdit }) =
   };
 
   useEffect(() => {
-    if (activeTab === 'history' && lessons.length === 0) {
+    if (activeTab === 'history' && !lessonsLoadedRef.current) {
+      lessonsLoadedRef.current = true;
       loadLessons();
-    } else if (activeTab === 'financial' && subscriptions.length === 0) {
+    } else if (activeTab === 'financial' && !financialLoadedRef.current) {
+      financialLoadedRef.current = true;
       loadFinancial();
-    } else if (activeTab === 'homework' && homework.length === 0) {
+    } else if (activeTab === 'homework' && !homeworkLoadedRef.current) {
+      homeworkLoadedRef.current = true;
       loadHomework();
     }
   }, [activeTab]);
@@ -333,16 +334,7 @@ const StudentCard: React.FC<StudentCardProps> = ({ student, onClose, onEdit }) =
                     </div>
                     <div>
                       <div className="text-[10px] text-slate-400 font-bold mb-1">אימייל</div>
-                      {isEditing ? (
-                        <input 
-                          type="email"
-                          value={editedStudent.email || ''}
-                          onChange={(e) => handleChange('email', e.target.value)}
-                          className="text-sm font-bold text-slate-500 border-b border-slate-200 outline-none w-full bg-transparent"
-                        />
-                      ) : (
-                        <div className="text-sm font-bold text-slate-500 truncate">{student.email || 'לא הוזן'}</div>
-                      )}
+                      <div className="text-sm font-bold text-slate-500 truncate">{student.email || 'לא הוזן'}</div>
                     </div>
                   </div>
                 </div>
@@ -491,7 +483,27 @@ const StudentCard: React.FC<StudentCardProps> = ({ student, onClose, onEdit }) =
                     <h3 className="text-lg font-black text-slate-800">שיעורים אחרונים</h3>
                     <button
                       onClick={() => {
-                        // CSV Export Logic from original Students.tsx
+                        const headers = [
+                          { key: 'date', label: 'תאריך' },
+                          { key: 'day', label: 'יום' },
+                          { key: 'startTime', label: 'שעת התחלה' },
+                          { key: 'duration', label: 'משך (דקות)' },
+                          { key: 'subject', label: 'מקצוע' },
+                          { key: 'teacherName', label: 'מורה' },
+                          { key: 'status', label: 'סטטוס' },
+                          { key: 'price', label: 'מחיר (₪)' },
+                        ];
+                        const rows = lessons.map(l => ({
+                          date: l.date,
+                          day: new Date(l.date).toLocaleDateString('he-IL', { weekday: 'long' }),
+                          startTime: l.startTime,
+                          duration: l.duration,
+                          subject: l.subject,
+                          teacherName: l.teacherName || '',
+                          status: l.status,
+                          price: l.price?.toFixed(2) ?? '0.00',
+                        }));
+                        exportToCsv(`שיעורים_${student.name}.csv`, headers, rows);
                       }}
                       className="px-4 py-2 bg-slate-100 text-slate-600 rounded-xl text-xs font-black hover:bg-slate-200 transition-all"
                     >
@@ -537,7 +549,7 @@ const StudentCard: React.FC<StudentCardProps> = ({ student, onClose, onEdit }) =
                                   <div className="text-left">
                                     <div className="font-black text-slate-800">₪{lesson.price?.toFixed(2) || '0.00'}</div>
                                     <div className={`text-[10px] font-black px-2 py-0.5 rounded-full inline-block mt-1 ${
-                                      lesson.status === 'הסתיים' ? 'bg-emerald-50 text-emerald-600' : 
+                                      lesson.status === 'בוצע' ? 'bg-emerald-50 text-emerald-600' : 
                                       lesson.status === 'בוטל' ? 'bg-red-50 text-red-600' : 'bg-blue-50 text-blue-600'
                                     }`}>
                                       {lesson.status}

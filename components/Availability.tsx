@@ -7,12 +7,15 @@ import type { ConflictItem, CheckConflictsResult } from '../services/conflictsCh
 import { buildConflictSummary } from '../services/conflictsCheckService';
 import { logConflictOverride } from '../services/eventLog';
 import StudentsPicker from './StudentsPicker';
+import GroupPicker from './GroupPicker';
 import SlotInventoryModal from './SlotInventoryModal';
 import { useOpenSlotModal } from '../hooks/useOpenSlotModal';
 import { useToast } from '../hooks/useToast';
 import { useConfirmDialog } from '../hooks/useConfirmDialog';
 import { apiUrl } from '../config/api';
 import { formatDate, parseLocalDate } from '../services/dateUtils';
+import { invalidateSlotInventory } from '../data/resources/slotInventory';
+import { slotStatusToAirtable } from '../utils/slotStatus';
 
 const DAYS_HEBREW = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'];
 
@@ -133,14 +136,6 @@ export function detectWeeklySlotOverlaps(
     return []; // Cannot determine day, skip overlap check to avoid false positives
   }
 
-  if (import.meta.env?.DEV) {
-    console.log('[detectWeeklySlotOverlaps] Starting overlap check:', {
-      editedRaw: editedSlot.dayOfWeek,
-      editedNorm: editedNormalizedDay,
-      editedDayName: DAYS_HEBREW[editedNormalizedDay] || `Day ${editedNormalizedDay}`,
-      totalSlots: allSlots.length,
-    });
-  }
 
   const overlaps: WeeklySlotOverlap[] = [];
 
@@ -165,17 +160,6 @@ export function detectWeeklySlotOverlaps(
     // STRICT GUARD: Only check overlaps if days match exactly
     if (otherNormalizedDay !== editedNormalizedDay) {
       // DEV log to debug day mismatch issues (only log first few to avoid spam)
-      if (import.meta.env?.DEV && overlaps.length === 0) {
-        console.log('[DOW_DEBUG] Day mismatch - skipping overlap check:', {
-          editedRaw: editedSlot.dayOfWeek,
-          editedNorm: editedNormalizedDay,
-          editedDayName: DAYS_HEBREW[editedNormalizedDay] || `Day ${editedNormalizedDay}`,
-          otherRaw: slot.dayOfWeek,
-          otherNorm: otherNormalizedDay,
-          otherDayName: DAYS_HEBREW[otherNormalizedDay] || `Day ${otherNormalizedDay}`,
-          slotId: slot.id,
-        });
-      }
       continue; // Different day - no overlap possible
     }
 
@@ -198,15 +182,6 @@ export function detectWeeklySlotOverlaps(
 
     // Overlap condition: startA < endB && startB < endA (strict, no <=)
     if (editedStart < slotEnd && slotStart < editedEnd) {
-      if (import.meta.env?.DEV) {
-        console.log('[detectWeeklySlotOverlaps] OVERLAP DETECTED:', {
-          editedDay: DAYS_HEBREW[editedNormalizedDay] || `Day ${editedNormalizedDay}`,
-          editedTime: `${editedSlot.startTime}-${editedSlot.endTime}`,
-          otherDay: DAYS_HEBREW[otherNormalizedDay] || `Day ${otherNormalizedDay}`,
-          otherTime: `${slot.startTime}-${slot.endTime}`,
-          slotId: slot.id,
-        });
-      }
       // Use normalized day for display consistency
       overlaps.push({
         slotId: slot.id,
@@ -279,17 +254,6 @@ const Availability: React.FC = () => {
 
   // STEP 2 & 3: Track selectedSlot changes and update formData accordingly
   useEffect(() => {
-    if (import.meta.env.DEV) {
-      console.log('[SELECTED_SLOT_SET]', {
-        slotId: selectedSlot?.id,
-        slotType: selectedSlot ? ('dayOfWeek' in selectedSlot ? 'WeeklySlot' : 'SlotInventory') : null,
-        modalMode,
-        isModalOpen,
-        formDataTeacherId: formData.teacherId,
-        formDataType: formData.type,
-        formDataDayOfWeek: formData.dayOfWeek,
-      });
-    }
 
     // If modal is open in edit mode and we have a selectedSlot, ensure formData is synced
     if (isModalOpen && modalMode === 'edit' && selectedSlot && 'dayOfWeek' in selectedSlot) {
@@ -320,12 +284,6 @@ const Availability: React.FC = () => {
         JSON.stringify(formData.reservedForIds) !== JSON.stringify(expectedFormData.reservedForIds);
 
       if (needsUpdate) {
-        if (import.meta.env.DEV) {
-          console.log('[FORM_DATA_SYNC] Updating formData to match selectedSlot:', {
-            current: formData,
-            expected: expectedFormData,
-          });
-        }
         setFormData(expectedFormData);
       }
     }
@@ -363,98 +321,20 @@ const Availability: React.FC = () => {
         forceRefresh // forceRefresh flag
       );
       
-      // PART 1: DEV logging to PROVE duplicates source in Availability
-      if (import.meta.env?.DEV) {
-        console.log(`[Availability] PART 1 - Received inventory analysis:`);
-        console.log(`  Array length received: ${inventory.length}`);
-        
-        // Check duplicates by id
-        const inventoryIds = inventory.map(s => s.id);
-        const uniqueIds = new Set(inventoryIds);
-        const duplicateById = inventoryIds.length !== uniqueIds.size;
-        
-        if (duplicateById) {
-          const duplicates = inventoryIds.filter((id, idx) => inventoryIds.indexOf(id) !== idx);
-          console.error(`  ⚠️ DUPLICATE slot.id in array: ${inventoryIds.length} total, ${uniqueIds.size} unique`);
-          console.error(`  Duplicate IDs:`, duplicates.slice(0, 10));
-        }
-        
-        // Check duplicates by natural_key
-        const naturalKeys = inventory.map(s => (s as any).naturalKey || '');
-        const naturalKeyMap = new Map<string, string[]>();
-        naturalKeys.forEach((key, idx) => {
-          if (key) {
-            if (!naturalKeyMap.has(key)) {
-              naturalKeyMap.set(key, []);
-            }
-            naturalKeyMap.get(key)!.push(inventory[idx].id);
-          }
-        });
-        const duplicateByNaturalKey = Array.from(naturalKeyMap.entries())
-          .filter(([_, ids]) => ids.length > 1);
-        
-        if (duplicateByNaturalKey.length > 0) {
-          console.warn(`  ⚠️ DUPLICATE natural_key in array: ${duplicateByNaturalKey.length} keys`);
-          duplicateByNaturalKey.slice(0, 5).forEach(([key, ids]) => {
-            console.warn(`    natural_key "${key}": ${ids.length} slots (${ids.slice(0, 3).join(', ')}...)`);
-          });
-        }
-        
-        // Check duplicates by composite key
-        const compositeKeys = inventory.map(s => {
-          const teacherId = s.teacherId || 'none';
-          const d = s.date != null ? String(s.date) : '';
-          const st = s.startTime != null ? String(s.startTime) : '';
-          const et = s.endTime != null ? String(s.endTime) : '';
-          return `${d}|${st}|${et}|${teacherId}`;
-        });
-        const compositeKeyMap = new Map<string, string[]>();
-        compositeKeys.forEach((key, idx) => {
-          if (!compositeKeyMap.has(key)) {
-            compositeKeyMap.set(key, []);
-          }
-          compositeKeyMap.get(key)!.push(inventory[idx].id);
-        });
-        const duplicateByCompositeKey = Array.from(compositeKeyMap.entries())
-          .filter(([_, ids]) => ids.length > 1);
-        
-        if (duplicateByCompositeKey.length > 0) {
-          console.warn(`  ⚠️ DUPLICATE composite key in array: ${duplicateByCompositeKey.length} keys`);
-          duplicateByCompositeKey.slice(0, 5).forEach(([key, ids]) => {
-            console.warn(`    composite "${key}": ${ids.length} slots (${ids.slice(0, 3).join(', ')}...)`);
-          });
-        }
-        
-        console.log(`[Availability] PART 1 Summary:`);
-        console.log(`  Duplicates by id: ${duplicateById ? 'YES' : 'NO'}`);
-        console.log(`  Duplicates by natural_key: ${duplicateByNaturalKey.length > 0 ? `YES (${duplicateByNaturalKey.length})` : 'NO'}`);
-        console.log(`  Duplicates by composite key: ${duplicateByCompositeKey.length > 0 ? `YES (${duplicateByCompositeKey.length})` : 'NO'}`);
-      }
-      
-      // Final deduplication guard before setting state (defensive)
-      const dedupeMap = new Map<string, SlotInventory>();
-      for (const slot of inventory) {
-        if (!slot?.id) continue;
-        if (!dedupeMap.has(slot.id)) {
-          dedupeMap.set(slot.id, slot);
-        } else if (import.meta.env?.DEV) {
-          console.warn(`[Availability] Skipping duplicate slot ID in state: ${slot.id}`);
-        }
-      }
-      const deduplicatedInventory = Array.from(dedupeMap.values());
-      
-      // Sort deterministically (defensive: date/startTime may be missing)
-      deduplicatedInventory.sort((a, b) => {
-        const dateA = a.date != null ? String(a.date) : '';
-        const dateB = b.date != null ? String(b.date) : '';
-        const dateCompare = dateA.localeCompare(dateB);
-        if (dateCompare !== 0) return dateCompare;
-        const startA = a.startTime != null ? String(a.startTime) : '';
-        const startB = b.startTime != null ? String(b.startTime) : '';
-        return startA.localeCompare(startB);
+      // Deduplicate by ID (defensive guard against Airtable returning dupes)
+      const seen = new Set<string>();
+      const deduplicated = inventory.filter(slot => {
+        if (!slot?.id || seen.has(slot.id)) return false;
+        seen.add(slot.id);
+        return true;
       });
       
-      setSlotInventory(deduplicatedInventory);
+      deduplicated.sort((a, b) => {
+        const dc = (a.date ?? '').localeCompare(b.date ?? '');
+        return dc !== 0 ? dc : (a.startTime ?? '').localeCompare(b.startTime ?? '');
+      });
+      
+      setSlotInventory(deduplicated);
     } catch (err) {
       console.error('Error loading inventory:', err);
     } finally {
@@ -464,12 +344,12 @@ const Availability: React.FC = () => {
 
   const loadTeachersAndStudents = async () => {
     try {
-      const [teachersData, studentsData] = await Promise.all([
+      const [teachersData, studentsResult] = await Promise.all([
         nexusApi.getTeachers(),
         nexusApi.getStudents()
       ]);
       setTeachers(teachersData);
-      setStudents(studentsData);
+      setStudents(studentsResult.students);
     } catch (err) {
       console.error('Error loading teachers/students:', err);
     }
@@ -552,23 +432,6 @@ const Availability: React.FC = () => {
         date: '',
       };
       
-      if (import.meta.env.DEV) {
-        console.log('[HANDLE_OPEN_MODAL] Weekly slot edit mode:', {
-          slotId: s.id,
-          slotData: {
-            dayOfWeek: s.dayOfWeek,
-            startTime: s.startTime,
-            endTime: s.endTime,
-            type: s.type,
-            teacherId: s.teacherId,
-            teacherName: s.teacherName,
-            isFixed: s.isFixed,
-            reservedForIds: s.reservedForIds,
-            reservedFor: s.reservedFor,
-          },
-          newFormData,
-        });
-      }
       
       // Set all state synchronously before opening modal
       setSelectedSlot(s);
@@ -587,25 +450,11 @@ const Availability: React.FC = () => {
       );
       setWeeklySlotOverlaps(overlaps);
       
-      // Open modal AFTER state is set (use setTimeout to ensure state updates are processed)
-      setTimeout(() => {
-        setIsModalOpen(true);
-      }, 0);
+      setIsModalOpen(true);
     } else if (slot) {
       // Slot inventory - EDIT MODE
       const s = slot as SlotInventory;
       
-      if (import.meta.env.DEV) {
-        console.log('[HANDLE_OPEN_MODAL] Slot inventory edit mode:', {
-          slotId: s.id,
-          slotData: {
-            date: s.date,
-            startTime: s.startTime,
-            endTime: s.endTime,
-            teacherId: s.teacherId,
-          },
-        });
-      }
       
       const inventoryFormData = {
         dayOfWeek: new Date(s.date).getDay(),
@@ -633,12 +482,6 @@ const Availability: React.FC = () => {
       }, 0);
     } else {
       // CREATE MODE - new slot
-      if (import.meta.env.DEV) {
-        console.log('[HANDLE_OPEN_MODAL] Create mode:', {
-          dayIdx,
-          teachersAvailable: teachers.length,
-        });
-      }
       
       const newFormData = {
         dayOfWeek: dayIdx !== undefined ? dayIdx : 0,
@@ -776,19 +619,8 @@ const Availability: React.FC = () => {
             updates.teacherId = formData.teacherId;
           }
           
-          // EXPLICITLY preserve status - pass current status to prevent Airtable automations from changing it
-          // Map normalized status back to Airtable format
-          let statusToPreserve: string;
-          if (currentSlot.status === 'blocked') {
-            statusToPreserve = 'חסום ע"י מנהל';
-          } else if (currentSlot.status === 'closed') {
-            statusToPreserve = 'סגור';
-          } else if (currentSlot.status === 'canceled') {
-            statusToPreserve = 'מבוטל';
-          } else {
-            statusToPreserve = 'פתוח'; // Default to open
-          }
-          updates.status = statusToPreserve as any; // Explicitly preserve status
+          // Preserve status in Airtable format to prevent automations from changing it
+          updates.status = slotStatusToAirtable(currentSlot.status) as any;
           
           const updated = await nexusApi.updateSlotInventory(selectedSlot.id, updates);
           
@@ -804,7 +636,8 @@ const Availability: React.FC = () => {
         // CREATE MODE: Create new slot
         if (formData.date && activeTab === 'exceptions') {
           // Creating a one-time exception slot (slot_inventory)
-          const newInventorySlot = await nexusApi.createSlotInventory({
+          const { createSlotInventory: createSlotMutation } = await import('../data/mutations');
+          const newInventorySlot = await createSlotMutation({
             teacherId: formData.teacherId,
             date: formData.date,
             startTime: formData.startTime,
@@ -1071,15 +904,6 @@ const Availability: React.FC = () => {
             conflictSummary,
           });
           
-          if (import.meta.env.DEV) {
-            console.log('[Availability] Conflict override logged:', {
-              recordId: slotInventory.id,
-              entity: 'slot_inventory',
-              teacherId: teacherId.slice(0, 8) + '…',
-              date: slotDate,
-              conflictSummary,
-            });
-          }
         }
       }
       
@@ -1182,7 +1006,7 @@ const Availability: React.FC = () => {
                   setIsCheckingConflicts(false);
                   setSlotInventoryValidationError(null);
                   setSlotInventoryOverlapWarning(null);
-                  setTimeout(() => setIsModalOpen(true), 0);
+                  setIsModalOpen(true);
                 }}
                 className="px-4 py-2 bg-blue-600 text-white text-sm font-bold rounded-xl hover:bg-blue-700 transition-all shadow-sm"
               >
@@ -1200,10 +1024,30 @@ const Availability: React.FC = () => {
               weekStart={weekStart}
               students={students}
               onSlotEdit={handleOpenModal}
+              onAddSlot={(dayIdx) => {
+                const startDate = parseLocalDate(weekStart);
+                const targetDate = new Date(startDate);
+                targetDate.setDate(startDate.getDate() + dayIdx);
+                const dateStr = formatDate(targetDate);
+                setSelectedSlot({ id: '', teacherId: '', teacherName: '', date: dateStr, startTime: '16:00', endTime: '17:00', status: 'open' } as SlotInventory);
+                setModalMode('create');
+                setFormData({
+                  dayOfWeek: targetDate.getDay(),
+                  startTime: '16:00',
+                  endTime: '17:00',
+                  type: 'private',
+                  teacherId: teachers.length > 0 ? teachers[0].id : '',
+                  isFixed: false,
+                  reservedFor: undefined,
+                  reservedForIds: [],
+                  date: dateStr,
+                });
+                setIsCheckingConflicts(false);
+                setSlotInventoryValidationError(null);
+                setSlotInventoryOverlapWarning(null);
+                setIsModalOpen(true);
+              }}
               onReserveSlot={(slotId) => {
-                if (import.meta.env?.DEV) {
-                  console.log('[Availability] onReserveSlot called with slotId:', slotId);
-                }
                 // Find the slot in current state to pass as preloadedSlot (same as Calendar)
                 const slot = slotInventory.find(s => s.id === slotId);
                 if (slot) {
@@ -1214,15 +1058,14 @@ const Availability: React.FC = () => {
               }}
               onSlotDelete={async (slotId) => {
                 try {
-                  await nexusApi.deleteSlotInventory(slotId);
-                  // Remove from state immediately (optimistic update)
                   setSlotInventory(prev => prev.filter(s => s.id !== slotId));
+                  await nexusApi.deleteSlotInventory(slotId);
+                  invalidateSlotInventory();
                   toast.success('החלון נמחק בהצלחה');
-                  // Refresh to ensure consistency (force refresh to bypass cache)
-                  await loadInventory(true);
                 } catch (err: any) {
                   console.error('[Availability] Failed to delete slot:', err);
                   toast.error(parseApiError(err));
+                  await loadInventory(true);
                 }
               }}
               onSlotBlock={async (slotId) => {
@@ -1233,25 +1076,20 @@ const Availability: React.FC = () => {
                     return;
                   }
                   
-                  // Toggle block status
                   const newStatus = slot.status === 'blocked' ? 'open' : 'blocked';
-                  const statusValue = newStatus === 'blocked' ? 'חסום ע"י מנהל' : 'פתוח';
-                  
-                  await nexusApi.updateSlotInventory(slotId, { status: statusValue as any });
-                  
-                  // Update state immediately (optimistic update)
                   setSlotInventory(prev => prev.map(s => 
                     s.id === slotId 
                       ? { ...s, status: newStatus }
                       : s
                   ));
                   
+                  await nexusApi.updateSlotInventory(slotId, { status: slotStatusToAirtable(newStatus) as any });
+                  invalidateSlotInventory();
                   toast.success(newStatus === 'blocked' ? 'החלון נחסם בהצלחה' : 'החסימה בוטלה בהצלחה');
-                  // Refresh to ensure consistency (force refresh to bypass cache)
-                  await loadInventory(true);
                 } catch (err: any) {
                   console.error('[Availability] Failed to block/unblock slot:', err);
                   toast.error(parseApiError(err));
+                  await loadInventory(true);
                 }
               }}
             />
@@ -1369,13 +1207,6 @@ const Availability: React.FC = () => {
                 <select 
                   value={formData.teacherId} 
                   onChange={(e) => {
-                    if (import.meta.env.DEV) {
-                      console.log('[TEACHER_SELECT_CHANGE]', {
-                        oldValue: formData.teacherId,
-                        newValue: e.target.value,
-                        availableOptions: teachers.map(t => ({ id: t.id, name: t.name })),
-                      });
-                    }
                     setFormData({...formData, teacherId: e.target.value});
                   }}
                   className="w-full bg-slate-50 border border-slate-200 rounded-xl p-4 font-bold outline-none focus:bg-white focus:ring-2 focus:ring-blue-100 transition-all"
@@ -1481,16 +1312,24 @@ const Availability: React.FC = () => {
 
                   <div className="space-y-3">
                     <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">תלמידים</label>
+                    {formData.type === 'group' && (
+                      <div className="space-y-2">
+                        <div className="text-[10px] font-bold text-blue-500 uppercase tracking-widest">מלא מקבוצה</div>
+                        <GroupPicker
+                          value={null}
+                          onChange={(_groupId, studentIds) => {
+                            if (studentIds.length > 0) {
+                              setFormData({...formData, reservedForIds: studentIds});
+                            }
+                          }}
+                          disabled={isSaving}
+                          placeholder="בחר קבוצה למילוי תלמידים..."
+                        />
+                      </div>
+                    )}
                     <StudentsPicker
                       values={formData.reservedForIds}
                       onChange={(ids) => {
-                        if (import.meta.env.DEV) {
-                          console.log('[STUDENTS_PICKER_CHANGE]', {
-                            oldValues: formData.reservedForIds,
-                            newValues: ids,
-                            studentsLoaded: students.length,
-                          });
-                        }
                         setFormData({...formData, reservedForIds: ids});
                       }}
                       placeholder="חפש תלמידים..."
@@ -1509,7 +1348,7 @@ const Availability: React.FC = () => {
                     {formData.type === 'pair' && formData.reservedForIds.length !== 2 && formData.reservedForIds.length > 0 && (
                       <div className="mt-2 p-4 bg-amber-50 border border-amber-200 rounded-2xl">
                         <div className="text-xs font-bold text-amber-800">
-                          ⚠️ אזהרה: סוג זוגי דורש בדיוק 2 תלמידים. נבחרו {formData.reservedForIds.length} תלמידים.
+                          אזהרה: סוג זוגי דורש בדיוק 2 תלמידים. נבחרו {formData.reservedForIds.length} תלמידים.
                         </div>
                       </div>
                     )}
@@ -1662,6 +1501,12 @@ const Availability: React.FC = () => {
             endDateTime: `${slotModal.slotData.date ?? ''}T${slotModal.slotData.endTime ?? '01:00'}:00`,
             teacherId: slotModal.slotData.teacherId,
             status: slotModal.slotData.status as any,
+            slotType: (() => {
+              const lt = (slotModal.slotData as any).lessonType;
+              if (lt === 'קבוצתי' || lt === 'group') return 'group';
+              if (lt === 'זוגי' || lt === 'pair') return 'pair';
+              return 'private';
+            })(),
           }}
           onClose={slotModal.close}
           onSuccess={async () => {

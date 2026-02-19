@@ -70,7 +70,7 @@ export function isBillableStatus(status: string): boolean {
   if (!status) return false;
   // Trim whitespace to handle cases like "מתוכנן " (with trailing space)
   const trimmedStatus = status.trim();
-  return trimmedStatus === 'הסתיים' || trimmedStatus === 'מתוכנן' || trimmedStatus === 'בוצע' || trimmedStatus === 'אישר הגעה' || trimmedStatus === 'attended' || trimmedStatus === 'scheduled';
+  return trimmedStatus === 'מתוכנן' || trimmedStatus === 'אישר הגעה' || trimmedStatus === 'בוצע' || trimmedStatus === 'attended' || trimmedStatus === 'scheduled';
 }
 
 /**

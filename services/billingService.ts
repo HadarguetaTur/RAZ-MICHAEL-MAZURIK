@@ -838,13 +838,6 @@ export async function discoverChargeTableSchema(
 
     const booleanFields = getBooleanFields();
 
-    if (_isDev) {
-      console.log('--- AIRTABLE SCHEMA DIAGNOSTIC (חיובים) ---');
-      console.log('Total unique fields found in', records.length, 'records:', fields.length);
-      console.log('All available fields (normalized):', normalizedFieldsList.map(f => logStringDetailed(f)));
-      console.log('Fields with boolean/null values:', booleanFields);
-      console.log('------------------------------------------');
-    }
     
     const findExactRawField = (searchTerms: string[], fallback: string): string => {
       // 1. Try exact match on normalized names
@@ -915,15 +908,6 @@ export async function discoverChargeTableSchema(
     let rawPaidField = potentialPaid ? normalizedFieldsMap.get(potentialPaid)! :
                       findExactRawField([KNOWN_PAID_FIELD, 'paid', 'שולם'], KNOWN_PAID_FIELD);
     
-    if (_isDev) {
-      console.log('[discoverChargeTableSchema] Discovered Raw Schema Mapping:', {
-        studentField: logStringDetailed(rawStudentField),
-        billingMonthField: logStringDetailed(rawBillingMonthField),
-        approvedField: logStringDetailed(rawApprovedField),
-        linkSentField: logStringDetailed(rawLinkSentField),
-        paidField: logStringDetailed(rawPaidField),
-      });
-    }
     
     return {
       studentField: rawStudentField,
@@ -1023,7 +1007,7 @@ async function isStudentEligible(
       
       // Private lessons are billable
       if (lessonType === 'פרטי' || lessonType === 'private') {
-        if (status === 'הסתיים' || status === 'מתוכנן' || status === 'completed' || status === 'scheduled') {
+        if (status === 'בוצע' || status === 'מתוכנן' || status === 'אישר הגעה' || status === 'completed' || status === 'scheduled') {
           return true;
         }
         // Check for billable cancellation
@@ -1196,7 +1180,6 @@ export async function createMonthlyCharges(
   }
   
   try {
-    console.log(`[createMonthlyCharges] Starting billing creation for ${billingMonth} using BillingEngine`);
     
     // Use the robust billing engine instead of the simple logic
     const result = await buildMonthForAllActiveStudents(client, billingMonth, false);
@@ -1678,9 +1661,6 @@ export async function getChargesReport(
   const billingTableId = client.getTableId('monthlyBills');
   
   // Log table ID being used (for debugging 403 errors)
-  if (_isDev) {
-    console.log('[getChargesReport] Using table ID:', billingTableId, 'for monthlyBills');
-  }
   
   try {
     // Get a sample record to discover field names
@@ -1736,10 +1716,6 @@ export async function getChargesReport(
           maxRecords: 100,
         });
         
-        if (_isDev) {
-          console.log(`[getChargesReport] Filter formula: ${filterFormula}`);
-          console.log(`[getChargesReport] Found ${chargeRecords.length} records with filter`);
-        }
       } catch (e) {
         if (_isDev) {
           console.warn('[getChargesReport] Filter failed, trying fallback:', e);
@@ -1749,9 +1725,6 @@ export async function getChargesReport(
           const allRecords = await client.getRecords(billingTableId, { maxRecords: 100 });
           chargeRecords = filterRecordsInMemory(allRecords, input, schema, lookupFields);
           
-          if (_isDev) {
-            console.log(`[getChargesReport] Filtered ${chargeRecords.length} records from ${allRecords.length} total in memory (fallback)`);
-          }
         } catch (fallbackError) {
           console.error('[getChargesReport] Failed to fetch all records for fallback:', fallbackError);
           chargeRecords = [];
@@ -1996,9 +1969,6 @@ export async function getChargesReportKPIs(
       maxRecords: 10000,
     });
     
-    if (_isDev && chargeRecords.length > 0) {
-      console.log(`[getChargesReportKPIs] Found ${chargeRecords.length} records with date filter (YEAR/MONTH)`);
-    }
   } catch (e) {
     if (_isDev) {
       console.warn('[getChargesReportKPIs] Date YEAR/MONTH filter failed:', e);
@@ -2014,9 +1984,6 @@ export async function getChargesReportKPIs(
         maxRecords: 10000,
       });
       
-      if (_isDev && chargeRecords.length > 0) {
-        console.log(`[getChargesReportKPIs] Found ${chargeRecords.length} records with date range filter`);
-      }
     } catch (e) {
       if (_isDev) {
         console.warn('[getChargesReportKPIs] Date range filter failed:', e);
@@ -2033,9 +2000,6 @@ export async function getChargesReportKPIs(
         maxRecords: 10000,
       });
       
-      if (_isDev && chargeRecords.length > 0) {
-        console.log(`[getChargesReportKPIs] Found ${chargeRecords.length} records with text filter`);
-      }
     } catch (e) {
       if (_isDev) {
         console.warn('[getChargesReportKPIs] Text filter failed:', e);
@@ -2075,9 +2039,6 @@ export async function getChargesReportKPIs(
         return false;
       });
       
-      if (_isDev) {
-        console.log(`[getChargesReportKPIs] Filtered ${chargeRecords.length} records from ${allRecords.length} total records in memory`);
-      }
     } catch (e) {
       console.error('[getChargesReportKPIs] Failed to fetch all records:', e);
       chargeRecords = [];
@@ -2085,9 +2046,7 @@ export async function getChargesReportKPIs(
   }
   
   if (_isDev) {
-    console.log(`[getChargesReportKPIs] Final result: ${chargeRecords.length} records for month ${billingMonth}`);
     if (chargeRecords.length > 0) {
-      console.log(`[getChargesReportKPIs] Sample record billing month value:`, chargeRecords[0].fields[schema.billingMonthField]);
     }
   }
   

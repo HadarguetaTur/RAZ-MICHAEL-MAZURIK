@@ -9,6 +9,7 @@ import LessonDetailsModal from './LessonDetailsModal';
 import SlotInventoryModal from './SlotInventoryModal';
 import StudentPicker from './StudentPicker';
 import StudentsPicker from './StudentsPicker';
+import GroupPicker from './GroupPicker';
 import LessonOverlapWarningModal from './ui/LessonOverlapWarningModal';
 import CancelLessonModal from './ui/CancelLessonModal';
 import type { ConflictItem, CheckConflictsResult } from '../services/conflictsCheckService';
@@ -37,28 +38,13 @@ function shouldRenderOpenSlot(
   slot: SlotInventory,
   allLessons: Lesson[]
 ): boolean {
-  // #region agent log
-  fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:shouldRenderOpenSlot:entry',message:'shouldRenderOpenSlot called',data:{slotId:slot.id,slotStatus:slot.status,slotLessons:slot.lessons,slotLessonsType:typeof slot.lessons,slotLessonsIsArray:Array.isArray(slot.lessons),slotLessonsLength:slot.lessons?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'G'})}).catch(()=>{});
-  // #endregion
   // Guard 1: Status must be "open" (strict check)
   if (slot.status !== 'open') {
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:shouldRenderOpenSlot:guard1',message:'Slot filtered out - status not open',data:{slotId:slot.id,slotStatus:slot.status},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'G'})}).catch(()=>{});
-    // #endregion
-    if (import.meta.env.DEV) {
-      console.log(`[shouldRenderOpenSlot] Slot ${slot.id} filtered out - status is "${slot.status}", not "open"`);
-    }
     return false;
   }
   
   // Guard 2: Check if slot has linked lessons (direct check from slot_inventory.lessons field)
   if (slot.lessons && slot.lessons.length > 0) {
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:shouldRenderOpenSlot:guard2',message:'Slot filtered out - has linked lessons',data:{slotId:slot.id,slotLessons:slot.lessons,slotLessonsLength:slot.lessons.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'G'})}).catch(()=>{});
-    // #endregion
-    if (import.meta.env.DEV) {
-      console.log(`[shouldRenderOpenSlot] Slot ${slot.id} filtered out - has ${slot.lessons.length} linked lesson(s):`, slot.lessons);
-    }
     return false;
   }
   
@@ -70,7 +56,7 @@ function shouldRenderOpenSlot(
   
   const hasMatchingLesson = allLessons.some(lesson => {
     // Ignore cancelled lessons – they should not block showing the reopened slot
-    if (lesson.status === LessonStatus.CANCELLED || lesson.status === LessonStatus.PENDING_CANCEL) {
+    if (lesson.status === LessonStatus.CANCELLED || lesson.status === LessonStatus.CANCELLED_BY_ADMIN) {
       return false;
     }
     const lessonDateNormalized = lesson.date.trim();
@@ -82,15 +68,6 @@ function shouldRenderOpenSlot(
     const teacherMatches = lesson.teacherId === slot.teacherId;
     
     if (dateMatches && timeMatches && teacherMatches) {
-      if (import.meta.env.DEV) {
-        console.log(`[shouldRenderOpenSlot] Slot ${slot.id} matches lesson ${lesson.id}:`, {
-          slotDate: slotDateNormalized,
-          slotTime: slotTimeNormalized,
-          lessonDate: lessonDateNormalized,
-          lessonTime: lessonTimeNormalized,
-          teacherMatch: teacherMatches,
-        });
-      }
       return true;
     }
     
@@ -98,9 +75,6 @@ function shouldRenderOpenSlot(
   });
   
   if (hasMatchingLesson) {
-    if (import.meta.env.DEV) {
-      console.log(`[shouldRenderOpenSlot] Suppressing slot ${slot.id} - has matching lesson`);
-    }
     return false;
   }
   
@@ -173,25 +147,18 @@ const Calendar: React.FC = () => {
     const fetchData = async () => {
       setLoading(true);
       try {
-        const [lessonsData, inventoryData, teachersData, studentsData] = await Promise.all([
+        const [lessonsData, inventoryData, teachersData, studentsResult] = await Promise.all([
           getLessons({ start: `${startDate}T00:00:00.000Z`, end: `${endDateStr}T23:59:59.999Z` }),
           getSlotInventory({ start: `${startDate}T00:00:00.000Z`, end: `${endDateStr}T23:59:59.999Z` }),
           nexusApi.getTeachers(),
           nexusApi.getStudents()
         ]);
+        const studentsData = studentsResult.students;
         setLessons(lessonsData);
         // Show only OPEN slots in calendar (exclude slots with linked lessons)
         const filteredOpenSlots = inventoryData.filter(slot => shouldRenderOpenSlot(slot, lessonsData));
         setOpenSlots(filteredOpenSlots);
         
-        if (import.meta.env.DEV) {
-          console.log(`[Calendar] Loaded data:`, {
-            lessonsCount: lessonsData.length,
-            inventoryCount: inventoryData.length,
-            openSlotsCount: filteredOpenSlots.length,
-            filteredOut: inventoryData.length - filteredOpenSlots.length,
-          });
-        }
         
         // Note: rawRecords not available when using resources (only from direct nexusApi calls)
         // This is fine as rawRecords are mainly used for detailed lesson info
@@ -212,8 +179,8 @@ const Calendar: React.FC = () => {
         l.studentName.toLowerCase().includes(searchTerm.toLowerCase()) ||
         (l.notes && l.notes.toLowerCase().includes(searchTerm.toLowerCase()));
       const matchesRecurring = viewMode !== 'recurring' || l.lessonType === 'recurring' || l.isPrivate === false; 
-      // Show lessons with status: SCHEDULED, COMPLETED (מתוכנן, אישר הגעה, בוצע)
-      const matchesStatus = l.status === LessonStatus.SCHEDULED || l.status === LessonStatus.COMPLETED;
+      // Show lessons with status: SCHEDULED, CONFIRMED, COMPLETED (מתוכנן, אישר הגעה, בוצע)
+      const matchesStatus = l.status === LessonStatus.SCHEDULED || l.status === LessonStatus.CONFIRMED || l.status === LessonStatus.COMPLETED;
       return matchesSearch && matchesRecurring && matchesStatus;
     });
   }, [lessons, searchTerm, viewMode]);
@@ -282,7 +249,7 @@ const Calendar: React.FC = () => {
       
       const hasOverlap = filteredLessons.some(lesson => {
         // Exclude cancelled lessons
-        if (lesson.status === LessonStatus.CANCELLED || lesson.status === LessonStatus.PENDING_CANCEL) {
+        if (lesson.status === LessonStatus.CANCELLED || lesson.status === LessonStatus.CANCELLED_BY_ADMIN) {
           return false;
         }
         
@@ -409,7 +376,7 @@ const Calendar: React.FC = () => {
 
       // Check overlapping lessons (exclude cancelled and current lesson)
       filteredLessons.forEach(lesson => {
-        if (lesson.status === LessonStatus.CANCELLED || lesson.status === LessonStatus.PENDING_CANCEL) {
+        if (lesson.status === LessonStatus.CANCELLED || lesson.status === LessonStatus.CANCELLED_BY_ADMIN) {
           return;
         }
         if (selectedLesson && lesson.id === selectedLesson.id) {
@@ -492,13 +459,13 @@ const Calendar: React.FC = () => {
   const isPairPrice = editState.lessonType === 'pair' || (editState.lessonType === 'recurring' && editState.recurringLessonType === 'pair');
   useEffect(() => {
     if (isPrivatePrice && !priceManuallyEdited && editState.duration) {
-      const calculatedPrice = Math.round(((editState.duration || 60) / 60) * 175 * 100) / 100;
+      const calculatedPrice = Math.round(((editState.duration || 60) / 60) * 175);
       setEditState(p => ({ ...p, price: calculatedPrice }));
-      setPriceInputValue(calculatedPrice.toFixed(2));
+      setPriceInputValue(String(calculatedPrice));
     }
     if (isPairPrice && !priceManuallyEdited) {
       setEditState(p => ({ ...p, price: 225 }));
-      setPriceInputValue('225.00');
+      setPriceInputValue('225');
     }
   }, [editState.duration, editState.lessonType, editState.recurringLessonType, priceManuallyEdited, isPrivatePrice, isPairPrice]);
 
@@ -519,20 +486,19 @@ const Calendar: React.FC = () => {
     const isPair = editState.lessonType === 'pair' || (editState.lessonType === 'recurring' && recurType === 'pair');
     if (isPrivate) {
       if (editState.price !== undefined) {
-        setPriceInputValue(editState.price.toFixed(2));
+        setPriceInputValue(String(Math.round(editState.price)));
       } else if (editState.duration) {
-        const calculatedPrice = Math.round(((editState.duration / 60) * 175 * 100) / 100);
-        setPriceInputValue(calculatedPrice.toFixed(2));
+        const calculatedPrice = Math.round((editState.duration / 60) * 175);
+        setPriceInputValue(String(calculatedPrice));
       } else {
-        setPriceInputValue('175.00');
+        setPriceInputValue('175');
       }
     } else if (isPair) {
-      // זוגי/מחזורי זוגי: ברירת מחדל 225; אם נשאר 175 מפרטי – להציג 225 עד שהאפקט יעדכן
       const pairPrice = editState.price === 175 ? 225 : editState.price;
       if (pairPrice !== undefined) {
-        setPriceInputValue(pairPrice.toFixed(2));
+        setPriceInputValue(String(Math.round(pairPrice)));
       } else {
-        setPriceInputValue('225.00');
+        setPriceInputValue('225');
       }
     } else if (editState.lessonType === 'group' || (editState.lessonType === 'recurring' && recurType === 'group')) {
       setPriceInputValue('');
@@ -555,13 +521,7 @@ const Calendar: React.FC = () => {
   };
 
   const refreshData = async (forceRefresh = false) => {
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:refreshData:entry',message:'refreshData called',data:{startDate,endDateStr,forceRefresh},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H6'})}).catch(()=>{});
-    // #endregion
     try {
-      if (import.meta.env.DEV) {
-        console.log(`[Calendar.refreshData] Refreshing data for ${startDate} to ${endDateStr}${forceRefresh ? ' (forceRefresh=true)' : ''}`);
-      }
       
       // If forceRefresh, invalidate cache before fetching
       if (forceRefresh) {
@@ -577,16 +537,10 @@ const Calendar: React.FC = () => {
         getSlotInventory({ start: `${startDate}T00:00:00.000Z`, end: `${endDateStr}T23:59:59.999Z` }, undefined, forceRefresh),
       ]);
       
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:refreshData:afterFetch',message:'getLessons returned',data:{lessonsCount:lessonsData.length,lessonIds:lessonsData.slice(-3).map(l=>({id:l.id,date:l.date,startTime:l.startTime})),startDate,endDateStr},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H7'})}).catch(()=>{});
-      // #endregion
       setLessons(lessonsData);
       
       // Show only OPEN slots in calendar (exclude slots with linked lessons)
       // Filter aggressively: only show slots that are truly open AND have no matching lessons
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:refreshData:beforeFilter',message:'Before filtering slots',data:{inventoryDataCount:inventoryData.length,inventorySlots:inventoryData.map(s=>({id:s.id,status:s.status,lessons:s.lessons,lessonsLength:s.lessons?.length}))},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'G'})}).catch(()=>{});
-      // #endregion
       const filteredOpenSlots = inventoryData.filter(slot => {
         const shouldRender = shouldRenderOpenSlot(slot, lessonsData);
         if (!shouldRender && import.meta.env.DEV) {
@@ -601,47 +555,15 @@ const Calendar: React.FC = () => {
                    lesson.teacherId === slot.teacherId;
           });
           if (matchingLesson) {
-            console.log(`[Calendar.refreshData] Filtered out slot ${slot.id} (${slot.date} ${slot.startTime}) - has matching lesson ${matchingLesson.id}`);
           }
         }
         return shouldRender;
       });
       const outByStatus = inventoryData.filter(s => s.status !== 'open').length;
       const outByLessons = inventoryData.filter(s => s.lessons && s.lessons.length > 0).length;
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:refreshData:afterFilter',message:'After filtering slots',data:{filteredOpenSlotsCount:filteredOpenSlots.length,inventoryTotal:inventoryData.length,outByStatusNotOpen:outByStatus,outByHasLessons:outByLessons,filteredSlots:filteredOpenSlots.map(s=>({id:s.id,status:s.status,lessons:s.lessons}))},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'G'})}).catch(()=>{});
-      // #endregion
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:refreshData:setState',message:'refreshData about to setOpenSlots',data:{lessonsSet:lessonsData.length,openSlotsToSet:filteredOpenSlots.length,forceRefresh},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H-cal-refresh'})}).catch(()=>{});
-      // #endregion
       setOpenSlots(filteredOpenSlots);
       
-      if (import.meta.env.DEV) {
-        console.log(`[Calendar.refreshData] Refreshed data:`, {
-          lessonsCount: lessonsData.length,
-          inventoryCount: inventoryData.length,
-          openSlotsCount: filteredOpenSlots.length,
-          filteredOut: inventoryData.length - filteredOpenSlots.length,
-          inventoryStatuses: inventoryData.map(s => ({ 
-            id: s.id, 
-            status: s.status,
-            date: s.date,
-            startTime: s.startTime,
-            teacherId: s.teacherId,
-          })),
-          lessons: lessonsData.map(l => ({
-            id: l.id,
-            date: l.date,
-            startTime: l.startTime,
-            teacherId: l.teacherId,
-            studentName: l.studentName,
-          })),
-        });
-      }
     } catch (err) {
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:refreshData:catch',message:'refreshData threw',data:{errorMessage:err instanceof Error ? err.message : String(err),forceRefresh},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H-cal-refresh'})}).catch(()=>{});
-      // #endregion
       console.error('Error refreshing calendar data:', err);
     }
   };
@@ -694,10 +616,6 @@ const Calendar: React.FC = () => {
   const performSave = async () => {
     const studentId = selectedStudent?.id || editState.studentId || editState.studentIds?.[0];
     
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:performSave:entry',message:'performSave called',data:{studentId,isCreating,selectedLessonId:selectedLesson?.id,editState:{date:editState.date,startTime:editState.startTime,duration:editState.duration}},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H1'})}).catch(()=>{});
-    // #endregion
-    
     setIsSaving(true);
     try {
       if (selectedLesson) {
@@ -720,14 +638,8 @@ const Calendar: React.FC = () => {
         }
         
         const updated = await updateLesson(selectedLesson.id, updateData);
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:performSave:afterUpdate',message:'After updateLesson, about to refreshData(false)',data:{lessonId:selectedLesson.id,forceRefresh:false},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H-cal-update'})}).catch(()=>{});
-        // #endregion
         // Refresh both lessons and slots (slots may have been auto-closed)
         await refreshData(true);
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:performSave:afterRefreshEdit',message:'refreshData() completed after edit',data:{},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H-cal-update'})}).catch(()=>{});
-        // #endregion
         setSelectedLesson(null);
         setIsCreating(false);
       } else {
@@ -791,9 +703,6 @@ const Calendar: React.FC = () => {
       setOverlapConflicts([]);
       setPendingSaveAction(null);
     } catch (err: any) {
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:performSave:catch',message:'performSave error caught',data:{errorMessage:err?.message,errorCode:err?.code,errorStatus:err?.status,errorDetails:err?.details},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H2'})}).catch(()=>{});
-      // #endregion
       if (err.code === 'CONFLICT_ERROR' || err.status === 409) {
         // Handle conflicts structure: { lessons: Lesson[], openSlots: SlotInventory[] }
         const conflicts = err.conflicts || {};
@@ -828,14 +737,8 @@ const Calendar: React.FC = () => {
   };
 
   const handleSave = async () => {
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:handleSave:entry',message:'handleSave called',data:{isSaving,isCheckingConflicts,isCreating,hasSelectedStudent:!!selectedStudent,selectedStudentId:selectedStudent?.id,editStateDate:editState.date,editStateStartTime:editState.startTime},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H1'})}).catch(()=>{});
-    // #endregion
     // Prevent double-submit
     if (isSaving || isCheckingConflicts) {
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:handleSave:blocked',message:'handleSave blocked by isSaving/isCheckingConflicts',data:{isSaving,isCheckingConflicts},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H1'})}).catch(()=>{});
-      // #endregion
       return;
     }
 
@@ -843,9 +746,6 @@ const Calendar: React.FC = () => {
     if (isCreating) {
       if (editState.lessonType === 'private') {
         if (!selectedStudent) {
-          // #region agent log
-          fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:handleSave:noStudent',message:'No student selected for private lesson',data:{isCreating,lessonType:editState.lessonType},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H1'})}).catch(()=>{});
-          // #endregion
           toast.error('נא לבחור תלמיד');
           return;
         }
@@ -955,15 +855,6 @@ const Calendar: React.FC = () => {
           conflictSummary,
         });
         
-        if (import.meta.env.DEV) {
-          console.log('[Calendar] Conflict override logged:', {
-            recordId,
-            entity: 'lesson',
-            teacherId: teacherId.slice(0, 8) + '…',
-            date,
-            conflictSummary,
-          });
-        }
       }
       
       await pendingSaveAction();
@@ -994,17 +885,11 @@ const Calendar: React.FC = () => {
     if (!cancelModalLesson) return;
     
     try {
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:handleCancelOnly:entry',message:'handleCancelOnly called',data:{lessonId:cancelModalLesson.id,date:cancelModalLesson.date,startTime:cancelModalLesson.startTime},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H7'})}).catch(()=>{});
-      // #endregion
       const updated = await updateLesson(cancelModalLesson.id, { status: LessonStatus.CANCELLED });
       setLessons(prev => prev.map(l => l.id === cancelModalLesson.id ? updated : l));
       
       // Trigger Make.com scenario to delete calendar event (non-blocking)
       try {
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:handleCancelOnly:triggerMake',message:'About to trigger CANCEL_LESSON scenario',data:{lessonId:cancelModalLesson.id},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H7'})}).catch(()=>{});
-        // #endregion
         const makeResult = await triggerCancelLessonScenario({
           lessonId: cancelModalLesson.id,
           studentId: cancelModalLesson.studentId,
@@ -1019,13 +904,7 @@ const Calendar: React.FC = () => {
       }
       
       // Refresh data to show reopened slots (if any)
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:handleCancelOnly:beforeRefresh',message:'About to refreshData(true) after cancel',data:{lessonId:cancelModalLesson.id},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H-cal-cancel'})}).catch(()=>{});
-      // #endregion
       await refreshData(true);
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'Calendar.tsx:handleCancelOnly:afterRefresh',message:'refreshData(true) completed after cancel',data:{},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H-cal-cancel'})}).catch(()=>{});
-      // #endregion
       setSelectedLesson(null);
       setShowCancelModal(false);
       setCancelModalLesson(null);
@@ -1139,11 +1018,9 @@ const Calendar: React.FC = () => {
     try {
       // weekDates[0] is Sunday (first day of the displayed week)
       const weekStart = weekDates[0];
-      console.log(`[Calendar] Opening week starting ${weekStart.toISOString()}`);
       
       const result = await nexusApi.openWeekSlots(weekStart);
       
-      console.log(`[Calendar] Week opened successfully:`, result);
       setOpenWeekMessage({
         type: 'success',
         text: `נפתחו ${result.slotInventoryCount} חלונות ו-${result.fixedLessonsCount} שיעורים קבועים`
@@ -1614,72 +1491,109 @@ const Calendar: React.FC = () => {
               </div>
 
               <div className="space-y-3">
-                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-                  {editState.lessonType === 'private' || (editState.lessonType === 'recurring' && (editState.recurringLessonType ?? 'private') === 'private') ? 'תלמיד' : 'תלמידים (בחירה מרובה)'}
-                </label>
-                {editState.lessonType === 'private' || (editState.lessonType === 'recurring' && (editState.recurringLessonType ?? 'private') === 'private') ? (
-                  <StudentPicker
-                    value={selectedStudent}
-                    onChange={(student) => {
-                      setSelectedStudent(student);
-                      setEditState(prev => ({
-                        ...prev,
-                        studentId: student?.id,
-                        studentIds: student ? [student.id] : [],
-                        studentName: student?.name
-                      }));
-                    }}
-                    placeholder="חפש תלמיד לפי שם או טלפון..."
-                    disabled={isSaving}
-                    filterActiveOnly={true}
-                  />
-                ) : (
-                  <>
-                    <StudentsPicker
-                      values={editState.studentIds || []}
-                      onChange={(studentIds) => {
-                        const isPair = editState.lessonType === 'pair' || (editState.lessonType === 'recurring' && editState.recurringLessonType === 'pair');
-                        const ids = isPair && studentIds.length > 2 ? studentIds.slice(0, 2) : studentIds;
-                        setEditState(prev => ({
-                          ...prev,
-                          studentIds: ids,
-                          studentId: ids[0] || undefined,
-                          studentName: ids.length === 1 ? students.find(s => s.id === ids[0])?.name : undefined
-                        }));
-                      }}
-                      placeholder="חפש תלמידים לפי שם או טלפון..."
-                      disabled={isSaving}
-                      filterActiveOnly={true}
-                      maxSelection={editState.lessonType === 'pair' || (editState.lessonType === 'recurring' && editState.recurringLessonType === 'pair') ? 2 : undefined}
-                      fallbackNames={Object.fromEntries(
-                        (editState.studentIds || [])
-                          .map(id => [id, students.find(s => s.id === id)?.name ?? ''])
-                          .filter(([, n]) => n) as [string, string][]
+                {(() => {
+                  const isPrivate = editState.lessonType === 'private' || (editState.lessonType === 'recurring' && (editState.recurringLessonType ?? 'private') === 'private');
+                  const isPair = editState.lessonType === 'pair' || (editState.lessonType === 'recurring' && editState.recurringLessonType === 'pair');
+                  const isGroup = editState.lessonType === 'group' || (editState.lessonType === 'recurring' && editState.recurringLessonType === 'group');
+
+                  if (isPrivate) {
+                    return (
+                      <>
+                        <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">תלמיד</label>
+                        <StudentPicker
+                          value={selectedStudent}
+                          onChange={(student) => {
+                            setSelectedStudent(student);
+                            setEditState(prev => ({
+                              ...prev,
+                              studentId: student?.id,
+                              studentIds: student ? [student.id] : [],
+                              studentName: student?.name
+                            }));
+                          }}
+                          placeholder="חפש תלמיד לפי שם או טלפון..."
+                          disabled={isSaving}
+                          filterActiveOnly={true}
+                        />
+                      </>
+                    );
+                  }
+
+                  if (isGroup) {
+                    return (
+                      <>
+                        <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">קבוצה</label>
+                        <GroupPicker
+                          value={(editState as any)._selectedGroupId ?? null}
+                          onChange={(groupId, studentIds) => {
+                            setEditState(prev => ({
+                              ...prev,
+                              studentIds,
+                              studentId: studentIds[0] || undefined,
+                              studentName: undefined,
+                              _selectedGroupId: groupId,
+                            } as any));
+                          }}
+                          disabled={isSaving}
+                        />
+                        {(editState.studentIds?.length || 0) > 0 && (
+                          <div className="flex flex-wrap gap-1.5 p-2 bg-slate-50 border border-slate-200 rounded-xl">
+                            {(editState.studentIds || []).map(id => {
+                              const name = students.find(s => s.id === id)?.name;
+                              return (
+                                <span key={id} className="px-2.5 py-1 bg-blue-600 text-white rounded-lg text-xs font-bold">
+                                  {name || id.slice(0, 8)}
+                                </span>
+                              );
+                            })}
+                          </div>
+                        )}
+                        {isCreating && (editState.studentIds?.length || 0) < 2 && (
+                          <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl">
+                            <div className="text-xs font-bold text-amber-800">
+                              שיעור קבוצתי דורש לפחות 2 תלמידים. יש לבחור קבוצה.
+                            </div>
+                          </div>
+                        )}
+                      </>
+                    );
+                  }
+
+                  // Pair mode
+                  return (
+                    <>
+                      <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">תלמידים (בחירה מרובה)</label>
+                      <StudentsPicker
+                        values={editState.studentIds || []}
+                        onChange={(studentIds) => {
+                          const ids = isPair && studentIds.length > 2 ? studentIds.slice(0, 2) : studentIds;
+                          setEditState(prev => ({
+                            ...prev,
+                            studentIds: ids,
+                            studentId: ids[0] || undefined,
+                            studentName: ids.length === 1 ? students.find(s => s.id === ids[0])?.name : undefined
+                          }));
+                        }}
+                        placeholder="חפש תלמידים לפי שם או טלפון..."
+                        disabled={isSaving}
+                        filterActiveOnly={true}
+                        maxSelection={2}
+                        fallbackNames={Object.fromEntries(
+                          (editState.studentIds || [])
+                            .map(id => [id, students.find(s => s.id === id)?.name ?? ''])
+                            .filter(([, n]) => n) as [string, string][]
+                        )}
+                      />
+                      {(editState.studentIds?.length || 0) !== 2 && (
+                        <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl">
+                          <div className="text-xs font-bold text-amber-800">
+                            שיעור זוגי דורש בדיוק 2 תלמידים. נבחרו {editState.studentIds?.length || 0} תלמידים.
+                          </div>
+                        </div>
                       )}
-                    />
-                    {(editState.lessonType === 'pair' || (editState.lessonType === 'recurring' && editState.recurringLessonType === 'pair')) && (editState.studentIds?.length || 0) !== 2 && (
-                      <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl">
-                        <div className="text-xs font-bold text-amber-800">
-                          שיעור זוגי דורש בדיוק 2 תלמידים. נבחרו {editState.studentIds?.length || 0} תלמידים.
-                        </div>
-                      </div>
-                    )}
-                    {isCreating && editState.lessonType === 'group' && (editState.studentIds?.length || 0) < 2 && (
-                      <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl">
-                        <div className="text-xs font-bold text-amber-800">
-                          ⚠️ שיעור קבוצתי דורש לפחות 2 תלמידים. נבחרו {editState.studentIds?.length || 0} תלמידים.
-                        </div>
-                      </div>
-                    )}
-                    {isCreating && editState.lessonType === 'recurring' && editState.recurringLessonType === 'group' && (editState.studentIds?.length || 0) < 2 && (
-                      <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl">
-                        <div className="text-xs font-bold text-amber-800">
-                          ⚠️ שיעור מחזורי קבוצתי דורש לפחות 2 תלמידים. נבחרו {editState.studentIds?.length || 0} תלמידים.
-                        </div>
-                      </div>
-                    )}
-                  </>
-                )}
+                    </>
+                  );
+                })()}
               </div>
 
               {/* Real-time Overlap Warning */}
@@ -1797,7 +1711,7 @@ const Calendar: React.FC = () => {
                   <div className="flex items-center gap-2">
                     <input
                       type="number"
-                      step="0.01"
+                      step="1"
                       min="0"
                       className="flex-1 bg-slate-50 border border-slate-200 rounded-xl p-4 font-bold outline-none focus:bg-white focus:ring-2 focus:ring-blue-100 transition-all"
                       value={priceInputValue}
@@ -1808,34 +1722,32 @@ const Calendar: React.FC = () => {
                       onBlur={(e) => {
                         const numValue = parseFloat(e.target.value);
                         if (!isNaN(numValue) && numValue >= 0) {
-                          const formattedPrice = Math.round(numValue * 100) / 100;
+                          const formattedPrice = Math.round(numValue);
                           setEditState(p => ({ ...p, price: formattedPrice }));
-                          setPriceInputValue(formattedPrice.toFixed(2));
+                          setPriceInputValue(String(formattedPrice));
                         } else if (e.target.value === '' || e.target.value === '.') {
-                          // Empty or just a dot - reset to calculated/default
                           const calculatedPrice = editState.duration 
-                            ? Math.round(((editState.duration / 60) * 175 * 100)) / 100
+                            ? Math.round((editState.duration / 60) * 175)
                             : 175;
                           setEditState(p => ({ ...p, price: calculatedPrice }));
-                          setPriceInputValue(calculatedPrice.toFixed(2));
+                          setPriceInputValue(String(calculatedPrice));
                           setPriceManuallyEdited(false);
                         } else {
-                          // Invalid input - restore to last valid price
                           const lastValidPrice = editState.price !== undefined 
                             ? editState.price 
                             : (editState.duration 
-                              ? Math.round(((editState.duration / 60) * 175 * 100)) / 100
+                              ? Math.round((editState.duration / 60) * 175)
                               : 175);
-                          setPriceInputValue(lastValidPrice.toFixed(2));
+                          setPriceInputValue(String(Math.round(lastValidPrice)));
                         }
                       }}
                     />
                     <button
                       type="button"
                       onClick={() => {
-                        const calculatedPrice = Math.round(((editState.duration || 60) / 60) * 175 * 100) / 100;
+                        const calculatedPrice = Math.round(((editState.duration || 60) / 60) * 175);
                         setEditState(p => ({ ...p, price: calculatedPrice }));
-                        setPriceInputValue(calculatedPrice.toFixed(2));
+                        setPriceInputValue(String(calculatedPrice));
                         setPriceManuallyEdited(false);
                       }}
                       className="px-4 py-4 bg-blue-50 text-blue-600 rounded-xl font-bold text-xs hover:bg-blue-100 transition-all"
@@ -1859,7 +1771,7 @@ const Calendar: React.FC = () => {
                   <div className="flex items-center gap-2">
                     <input
                       type="number"
-                      step="0.01"
+                      step="1"
                       min="0"
                       className="flex-1 bg-slate-50 border border-slate-200 rounded-xl p-4 font-bold outline-none focus:bg-white focus:ring-2 focus:ring-blue-100 transition-all"
                       value={priceInputValue}
@@ -1870,16 +1782,16 @@ const Calendar: React.FC = () => {
                       onBlur={(e) => {
                         const numValue = parseFloat(e.target.value);
                         if (!isNaN(numValue) && numValue >= 0) {
-                          const formattedPrice = Math.round(numValue * 100) / 100;
+                          const formattedPrice = Math.round(numValue);
                           setEditState(p => ({ ...p, price: formattedPrice }));
-                          setPriceInputValue(formattedPrice.toFixed(2));
+                          setPriceInputValue(String(formattedPrice));
                         } else if (e.target.value === '' || e.target.value === '.') {
                           setEditState(p => ({ ...p, price: 225 }));
-                          setPriceInputValue('225.00');
+                          setPriceInputValue('225');
                           setPriceManuallyEdited(false);
                         } else {
                           const lastValid = editState.price !== undefined ? editState.price : 225;
-                          setPriceInputValue(lastValid.toFixed(2));
+                          setPriceInputValue(String(Math.round(lastValid)));
                         }
                       }}
                     />
@@ -1887,7 +1799,7 @@ const Calendar: React.FC = () => {
                       type="button"
                       onClick={() => {
                         setEditState(p => ({ ...p, price: 225 }));
-                        setPriceInputValue('225.00');
+                        setPriceInputValue('225');
                         setPriceManuallyEdited(false);
                       }}
                       className="px-4 py-4 bg-blue-50 text-blue-600 rounded-xl font-bold text-xs hover:bg-blue-100 transition-all"
@@ -1899,6 +1811,22 @@ const Calendar: React.FC = () => {
                   <div className="text-xs text-slate-400">
                     ברירת מחדל: 225 ₪ סה&quot;כ (112.50 ₪ לתלמיד). עם מנוי זוגי – החיוב הוא של המנוי בלבד.
                   </div>
+                </div>
+              )}
+
+              {/* Status selector - only when editing existing lesson */}
+              {!isCreating && (
+                <div className="space-y-3">
+                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">סטטוס שיעור</label>
+                  <select
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl p-4 font-bold outline-none focus:bg-white focus:ring-2 focus:ring-blue-100 transition-all appearance-none cursor-pointer"
+                    value={editState.status || ''}
+                    onChange={(e) => setEditState(p => ({ ...p, status: e.target.value as LessonStatus }))}
+                  >
+                    {Object.values(LessonStatus).map((s) => (
+                      <option key={s} value={s}>{s}</option>
+                    ))}
+                  </select>
                 </div>
               )}
 
@@ -1995,6 +1923,12 @@ const Calendar: React.FC = () => {
             endDateTime: `${slotModal.slotData.date}T${slotModal.slotData.endTime}:00`,
             teacherId: slotModal.slotData.teacherId,
             status: slotModal.slotData.status as any,
+            slotType: (() => {
+              const lt = (slotModal.slotData as any).lessonType;
+              if (lt === 'קבוצתי' || lt === 'group') return 'group';
+              if (lt === 'זוגי' || lt === 'pair') return 'pair';
+              return 'private';
+            })(),
           }}
           onClose={slotModal.close}
           onSuccess={() => {
@@ -2021,6 +1955,12 @@ const Calendar: React.FC = () => {
             endDateTime: `${clickedSlot.date ?? ''}T${clickedSlot.endTime ?? '01:00'}:00`,
             teacherId: clickedSlot.teacherId,
             status: clickedSlot.status as any,
+            slotType: (() => {
+              const lt = (clickedSlot as any).lessonType;
+              if (lt === 'קבוצתי' || lt === 'group') return 'group';
+              if (lt === 'זוגי' || lt === 'pair') return 'pair';
+              return 'private';
+            })(),
           }}
           onClose={() => setClickedSlot(null)}
           onSuccess={() => {

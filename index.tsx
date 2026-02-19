@@ -1,8 +1,10 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
+import './app.css';
 import App from './App';
 import ToastHost from './components/ui/ToastHost';
 import ConfirmDialogHost from './components/ui/ConfirmDialogHost';
+import { AuthProvider } from './hooks/useAuth';
 
 const rootElement = document.getElementById('root');
 if (!rootElement) {
@@ -12,10 +14,12 @@ if (!rootElement) {
 const root = ReactDOM.createRoot(rootElement);
 root.render(
   <React.StrictMode>
-    <ToastHost>
-      <ConfirmDialogHost>
-        <App />
-      </ConfirmDialogHost>
-    </ToastHost>
+    <AuthProvider>
+      <ToastHost>
+        <ConfirmDialogHost>
+          <App />
+        </ConfirmDialogHost>
+      </ToastHost>
+    </AuthProvider>
   </React.StrictMode>
 );

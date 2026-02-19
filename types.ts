@@ -1,11 +1,10 @@
 
 export enum LessonStatus {
   SCHEDULED = 'מתוכנן',
-  COMPLETED = 'הסתיים',
+  CONFIRMED = 'אישר הגעה',
+  COMPLETED = 'בוצע',
   CANCELLED = 'בוטל',
-  PENDING = 'ממתין',
-  NOSHOW = 'לא הופיע',
-  PENDING_CANCEL = 'ממתין לאישור ביטול'
+  CANCELLED_BY_ADMIN = 'בוטל ע"י מנהל'
 }
 
 export type LessonType = 'private' | 'pair' | 'group' | 'recurring';
@@ -28,8 +27,6 @@ export interface Student {
   subscriptionType: string;
   balance: number;
   notes?: string;
-  homework?: { id: string; title: string; status: 'pending' | 'completed'; dueDate: string }[];
-  tests?: { id: string; subject: string; date: string; result?: string }[];
 }
 
 export interface Lesson {
@@ -91,22 +88,25 @@ export interface SlotInventory {
 
 export interface HomeworkLibraryItem {
   id: string;
-  title: string;
-  subject: string;
-  level: string;
+  topic: string;
   description: string;
-  attachmentUrl?: string;
+  status: string;
+  level: string;
+  grade: string;
+  subTopic: string;
+  attachments?: { id?: string; url: string; filename: string }[];
 }
 
 export interface HomeworkAssignment {
   id: string;
+  homeworkId: number;
   studentId: string;
   studentName: string;
-  homeworkId: string;
   homeworkTitle: string;
-  status: 'assigned' | 'done' | 'reviewed';
   dueDate: string;
   assignedDate: string;
+  status: 'assigned' | 'done' | 'reviewed';
+  notes?: string;
 }
 
 export interface Teacher {
@@ -178,4 +178,13 @@ export interface Entity {
   email?: string;         // Airtable: email
   notes?: string;         // Airtable: הערות
   studentIds?: string[];  // Airtable: full_name_ (relation to students)
+}
+
+export interface StudentGroup {
+  id: string;
+  name: string;
+  studentIds: string[];
+  studentNames?: string[];
+  studentCount?: number;
+  status: 'active' | 'paused';
 }

@@ -9,6 +9,7 @@ import { generateBillingPdf } from '../services/pdfGenerator';
 import { openWhatsApp, normalizePhoneToE164 } from '../services/whatsappUtils';
 import { useToast } from '../hooks/useToast';
 import { useConfirmDialog } from '../hooks/useConfirmDialog';
+import { exportToCsv } from '../utils/csvExport';
 
 const Billing: React.FC = () => {
   const toast = useToast();
@@ -124,7 +125,6 @@ const Billing: React.FC = () => {
   useEffect(() => {
     const CACHE_CLEANUP_KEY = 'billing_cache_cleanup_v3';
     if (!localStorage.getItem(CACHE_CLEANUP_KEY)) {
-      console.log('[Billing] Performing one-time cache cleanup for new KPI logic');
       // Clear billing related cache
       for (let i = 0; i < localStorage.length; i++) {
         const key = localStorage.key(i);
@@ -178,10 +178,8 @@ const Billing: React.FC = () => {
         
         if (lastRun !== todayStr) {
           try {
-            console.log(`[Auto Billing] Creating charges for ${billingMonth}`);
             const result = await nexusApi.createMonthlyCharges(billingMonth);
             localStorage.setItem(lastRunKey, todayStr);
-            console.log(`[Auto Billing] Created ${result.createdCount} charges, skipped ${result.skippedCount} for ${billingMonth}`);
             
             // רענון הרשימה אם זה החודש הנבחר
             if (selectedMonth === billingMonth) {
@@ -213,15 +211,9 @@ const Billing: React.FC = () => {
         searchQuery: searchTerm || undefined,
       };
       
-      if (import.meta.env.DEV) {
-        console.log('[Billing] Loading bills for month:', selectedMonth, 'with filters:', filters);
-      }
       
       const data = await getMonthlyBills(selectedMonth, filters);
       
-      if (import.meta.env.DEV) {
-        console.log('[Billing] Loaded', data.length, 'bills');
-      }
       
       setBills(data);
     } catch (err) {
@@ -241,17 +233,6 @@ const Billing: React.FC = () => {
     setBillingDetails(null);
 
     // DEV: Log the selected BillingRowDTO vs current breakdown (if any)
-    if (import.meta.env.DEV) {
-        console.log('BillingRowDTO selected', {
-          id: bill.id,
-          total: bill.totalAmount,
-          lessonsAmount: bill.lessonsAmount,
-          subscriptionsAmount: bill.subscriptionsAmount,
-          manualAdjustmentAmount: bill.manualAdjustmentAmount,
-          manualAdjustmentReason: bill.manualAdjustmentReason,
-          manualAdjustmentDate: bill.manualAdjustmentDate,
-        });
-    }
 
     setLoadingDetails(true);
     try {
@@ -259,23 +240,6 @@ const Billing: React.FC = () => {
       setBillingDetails(breakdown);
       setBreakdownsCache(prev => ({ ...prev, [bill.id]: breakdown }));
 
-      if (import.meta.env.DEV) {
-        console.log('[Billing] Loaded billingDetails breakdown', {
-          billId: bill.id,
-          studentId: bill.studentId,
-          month: bill.month,
-          fromRow: {
-            lessonsAmount: bill.lessonsAmount,
-            subscriptionsAmount: bill.subscriptionsAmount,
-            totalAmount: bill.totalAmount,
-            manualAdjustmentAmount: bill.manualAdjustmentAmount,
-          },
-          breakdownTotals: breakdown?.totals || null,
-          lessonsCount: breakdown?.lessons.length ?? 0,
-          subscriptionsCount: breakdown?.subscriptions.length ?? 0,
-          paidCancellationsCount: breakdown?.paidCancellations.length ?? 0,
-        });
-      }
     } catch (error) {
       console.error('[Billing] Failed to load billing details:', error);
       toast.error('לא ניתן לטעון את פירוט החיוב. נסו שוב או רעננו את העמוד.');
@@ -449,12 +413,10 @@ const Billing: React.FC = () => {
     setUpdatingIds(prev => new Set(prev).add(`${billId}-${field}`));
     
     try {
-      console.log(`[Billing] Updating status: ${billId}.${field} = ${value}`);
       await updateBillStatus(billId, { [field]: value }, selectedMonth);
       
       // Refresh KPIs to reflect the change in totals
       loadKPIs();
-      console.log(`[Billing] Status update successful`);
     } catch (err) {
       console.error('[Billing] Failed to update status:', err);
       
@@ -495,7 +457,6 @@ const Billing: React.FC = () => {
     setDeletingIds(prev => new Set(prev).add(billId));
     
     try {
-      console.log(`[Billing] Deleting bill ${billId}`);
       await deleteBillMutation(billId, billMonth || selectedMonth);
       
       // Remove from local state
@@ -594,15 +555,57 @@ const Billing: React.FC = () => {
             <option value="paid">שולמו</option>
           </select>
         </div>
-        <button 
-          onClick={handleCreateMonthlyCharges}
-          disabled={isCreatingCharges}
-          className={`h-12 bg-blue-600 text-white px-6 rounded-xl font-black text-sm shadow-lg shadow-blue-100 hover:bg-blue-700 active:scale-95 transition-all ${
-            isCreatingCharges ? 'opacity-50 cursor-not-allowed' : ''
-          }`}
-        >
-          {isCreatingCharges ? 'יוצר חיובים...' : 'צור חיובים חודשיים'}
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={() => {
+              if (filteredBills.length === 0) return;
+              const headers = [
+                { key: 'studentName', label: 'תלמיד' },
+                { key: 'parentName', label: 'הורה' },
+                { key: 'month', label: 'חודש' },
+                { key: 'lessonsCount', label: 'מספר שיעורים' },
+                { key: 'lessonsAmount', label: 'סכום שיעורים (₪)' },
+                { key: 'subscriptionsAmount', label: 'מנויים (₪)' },
+                { key: 'cancellationsAmount', label: 'ביטולים (₪)' },
+                { key: 'manualAdjustmentAmount', label: 'התאמה ידנית (₪)' },
+                { key: 'totalAmount', label: 'סה"כ (₪)' },
+                { key: 'statusLabel', label: 'סטטוס' },
+              ];
+              const rows = filteredBills.map(bill => {
+                let statusLabel = 'טיוטה';
+                if (bill.paid) statusLabel = 'שולם';
+                else if (bill.linkSent) statusLabel = 'נשלח';
+                else if (bill.approved) statusLabel = 'ממתין לשליחה';
+                return {
+                  studentName: bill.studentName,
+                  parentName: bill.parentName || '',
+                  month: bill.month,
+                  lessonsCount: bill.lessonsCount || 0,
+                  lessonsAmount: bill.lessonsAmount || 0,
+                  subscriptionsAmount: bill.subscriptionsAmount || 0,
+                  cancellationsAmount: bill.cancellationsAmount || 0,
+                  manualAdjustmentAmount: bill.manualAdjustmentAmount || 0,
+                  totalAmount: getDisplayTotal(bill),
+                  statusLabel,
+                };
+              });
+              exportToCsv(`חיובים_${selectedMonth}.csv`, headers, rows);
+            }}
+            disabled={filteredBills.length === 0}
+            className="h-12 bg-white border border-slate-200 text-slate-600 px-5 rounded-xl font-black text-sm hover:bg-slate-50 active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            ייצוא CSV
+          </button>
+          <button 
+            onClick={handleCreateMonthlyCharges}
+            disabled={isCreatingCharges}
+            className={`h-12 bg-blue-600 text-white px-6 rounded-xl font-black text-sm shadow-lg shadow-blue-100 hover:bg-blue-700 active:scale-95 transition-all ${
+              isCreatingCharges ? 'opacity-50 cursor-not-allowed' : ''
+            }`}
+          >
+            {isCreatingCharges ? 'יוצר חיובים...' : 'צור חיובים חודשיים'}
+          </button>
+        </div>
       </div>
 
       {/* Responsive Table / Cards */}
@@ -1028,10 +1031,10 @@ const Billing: React.FC = () => {
                           </label>
                           <input
                             type="number"
-                            step="0.01"
+                            step="1"
                             value={adjustmentAmount}
                             onChange={(e) => setAdjustmentAmount(e.target.value)}
-                            placeholder="0.00"
+                            placeholder="0"
                             className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-sm font-bold outline-none focus:border-blue-300 focus:ring-2 focus:ring-blue-100"
                           />
                           <div className="text-[9px] text-slate-400 mt-1">

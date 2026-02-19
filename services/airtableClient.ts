@@ -4,25 +4,22 @@
  */
 
 import { AIRTABLE_CONFIG } from '../config/airtable';
+import { getAuthToken, notifyAuthExpired } from '../hooks/useAuth';
+import { apiUrl } from '../config/api';
 
-const API_BASE_URL = 'https://api.airtable.com/v0';
+const PROXY_BASE_URL = '/api/airtable';
 const MAX_RETRIES = 3;
 const INITIAL_BACKOFF_MS = 1000; // Start with 1 second
-
-// Use environment variables from Vite (import.meta.env.VITE_*)
-const getApiKey = () => {
-  return import.meta.env.VITE_AIRTABLE_API_KEY || '';
-};
-
-const getBaseId = () => {
-  return import.meta.env.VITE_AIRTABLE_BASE_ID || '';
-};
 
 /**
  * Sleep utility for backoff
  */
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function escapeFormulaString(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
 /**
@@ -100,38 +97,36 @@ async function withRetry<T>(
  * AirtableClient - Single DAL for all Airtable operations
  */
 export class AirtableClient {
-  private apiKey: string;
-  private baseId: string;
   private isConfigured: boolean;
 
-  constructor(apiKey?: string, baseId?: string) {
-    this.apiKey = apiKey || getApiKey();
-    this.baseId = baseId || getBaseId();
-    this.isConfigured = !!(this.apiKey && this.baseId);
+  constructor() {
+    this.isConfigured = true; // Always configured when using proxy
   }
 
   /**
-   * Check if client is configured and throw a clear error if not
+   * Check if user is authenticated and throw a clear error if not
    */
   private ensureConfigured(): void {
-    if (!this.isConfigured) {
+    const token = getAuthToken();
+    if (!token) {
       throw {
-        message: 'Airtable API Key or Base ID not configured. Please set VITE_AIRTABLE_API_KEY and VITE_AIRTABLE_BASE_ID in .env.local',
-        code: 'AIRTABLE_NOT_CONFIGURED',
-        status: 0,
+        message: 'Authentication required. Please log in.',
+        code: 'AUTH_REQUIRED',
+        status: 401,
       };
     }
   }
 
   /**
-   * Make a request to Airtable API with retry/backoff
+   * Make a request to Airtable API via backend proxy with retry/backoff
    */
   private async request<T>(
     endpoint: string,
     options: RequestInit = {}
   ): Promise<T> {
-    // Fail gracefully if not configured
+    // Fail gracefully if not authenticated
     this.ensureConfigured();
+    const token = getAuthToken();
     
     // Encode table IDs for safety
     const [tablePath, queryString] = endpoint.split('?');
@@ -142,23 +137,29 @@ export class AirtableClient {
     const encodedPath = pathParts.join('/');
     const encodedEndpoint = queryString ? `${encodedPath}?${queryString}` : encodedPath;
 
-    const url = `${API_BASE_URL}/${encodeURIComponent(this.baseId)}${encodedEndpoint}`;
+    const url = apiUrl(`${PROXY_BASE_URL}${encodedEndpoint}`);
 
-    if (import.meta.env.DEV) {
-      console.log(`[AirtableClient] Request: ${options.method || 'GET'} ${encodedPath}`);
-    }
 
     const makeRequest = async (): Promise<T> => {
       const response = await fetch(url, {
         ...options,
         headers: {
-          'Authorization': `Bearer ${this.apiKey}`,
+          'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
           ...options.headers,
         },
       });
 
       if (!response.ok) {
+        if (response.status === 401) {
+          notifyAuthExpired();
+          throw {
+            message: 'Session expired. Please log in again.',
+            code: 'AUTH_EXPIRED',
+            status: 401,
+          };
+        }
+
         const errorText = await response.text();
         let errorData;
         try {
@@ -171,13 +172,9 @@ export class AirtableClient {
         const tableIdMatch = endpoint.match(/\/([^/?]+)/);
         const tableId = tableIdMatch ? tableIdMatch[1] : 'unknown';
 
-        // Enhanced error message for 403 (permission/not found errors)
-        let errorMessage = errorData.error?.message || `Airtable API error: ${response.statusText}`;
+        let errorMessage = errorData.error?.message || `API error: ${response.statusText}`;
         if (response.status === 403) {
-          errorMessage = `Airtable 403 Forbidden: Invalid permissions or table not found. ` +
-            `Attempted table ID: "${tableId}". ` +
-            `Please verify: (1) The table ID is correct in config/airtable.ts, ` +
-            `(2) The API key has access to this table, (3) The table exists in base ${this.baseId.substring(0, 8)}...`;
+          errorMessage = `Forbidden: Table "${tableId}" — check API permissions.`;
         }
 
         const error: any = {
@@ -305,7 +302,6 @@ export class AirtableClient {
     
     // Sanitize fields: remove read-only/computed fields like "id", "createdTime"
     if (import.meta.env.DEV) {
-      console.log(`[AirtableClient.createRecord] BEFORE sanitization - Fields received:`, Object.keys(fields));
       if ('id' in fields) {
         console.error(`[AirtableClient.createRecord] ERROR: Field "id" found in input fields!`, fields);
       }
@@ -323,11 +319,6 @@ export class AirtableClient {
       throw new Error('CRITICAL: Field "id" is still present after sanitization. This should never happen.');
     }
     
-    if (import.meta.env.DEV) {
-      console.log(`[AirtableClient.createRecord] Creating record in table ${tableId}`);
-      console.log(`[AirtableClient.createRecord] Fields being sent:`, Object.keys(sanitizedFields));
-      console.log(`[AirtableClient.createRecord] Full payload:`, JSON.stringify({ fields: sanitizedFields }, null, 2));
-    }
     
     const body: any = { fields: sanitizedFields };
     if (options?.typecast) {
@@ -357,7 +348,6 @@ export class AirtableClient {
     
     // Sanitize fields: remove read-only/computed fields like "id", "createdTime"
     if (import.meta.env.DEV) {
-      console.log(`[AirtableClient.updateRecord] BEFORE sanitization - Fields received:`, Object.keys(fields));
       if ('id' in fields) {
         console.error(`[AirtableClient.updateRecord] ERROR: Field "id" found in input fields!`, fields);
       }
@@ -375,11 +365,6 @@ export class AirtableClient {
       throw new Error('CRITICAL: Field "id" is still present after sanitization. This should never happen.');
     }
     
-    if (import.meta.env.DEV) {
-      console.log(`[AirtableClient.updateRecord] Updating record ${recordId} in table ${tableId}`);
-      console.log(`[AirtableClient.updateRecord] Fields being sent:`, Object.keys(sanitizedFields));
-      console.log(`[AirtableClient.updateRecord] Full payload:`, JSON.stringify({ fields: sanitizedFields }, null, 2));
-    }
     
     const body: any = { fields: sanitizedFields };
     if (options?.typecast) {
@@ -403,7 +388,7 @@ export class AirtableClient {
     fieldName: string,
     fieldValue: string
   ): Promise<{ id: string; fields: T } | null> {
-    const filterFormula = `{${fieldName}} = "${fieldValue}"`;
+    const filterFormula = `{${fieldName}} = "${escapeFormulaString(fieldValue)}"`;
     const records = await this.getRecords<T>(tableId, {
       filterByFormula: filterFormula,
       maxRecords: 1,
@@ -433,6 +418,5 @@ export class AirtableClient {
 }
 
 // Export singleton instance
-// Note: This is created at module load time, matching the original behavior
-// The constructor will throw if env vars are missing, which is the expected behavior
+// Note: This is created at module load time. Auth check happens per-request, not at construction time.
 export const airtableClient = new AirtableClient();

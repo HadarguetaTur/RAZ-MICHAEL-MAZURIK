@@ -54,9 +54,6 @@ const StudentsPicker: React.FC<StudentsPickerProps> = ({
       // Find IDs that are missing from local cache
       const missingIds = values.filter(id => !getStudentByIdSync(id));
 
-      if (import.meta.env.DEV && missingIds.length > 0) {
-        console.log('[StudentsPicker] Missing students from cache, fetching:', missingIds);
-      }
 
       // Fetch missing students asynchronously
       const fetchedStudents = await Promise.all(
@@ -72,14 +69,6 @@ const StudentsPicker: React.FC<StudentsPickerProps> = ({
           !allSelected.every((s, i) => selectedStudentsState[i]?.id === s.id)) {
         setSelectedStudentsState(allSelected);
         
-        if (import.meta.env.DEV) {
-          console.log('[StudentsPicker] Selected students updated:', {
-            total: allSelected.length,
-            fromCache: localStudents.length,
-            fetched: validFetched.length,
-            studentNames: allSelected.map(s => s.name),
-          });
-        }
       }
     };
 

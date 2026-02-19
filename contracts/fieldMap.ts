@@ -78,10 +78,20 @@ export const TABLES = {
     primaryField: 'assignment_id',
     displayNameHe: 'שיעורי בית',
   },
+  homeworkAssignments: {
+    id: 'tbli8REMCOKvdxMzZ',
+    primaryField: 'assignment_id',
+    displayNameHe: 'הקצאות שיעורי בית',
+  },
   slotBlocks: {
     id: 'tblk9sSVBGzvHdaIv',
     primaryField: 'block_batch_id',
     displayNameHe: 'Slot_Blocks',
+  },
+  studentGroups: {
+    id: 'tblUURXeFzvg2hcGQ',
+    primaryField: 'group_name',
+    displayNameHe: 'קבוצות תלמידים',
   },
 } as const;
 
@@ -297,6 +307,17 @@ export const FIELDS = {
     'מסמכים': 'מסמכים',
     'תת_נושא': 'תת נושא',
   },
+  homeworkAssignments: {
+    assignment_id: 'assignment_id',
+    homework_id: 'homework_id',
+    student_id: 'student_id',
+    student_name: 'student_name',
+    homework_title: 'homework_title',
+    due_date: 'due_date',
+    assigned_date: 'assigned_date',
+    status: 'status',
+    notes: 'notes',
+  },
   slotBlocks: {
     block_batch_id: 'block_batch_id',
     teacher_id: 'teacher_id',
@@ -308,6 +329,14 @@ export const FIELDS = {
     slots: 'slots', // Linked record
     errors_count: 'errors_count',
     'שיעורים_שבוטלו': 'שיעורים שבוטלו', // Linked record
+  },
+  studentGroups: {
+    group_name: 'group_name',
+    students: 'students', // Linked record to students table
+    status: 'status',
+    // Computed fields (read-only)
+    student_names: 'student_names', // Lookup from students.full_name
+    student_count: 'student_count', // Count of linked students
   },
 } as const;
 
@@ -378,7 +407,12 @@ export const COMPUTED_FIELDS = {
   subscriptions: new Set([]),
   waitingList: new Set([]),
   homework: new Set([]),
+  homeworkAssignments: new Set(['assignment_id']),
   slotBlocks: new Set([]),
+  studentGroups: new Set([
+    'student_names',
+    'student_count',
+  ]),
 } as const;
 
 /**
@@ -412,6 +446,10 @@ export const REQUIRED_FIELDS = {
   },
   teachers: {
     list: ['teacher_id', 'full_name', 'is_active'],
+  },
+  studentGroups: {
+    list: ['group_name', 'status'],
+    create: ['group_name', 'status'],
   },
 } as const;
 

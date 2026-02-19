@@ -1,6 +1,7 @@
 import path from 'path';
 import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
+import tailwindcss from '@tailwindcss/vite';
 
 export default defineConfig(({ mode }) => {
     const env = loadEnv(mode, '.', '');
@@ -24,18 +25,18 @@ export default defineConfig(({ mode }) => {
               });
             },
           },
+          '/api/airtable': { target: 'http://localhost:3001', changeOrigin: true },
+          '/api/auth': { target: 'http://localhost:3001', changeOrigin: true },
           '/api/conflicts': { target: 'http://localhost:3001', changeOrigin: true },
           '/api/slot-inventory': { target: 'http://localhost:3001', changeOrigin: true },
+          '/api/tmp-upload': { target: 'http://localhost:3001', changeOrigin: true },
+          '/api/tmp-files': { target: 'http://localhost:3001', changeOrigin: true },
         },
       },
-      plugins: [react()],
+      plugins: [tailwindcss(), react()],
       define: {
         'process.env.NODE_ENV': JSON.stringify(mode),
-        'process.env.API_KEY': JSON.stringify(env.GEMINI_API_KEY),
-        'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
         'process.env.API_BASE_URL': JSON.stringify(env.API_BASE_URL || '/api'),
-        'process.env.AIRTABLE_API_KEY': JSON.stringify(env.AIRTABLE_API_KEY || ''),
-        'process.env.AIRTABLE_BASE_ID': JSON.stringify(env.AIRTABLE_BASE_ID || '')
       },
       resolve: {
         alias: {

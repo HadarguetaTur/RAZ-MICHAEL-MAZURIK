@@ -1,10 +1,12 @@
 
-import { Lesson, Student, Teacher, Subscription, MonthlyBill, LessonStatus, HomeworkLibraryItem, HomeworkAssignment, WeeklySlot, SlotInventory, Entity, EntityPermission } from '../types';
+import { Lesson, Student, Teacher, Subscription, MonthlyBill, LessonStatus, HomeworkLibraryItem, HomeworkAssignment, WeeklySlot, SlotInventory, Entity, EntityPermission, StudentGroup } from '../types';
 import { mockData } from './mockApi';
 import { AIRTABLE_CONFIG } from '../config/airtable';
 import { getChargesReport, createMonthlyCharges, CreateMonthlyChargesResult, recalculateBill, RecalculateBillResult, discoverChargeTableSchema, ChargeTableSchema, getChargesReportKPIs, ChargesReportKPIs } from './billingService';
 import { getBillingBreakdown, BillingBreakdown } from './billingDetailsService';
 import { airtableClient } from './airtableClient';
+import { getAuthToken, notifyAuthExpired } from '../hooks/useAuth';
+import { apiUrl } from '../config/api';
 
 // Cache for table schema to avoid redundant discovery calls
 let cachedChargeSchema: ChargeTableSchema | null = null;
@@ -12,47 +14,51 @@ import { getTableId, getField, isComputedField, filterComputedFields } from '../
 import { getWeeklySlots as getWeeklySlotsService, getSlotInventory as getSlotInventoryService, updateWeeklySlot as updateWeeklySlotService, updateSlotInventory as updateSlotInventoryService, createWeeklySlot as createWeeklySlotService, deleteWeeklySlot as deleteWeeklySlotService, reserveRecurringLesson as reserveRecurringLessonService } from './slotManagementService';
 import { openNewWeek as openNewWeekService } from './weeklyRolloverService';
 import { triggerCreateLessonScenario } from './makeApi';
+import { normalizeSlotStatus, slotStatusToAirtable } from '../utils/slotStatus';
 
-// Use Vite's import.meta.env for client-side environment variables
-const API_BASE_URL = 'https://api.airtable.com/v0';
-const AIRTABLE_API_KEY = import.meta.env.VITE_AIRTABLE_API_KEY || '';
-const AIRTABLE_BASE_ID = import.meta.env.VITE_AIRTABLE_BASE_ID || '';
+// Backend proxy base path (the server handles Airtable credentials)
+const PROXY_BASE_URL = '/api/airtable';
 
-console.log(`[API] API_BASE_URL configured as: ${API_BASE_URL}`);
-console.log(`[Airtable] Base ID: ${AIRTABLE_BASE_ID ? 'Configured' : 'Not configured'}`);
-console.log(`[Airtable] API Key: ${AIRTABLE_API_KEY ? 'Configured' : 'Not configured'}`);
-
-// Airtable API helper functions
+// Airtable API helper functions — routes through backend proxy
 async function airtableRequest<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
-  if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-    throw new Error('Airtable API Key or Base ID not configured. Please set VITE_AIRTABLE_API_KEY and VITE_AIRTABLE_BASE_ID in .env.local');
+  const token = getAuthToken();
+  if (!token) {
+    throw {
+      message: 'לא מחובר למערכת. יש להתחבר מחדש.',
+      code: 'AUTH_REQUIRED',
+      status: 401,
+    };
   }
 
-  // Encode table IDs for safety (even though they're alphanumeric)
-  // Split endpoint to encode table ID but preserve query parameters
+  // endpoint looks like: "/tblXXX?filterByFormula=..."
+  // We need to build: /api/airtable/tblXXX?filterByFormula=...
   const [tablePath, queryString] = endpoint.split('?');
   const pathParts = tablePath.split('/');
   if (pathParts.length > 1 && pathParts[1]) {
-    // Encode the table ID (second segment)
     pathParts[1] = encodeURIComponent(pathParts[1]);
   }
   const encodedPath = pathParts.join('/');
   const encodedEndpoint = queryString ? `${encodedPath}?${queryString}` : encodedPath;
-  
-  const url = `${API_BASE_URL}/${encodeURIComponent(AIRTABLE_BASE_ID)}${encodedEndpoint}`;
-  console.log(`[Airtable] ${options.method || 'GET'} ${url}`);
+
+  const url = apiUrl(`${PROXY_BASE_URL}${encodedEndpoint}`);
 
   try {
     const response = await fetch(url, {
       ...options,
       headers: {
-        'Authorization': `Bearer ${AIRTABLE_API_KEY}`,
+        'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
         ...options.headers,
       },
     });
 
     if (!response.ok) {
+      // If 401, token might be expired — user needs to re-login
+      if (response.status === 401) {
+        notifyAuthExpired();
+        throw { message: 'פג תוקף ההתחברות', code: 'AUTH_EXPIRED', status: 401 };
+      }
+
       const errorText = await response.text();
       let errorData;
       try {
@@ -60,9 +66,12 @@ async function airtableRequest<T>(endpoint: string, options: RequestInit = {}): 
       } catch {
         errorData = { error: errorText };
       }
-      console.error(`[Airtable] Error ${response.status}:`, errorData);
+      const errMsg =
+        typeof errorData.error === 'string'
+          ? errorData.error
+          : errorData.error?.message || `API error: ${response.statusText}`;
       throw {
-        message: errorData.error?.message || `Airtable API error: ${response.statusText}`,
+        message: errMsg,
         code: 'AIRTABLE_ERROR',
         status: response.status,
         details: errorData,
@@ -71,13 +80,12 @@ async function airtableRequest<T>(endpoint: string, options: RequestInit = {}): 
 
     return response.json() as Promise<T>;
   } catch (err: any) {
-    if (err.code === 'AIRTABLE_ERROR') {
+    if (err.code === 'AIRTABLE_ERROR' || err.code === 'AUTH_REQUIRED' || err.code === 'AUTH_EXPIRED') {
       throw err;
     }
-    // Network or other errors
     throw {
-      message: `Failed to connect to Airtable: ${err.message}`,
-      code: 'AIRTABLE_CONNECTION_ERROR',
+      message: `Failed to connect to server: ${err.message}`,
+      code: 'CONNECTION_ERROR',
       status: 0,
     };
   }
@@ -165,21 +173,15 @@ async function listAllAirtableRecords<TFields>(
 function mapAirtableToLesson(record: any): Lesson {
   const fields = record.fields || {};
   
-  console.log(`[DEBUG] Mapping record ${record.id}, fields keys:`, Object.keys(fields));
   const lessonDetailsField = getField('lessons', 'פרטי_השיעור' as any);
-  console.log(`[DEBUG] Looking for 'פרטי השיעור' field:`, fields[lessonDetailsField]);
-  console.log(`[DEBUG] All field names in record:`, Object.keys(fields));
   
   // Map status from Airtable to LessonStatus enum
   const statusMap: Record<string, LessonStatus> = {
     'מתוכנן': LessonStatus.SCHEDULED,
-    'אישר הגעה': LessonStatus.COMPLETED, // Map 'אישר הגעה' to COMPLETED
-    'בוצע': LessonStatus.COMPLETED, // Map 'בוצע' to COMPLETED
-    'הסתיים': LessonStatus.COMPLETED,
+    'אישר הגעה': LessonStatus.CONFIRMED,
+    'בוצע': LessonStatus.COMPLETED,
     'בוטל': LessonStatus.CANCELLED,
-    'ממתין': LessonStatus.PENDING,
-    'לא הופיע': LessonStatus.NOSHOW,
-    'ממתין לאישור ביטול': LessonStatus.PENDING_CANCEL,
+    'בוטל ע"י מנהל': LessonStatus.CANCELLED_BY_ADMIN,
   };
 
   // Extract date and time from datetime fields
@@ -190,20 +192,13 @@ function mapAirtableToLesson(record: any): Lesson {
   const endDatetime = fields[endDatetimeField] || '';
   const lessonDate = fields[lessonDateField] || '';
   
-  console.log(`[DEBUG] start_datetime raw value:`, startDatetime, `(type: ${typeof startDatetime})`);
-  console.log(`[DEBUG] end_datetime raw value:`, endDatetime);
-  console.log(`[DEBUG] lesson_date raw value:`, lessonDate);
-  
   // Parse datetime strings to extract date and time
   let date = '';
   let startTime = '';
   let duration = 60;
   
   if (startDatetime) {
-    console.log(`[DEBUG] Parsing startDatetime: ${startDatetime}`);
     const startDate = new Date(startDatetime);
-    console.log(`[DEBUG] Parsed Date object:`, startDate);
-    console.log(`[DEBUG] Date isValid:`, !isNaN(startDate.getTime()));
     // FIX: Airtable returns UTC datetimes (with Z), but we want to display local time
     // If the datetime string ends with Z (UTC), extract UTC hours/minutes and convert to local
     // If it doesn't have Z, treat it as local time already
@@ -223,15 +218,12 @@ function mapAirtableToLesson(record: any): Lesson {
       startTime = String(startDate.getHours()).padStart(2, '0') + ':' + String(startDate.getMinutes()).padStart(2, '0');
     }
     
-    console.log(`[DEBUG] Extracted date: ${date}, startTime: ${startTime}`);
     if (endDatetime) {
       const endDate = new Date(endDatetime);
       duration = Math.round((endDate.getTime() - startDate.getTime()) / (1000 * 60)); // duration in minutes
-      console.log(`[DEBUG] Calculated duration: ${duration} minutes`);
       }
   } else if (lessonDate) {
     date = typeof lessonDate === 'string' ? lessonDate : lessonDate.split('T')[0];
-    console.log(`[DEBUG] Using lessonDate fallback: ${date}`);
   }
   
   // Handle student name - could be from linked record or direct field
@@ -246,7 +238,6 @@ function mapAirtableToLesson(record: any): Lesson {
                        fields['notes'] || 
                        '';
   
-  console.log(`[DEBUG] Mapped lessonDetails:`, lessonDetails);
 
   const statusField = getField('lessons', 'status');
   const priceField = getField('lessons', 'price');
@@ -259,20 +250,22 @@ function mapAirtableToLesson(record: any): Lesson {
   const statusKey = typeof rawStatus === 'string' ? rawStatus.trim() : String(rawStatus || '').trim();
   const mappedStatus = statusMap[statusKey] || LessonStatus.SCHEDULED;
   
-  // Extract studentId from full_name field (primary) or fallback fields
+  // Extract all student IDs from full_name linked record field
   const fullNameField = getField('lessons', 'full_name');
-  let studentIdFromFullName = '';
   const fullNameValue = fields[fullNameField];
+  let allStudentIds: string[] = [];
   if (Array.isArray(fullNameValue) && fullNameValue.length > 0) {
-    // Linked record array - extract ID
-    const firstItem = fullNameValue[0];
-    studentIdFromFullName = typeof firstItem === 'string' && firstItem.startsWith('rec')
-      ? firstItem
-      : (firstItem?.id && firstItem.id.startsWith('rec') ? firstItem.id : '');
+    allStudentIds = fullNameValue
+      .map((item: any) =>
+        typeof item === 'string' && item.startsWith('rec')
+          ? item
+          : item?.id && item.id.startsWith('rec') ? item.id : ''
+      )
+      .filter(Boolean);
   } else if (typeof fullNameValue === 'string' && fullNameValue.startsWith('rec')) {
-    // Single record ID string
-    studentIdFromFullName = fullNameValue;
+    allStudentIds = [fullNameValue];
   }
+  const studentIdFromFullName = allStudentIds[0] || '';
   
   // Extract teacherId from teacher_id linked record (Airtable returns array of rec IDs)
   const teacherIdField = getField('lessons', 'teacher_id');
@@ -291,12 +284,14 @@ function mapAirtableToLesson(record: any): Lesson {
   };
   const lessonType = lessonTypeMap[lessonTypeRaw] || lessonTypeRaw || 'private';
 
-  const mappedLesson = {
-    id: record.id,
-    studentId: studentIdFromFullName || 
+  const primaryStudentId = studentIdFromFullName || 
               fields['Student_ID'] || 
               fields['Student']?.[0]?.id || 
-              '',
+              '';
+  const mappedLesson = {
+    id: record.id,
+    studentId: primaryStudentId,
+    studentIds: allStudentIds.length > 0 ? allStudentIds : (primaryStudentId ? [primaryStudentId] : []),
     studentName: studentName,
     teacherId: teacherId,
     teacherName: fields['Teacher_Name'] || fields['Teacher']?.[0]?.name || '',
@@ -315,7 +310,6 @@ function mapAirtableToLesson(record: any): Lesson {
     price: price,
   };
   
-  console.log(`[DEBUG] Mapped lesson:`, mappedLesson);
   
   return mappedLesson;
 }
@@ -340,7 +334,6 @@ function mapAirtableToStudent(record: any): Student {
   // DEBUG: Log balance field info for first few students
   const rawBalance = fields[totalWithVatField];
   const studentName = fields[fullNameField];
-  console.log(`[DEBUG Student Balance] ${studentName}: field="${totalWithVatField}", raw="${rawBalance}", type=${typeof rawBalance}`);
   
   return {
     id: record.id,
@@ -356,16 +349,13 @@ function mapAirtableToStudent(record: any): Student {
     paymentStatus: fields[paymentStatusField] || '',
     registrationDate: fields[registrationDateField] || '',
     lastActivity: fields[lastActivityField] || '',
-    // Map is_active boolean field to status enum
-    // is_active is a boolean checkbox field - true → 'active', false → 'inactive'
-    // Note: There is no 'Status' field in the students table, only 'is_active' boolean field
     status: (() => {
       const isActive = fields[isActiveField];
-      if (isActive === true || isActive === 1) return 'active';
-      // For 'on_hold' status, we might need to check other fields or default to 'inactive'
-      // Since is_active is boolean, we can't distinguish between 'inactive' and 'on_hold'
-      return 'inactive';
-    })() as 'active' | 'on_hold' | 'inactive',
+      if (isActive === true || isActive === 1) return 'active' as const;
+      const payStatus = (fields[paymentStatusField] || '').toString().trim();
+      if (payStatus === 'הקפאה') return 'on_hold' as const;
+      return 'inactive' as const;
+    })(),
     subscriptionType: fields['Subscription_Type'] || fields['subscription_type'] || '',
     balance: parseFloat(fields[totalWithVatField] || '0') || 0, // סכום כולל מע״מ ומנויים
     notes: fields['Notes'] || fields['notes'],
@@ -381,12 +371,9 @@ function mapLessonToAirtable(lesson: Partial<Lesson>): any {
   
   // Only map the fields that are allowed for updates: status, start_datetime, end_datetime
   
-  // Map status (Single Select options in this base use trailing space, e.g. "מתוכנן ", "בוטל ")
+  // Map status - send the clean value, typecast handles matching to existing options
   if (lesson.status !== undefined) {
-    const raw = String(lesson.status);
-    const trimmed = raw.trim();
-    if (trimmed === 'מתוכנן' || trimmed === 'בוטל') fields[statusField] = trimmed + ' ';
-    else fields[statusField] = raw;
+    fields[statusField] = String(lesson.status).trim();
   }
   
   // Convert date + startTime to start_datetime (ISO format)
@@ -445,11 +432,7 @@ function mapLessonToAirtable(lesson: Partial<Lesson>): any {
     fields[durationField] = lesson.duration;
   }
 
-  // Notes (פרטי השיעור) - when provided
-  if (lesson.notes !== undefined) {
-    const lessonDetailsField = getField('lessons', 'פרטי_השיעור' as any);
-    fields[lessonDetailsField] = lesson.notes;
-  }
+  // Notes: 'פרטי השיעור' is a computed/formula field in Airtable – skip writing to it
 
   // Student link (same field and format as createLesson) - only when provided so we don't overwrite on status-only updates (e.g. cancel)
   if (lesson.studentIds && Array.isArray(lesson.studentIds) && lesson.studentIds.length > 0) {
@@ -471,11 +454,9 @@ async function handleResponse<T>(response: Response, url: string): Promise<T> {
   const contentType = response.headers.get('content-type') || '';
   const isJson = contentType.includes('application/json');
   
-  console.log(`[API] ${url} - Status: ${response.status}, Content-Type: ${contentType}`);
   
   // Get response text first to check what we're actually receiving
   const responseText = await response.text();
-  console.log(`[API] ${url} - Response preview (first 200 chars):`, responseText.substring(0, 200));
   
   if (!response.ok) {
     let errorMessage = 'שגיאת שרת לא ידועה';
@@ -544,7 +525,6 @@ async function withFallback<T>(apiCall: () => Promise<T>, fallbackData: T | (() 
   } catch (err: any) {
     console.warn(`[API] API call failed, using fallback data:`, err);
     if (err.status === 404 || err.code === 'ENDPOINT_NOT_FOUND' || err.message?.includes('Failed to fetch') || err.message?.includes('HTML instead of JSON')) {
-      console.log(`[API] Using fallback data for failed request`);
       return typeof fallbackData === 'function' ? (fallbackData as any)() : fallbackData;
     }
     throw err;
@@ -748,8 +728,8 @@ async function resolveTeacherRecordId(teacherId: string | undefined): Promise<st
 export const nexusApi = {
   getTeachers: async (): Promise<Teacher[]> => {
     // Fetch from Airtable - no fallback
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
     const params = new URLSearchParams({
@@ -773,30 +753,27 @@ export const nexusApi = {
       };
     });
     
-    console.log(`[Airtable] Fetched ${teachers.length} teachers`);
     return teachers;
   },
 
-  getStudents: async (page: number = 1): Promise<Student[]> => {
-    // Fetch from Airtable - no fallback
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+  getStudents: async (offsetToken?: string): Promise<{ students: Student[]; nextOffset?: string }> => {
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
-    const params = new URLSearchParams({
-      pageSize: '100',
-      ...(page > 1 && { offset: String((page - 1) * 100) }),
-    });
+    const params = new URLSearchParams({ pageSize: '100' });
+    if (offsetToken) {
+      params.set('offset', offsetToken);
+    }
     const studentsTableId = getTableId('students');
-    const response = await airtableRequest<{ records: any[] }>(`/${studentsTableId}?${params}`);
+    const response = await airtableRequest<{ records: any[]; offset?: string }>(`/${studentsTableId}?${params}`);
     const students = response.records.map(mapAirtableToStudent);
-    console.log(`[Airtable] Fetched ${students.length} students`);
-    return students;
+    return { students, nextOffset: response.offset };
   },
 
   updateStudent: async (id: string, updates: Partial<Student>): Promise<Student> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
     const airtableFields: any = { fields: {} };
@@ -869,17 +846,18 @@ export const nexusApi = {
     // }
     
     if (updates.status !== undefined) {
-      // is_active is a boolean field - convert status to boolean
-      // 'active' → true, 'inactive' or 'on_hold' → false
       airtableFields.fields[getField('students', 'is_active')] = updates.status === 'active';
-      // Note: There is no 'Status' field in the students table, only 'is_active' boolean field
+      if (updates.status === 'on_hold') {
+        airtableFields.fields[getField('students', 'payment_status')] = 'הקפאה';
+      } else if (updates.status === 'active' && updates.paymentStatus === undefined) {
+        // Clear הקפאה when reactivating, unless paymentStatus is explicitly set
+        const currentPayment = airtableFields.fields[getField('students', 'payment_status')];
+        if (currentPayment === undefined) {
+          airtableFields.fields[getField('students', 'payment_status')] = null;
+        }
+      }
     }
 
-    if (import.meta.env.DEV) {
-      console.log('[updateStudent] Updating student:', id);
-      console.log('[updateStudent] Updates received:', updates);
-      console.log('[updateStudent] Airtable fields to send:', airtableFields);
-    }
 
     const studentsTableId = getTableId('students');
     const response = await airtableRequest<{ id: string; fields: any }>(
@@ -894,11 +872,10 @@ export const nexusApi = {
   },
 
   createStudent: async (student: Partial<Student>): Promise<Student> => {
-    console.log('[createStudent] Entry - received student data:', student);
     
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      console.error('[createStudent] Missing API Key or Base ID');
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      console.error('[createStudent] Not authenticated');
+      throw new Error('Authentication required. Please log in.');
     }
 
     // Validate required fields
@@ -911,7 +888,6 @@ export const nexusApi = {
       };
     }
 
-    console.log('[createStudent] Creating new student:', student.name);
 
     // Build Airtable fields
     const airtableFields: any = { fields: {} };
@@ -957,8 +933,6 @@ export const nexusApi = {
 
     // Create record in Airtable
     const studentsTableId = getTableId('students');
-    console.log('[createStudent] Table ID:', studentsTableId);
-    console.log('[createStudent] Request body:', JSON.stringify(airtableFields, null, 2));
     
     const response = await airtableRequest<{ id: string; fields: any }>(
       `/${studentsTableId}`,
@@ -968,23 +942,18 @@ export const nexusApi = {
       }
     );
 
-    console.log('[createStudent] Successfully created student:', response.id);
-    console.log('[createStudent] Response fields:', response.fields);
     return mapAirtableToStudent({ id: response.id, fields: response.fields });
   },
 
   getLessons: async (start: string, end: string, teacherId?: string): Promise<Lesson[]> => {
     // Fetch from Airtable - no fallback
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
-    console.log(`[DEBUG] getLessons called with start=${start}, end=${end}, teacherId=${teacherId}`);
     const lessonsTableId = getTableId('lessons');
     const startDatetimeField = getField('lessons', 'start_datetime');
     const statusField = getField('lessons', 'status');
-    console.log(`[DEBUG] Table ID: ${lessonsTableId}`);
-    console.log(`[DEBUG] Base ID: ${AIRTABLE_BASE_ID}`);
 
     // Filter by date range (inclusive of start and end day) with pagination
     const startDate = start.split('T')[0];
@@ -1010,132 +979,16 @@ export const nexusApi = {
     };
 
     const records = await listAllAirtableRecords<Record<string, unknown>>(lessonsTableId, params);
-    console.log(`[DEBUG] getLessons: fetched ${records.length} records in date range ${startDate}..${endDateStr}`);
 
     if (records.length === 0) {
       console.warn(`[DEBUG] Airtable returned 0 records for table ${lessonsTableId} in range`);
       return [];
     }
 
-    // Log first record details (dev)
-    if (records.length > 0) {
-      const firstRecord = records[0];
-      const lessonDetailsField = getField('lessons', 'פרטי_השיעור' as any);
-      const statusField = getField('lessons', 'status');
-      const existingStatusValue = firstRecord.fields?.[statusField];
-      
-      // Collect all unique status values from all records
-      const allStatusValues = [...new Set(records.map((r: any) => r.fields?.[statusField]).filter((v: any) => v))];
-      
-      console.log(`[DEBUG] First record ID: ${firstRecord.id}`);
-      console.log(`[DEBUG] First record fields:`, JSON.stringify(firstRecord.fields, null, 2));
-      console.log(`[DEBUG] First record start_datetime value:`, firstRecord.fields?.[startDatetimeField]);
-      console.log(`[DEBUG] First record 'פרטי השיעור' value:`, firstRecord.fields?.[lessonDetailsField]);
-      console.log(`[DEBUG] First record status value:`, existingStatusValue);
-      console.log(`[DEBUG] All unique status values in existing lessons:`, allStatusValues);
-      
-      // PART A: Identify the writable student linked record field
-      const allFieldNames = Object.keys(firstRecord.fields || {});
-      const studentRelatedFields = allFieldNames.filter(k => 
-        k.toLowerCase().includes('student') || 
-        k.includes('תלמיד') ||
-        k.toLowerCase().includes('student_id')
-      );
-      
-      console.log(`[DEBUG getLessons] PART A - Identifying writable Student linked record field:`);
-      console.log(`[DEBUG getLessons] PART A - All field names:`, allFieldNames);
-      console.log(`[DEBUG getLessons] PART A - Student-related fields:`, studentRelatedFields);
-      
-      // Check each student-related field to determine if it's a writable linked record
-      studentRelatedFields.forEach(fieldName => {
-        const fieldValue = firstRecord.fields[fieldName];
-        const isArray = Array.isArray(fieldValue);
-        const firstItem = isArray && fieldValue.length > 0 ? fieldValue[0] : null;
-        const firstItemIsString = typeof firstItem === 'string';
-        const firstItemIsObject = typeof firstItem === 'object' && firstItem !== null;
-        const hasRecId = firstItemIsString && firstItem.startsWith('rec') || 
-                        (firstItemIsObject && firstItem.id && firstItem.id.startsWith('rec'));
-        
-        console.log(`[DEBUG getLessons] PART A - Field "${fieldName}":`, {
-          type: typeof fieldValue,
-          isArray,
-          value: JSON.stringify(fieldValue),
-          firstItem,
-          firstItemType: typeof firstItem,
-          hasRecId,
-          isWritableLinkedRecord: isArray && hasRecId
-        });
-        
-        // Determine if this is a writable linked record field
-        if (isArray && hasRecId) {
-          console.log(`[DEBUG getLessons] PART A - ✅ "${fieldName}" appears to be a WRITABLE linked record field (array of rec... IDs)`);
-          console.log(`[DEBUG getLessons] PART A - Use this field name in config: lessonStudent: '${fieldName}'`);
-        } else if (isArray && firstItemIsObject && firstItem.name) {
-          console.log(`[DEBUG getLessons] PART A - ❌ "${fieldName}" appears to be a LOOKUP field (array of objects with name) - NOT writable`);
-        } else if (typeof fieldValue === 'string' && fieldValue.startsWith('rec')) {
-          console.log(`[DEBUG getLessons] PART A - ⚠️ "${fieldName}" is a single string rec ID - may need array wrapper`);
-        }
-      });
-      
-      // Check "Student" field specifically
-      console.log(`[DEBUG getLessons] PART A - "Student" field analysis:`);
-      const studentField = firstRecord.fields?.['Student'];
-      if (Array.isArray(studentField) && studentField.length > 0) {
-        const first = studentField[0];
-        if (typeof first === 'string' && first.startsWith('rec')) {
-          console.log(`[DEBUG getLessons] PART A - "Student" is array of rec IDs - WRITABLE ✅`);
-        } else if (typeof first === 'object' && first.id && first.id.startsWith('rec')) {
-          console.log(`[DEBUG getLessons] PART A - "Student" is array of objects with rec IDs - WRITABLE ✅`);
-        } else if (typeof first === 'object' && first.name) {
-          console.log(`[DEBUG getLessons] PART A - "Student" is array of objects with names - LOOKUP field, NOT writable ❌`);
-        }
-      }
-      
-      // Check Hebrew fields containing "תלמיד"
-      const hebrewStudentFields = allFieldNames.filter(k => k.includes('תלמיד'));
-      console.log(`[DEBUG getLessons] PART A - Hebrew fields containing "תלמיד":`, hebrewStudentFields);
-      hebrewStudentFields.forEach(fieldName => {
-        const fieldValue = firstRecord.fields[fieldName];
-        console.log(`[DEBUG getLessons] PART A - Hebrew field "${fieldName}":`, {
-          type: typeof fieldValue,
-          isArray: Array.isArray(fieldValue),
-          value: JSON.stringify(fieldValue),
-          isWritable: Array.isArray(fieldValue) && fieldValue.length > 0 && 
-                     (typeof fieldValue[0] === 'string' && fieldValue[0].startsWith('rec') ||
-                      (typeof fieldValue[0] === 'object' && fieldValue[0]?.id?.startsWith('rec')))
-        });
-      });
-      
-      // STEP 3: Inspect ALL field names to identify correct mappings
-      // Reuse allFieldNames declared above in PART A
-      const hebrewFields = allFieldNames.filter(k => /[\u0590-\u05FF]/.test(k));
-      const subjectRelatedFields = allFieldNames.filter(k => 
-        k.toLowerCase().includes('subject') || 
-        k.toLowerCase().includes('סוג') || 
-        k.toLowerCase().includes('type') ||
-        k.toLowerCase().includes('שיעור')
-      );
-      
-      console.log(`[DEBUG getLessons] STEP 3 - ALL field names in existing lesson record:`, allFieldNames);
-      console.log(`[DEBUG getLessons] STEP 3 - Hebrew field names:`, hebrewFields);
-      console.log(`[DEBUG getLessons] STEP 3 - Subject/Type related fields:`, subjectRelatedFields);
-      console.log(`[DEBUG getLessons] STEP 3 - Subject field (exact):`, firstRecord.fields?.['Subject']);
-      console.log(`[DEBUG getLessons] STEP 3 - subject field (lowercase):`, firstRecord.fields?.['subject']);
-      console.log(`[DEBUG getLessons] STEP 3 - Full field structure:`, JSON.stringify(firstRecord.fields, null, 2));
-      
-      // Log for field mapping discovery
-      console.log(`[DEBUG getLessons] STEP 3 - FIELD MAPPING DISCOVERY:`);
-      console.log(`[DEBUG getLessons] STEP 3 - Use these field names in config/airtable.ts:`);
-      allFieldNames.forEach(fieldName => {
-        console.log(`[DEBUG getLessons] STEP 3 -   "${fieldName}": ${JSON.stringify(firstRecord.fields[fieldName])}`);
-      });
-    }
     
     const lessons = records.map((r: any) => mapAirtableToLesson(r));
     // Exclude cancelled lessons so they don't appear in calendar or affect overlap logic
-    const lessonsFiltered = lessons.filter(l => l.status !== LessonStatus.CANCELLED && l.status !== LessonStatus.PENDING_CANCEL);
-    console.log(`[Airtable] Fetched ${lessons.length} lessons (${lessonsFiltered.length} after excluding cancelled)`);
-    console.log(`[DEBUG] Mapped lessons:`, lessonsFiltered.slice(0, 2)); // Log first 2 mapped lessons
+    const lessonsFiltered = lessons.filter(l => l.status !== LessonStatus.CANCELLED && l.status !== LessonStatus.CANCELLED_BY_ADMIN);
 
     // Store raw records in a map for modal access
     const rawRecordsMap = new Map<string, any>();
@@ -1150,8 +1003,8 @@ export const nexusApi = {
   },
 
   getWeeklySlots: async (): Promise<WeeklySlot[]> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
     const tableId = AIRTABLE_CONFIG.tables.weekly_slot;
@@ -1198,16 +1051,6 @@ export const nexusApi = {
       
       // Log raw value for debugging (first 5 records only)
       const recordIndex = records.indexOf(record);
-      if (import.meta.env.DEV && recordIndex < 5) {
-        console.log(`[DEBUG getWeeklySlots] Record ${record.id} (index ${recordIndex}):`, {
-          dayNumValue: dayNumValue,
-          dayNumType: typeof dayNumValue,
-          dayOfWeekValue: dayOfWeekValue,
-          dayOfWeekType: typeof dayOfWeekValue,
-          usingField: dayNumValue !== null && dayNumValue !== undefined && dayNumValue !== '' ? 'day_num' : 'day_of_week',
-          rawValue: rawValue,
-        });
-      }
       
       if (rawValue === null || rawValue === undefined || rawValue === '') {
         dayOfWeek = 0; // Default to Sunday
@@ -1231,9 +1074,6 @@ export const nexusApi = {
         } else {
           dayOfWeek = 0;
         }
-        if (import.meta.env.DEV && recordIndex < 5) {
-          console.log(`[DEBUG getWeeklySlots] Record ${record.id} - Parsed string "${rawValue}" -> ${dayOfWeek}`);
-        }
       } else if (typeof rawValue === 'number') {
         // day_num is 1-7 (1=Sunday), convert to 0-6 (0=Sunday)
         // day_of_week might be 0-6, so handle both
@@ -1243,9 +1083,6 @@ export const nexusApi = {
         } else {
           // Already in 0-6 format
           dayOfWeek = Math.max(0, Math.min(6, num));
-        }
-        if (import.meta.env.DEV && recordIndex < 5) {
-          console.log(`[DEBUG getWeeklySlots] Record ${record.id} - Normalized number ${rawValue} -> ${dayOfWeek}`);
         }
       } else {
         dayOfWeek = 0; // Default to Sunday if invalid type
@@ -1335,10 +1172,6 @@ export const nexusApi = {
         }
       }
       
-      // DEBUG LOG: Show type mapping (temporary, remove before commit)
-      if (import.meta.env.DEV && recordIndex < 10) {
-        console.log(`[DEBUG getWeeklySlots] Slot ${record.id.substring(0, 8)}: type="${rawTypeValue}" → mapped="${type}", reserved_for_count=${reservedForIds.length}`);
-      }
       
       return {
         id: record.id,
@@ -1364,22 +1197,6 @@ export const nexusApi = {
     
     // Filter out invalid slots (missing required fields)
     // NOTE: We allow slots without teacherId/teacherName to still render (show teacherId as fallback)
-    if (import.meta.env.DEV) {
-      console.log(`[DEBUG getWeeklySlots] Before API filter: ${slots.length} slots`);
-      if (slots.length > 0) {
-        console.log(`[DEBUG getWeeklySlots] First mapped record example:`, {
-          id: slots[0].id,
-          dayOfWeek: slots[0].dayOfWeek,
-          dayOfWeekType: typeof slots[0].dayOfWeek,
-          startTime: slots[0].startTime,
-          endTime: slots[0].endTime,
-          teacherId: slots[0].teacherId,
-          teacherName: slots[0].teacherName,
-          type: slots[0].type,
-          status: slots[0].status,
-        });
-      }
-    }
     
     const validSlots = slots.filter(slot => {
       // Only filter out slots missing critical time fields
@@ -1413,20 +1230,6 @@ export const nexusApi = {
           perDayCounts[day] = (perDayCounts[day] || 0) + 1;
         }
       });
-      console.log(`[DEBUG getWeeklySlots] After API filter: ${validSlots.length} slots (dropped ${slots.length - validSlots.length})`);
-      console.log(`[DEBUG getWeeklySlots] Per-day distribution:`, perDayCounts);
-      
-      // Show sample of first 3 slots with their dayOfWeek values
-      if (validSlots.length > 0) {
-        console.log(`[DEBUG getWeeklySlots] Sample slots (first 3):`, 
-          validSlots.slice(0, 3).map(s => ({
-            id: s.id.substring(0, 8),
-            dayOfWeek: s.dayOfWeek,
-            dayOfWeekType: typeof s.dayOfWeek,
-            startTime: s.startTime,
-          }))
-        );
-      }
       
       // Warn if all slots are in the same day
       const nonZeroDays = Object.values(perDayCounts).filter(count => count > 0).length;
@@ -1438,13 +1241,12 @@ export const nexusApi = {
       }
     }
     
-    console.log(`[nexusApi] Fetched ${validSlots.length} weekly slots from ${records.length} records`);
     return validSlots as WeeklySlot[];
   },
 
   getSlotInventory: async (start: string, end: string, teacherId?: string): Promise<SlotInventory[]> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
     const tableId = AIRTABLE_CONFIG.tables.slot_inventory;
@@ -1466,9 +1268,6 @@ export const nexusApi = {
       const escapedTeacherId = escapeAirtableString(teacherId);
       filterFormula = `AND(${filterFormula}, FIND("${escapedTeacherId}", ARRAYJOIN({${teacherIdField}})) > 0)`;
     }
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1164',message:'getSlotInventory: filter formula',data:{start,end,startDate,endDate,teacherId,filterFormula,dateField},timestamp:Date.now(),sessionId:'debug-session',runId:'run3',hypothesisId:'C'})}).catch(()=>{});
-    // #endregion
     
     // Fetch all records with pagination, sorted by date then start time
     const params: Record<string, string | undefined> = {
@@ -1480,9 +1279,6 @@ export const nexusApi = {
       'sort[1][direction]': 'asc',
     };
     const records = await listAllAirtableRecords(tableId, params);
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1181',message:'getSlotInventory: fetched records',data:{recordsCount:records.length,requestedStartDate:startDate,requestedEndDate:endDate,teacherId,sampleDates:records.slice(0,5).map(r=>r.fields[dateField])},timestamp:Date.now(),sessionId:'debug-session',runId:'run3',hypothesisId:'C'})}).catch(()=>{});
-    // #endregion
     
     // PART 1: DEV logging to PROVE duplicates source
     if (import.meta.env?.DEV) {
@@ -1490,11 +1286,6 @@ export const nexusApi = {
       const uniqueIds = new Set(recordIds);
       const duplicateById = recordIds.length !== uniqueIds.size;
       
-      // Log raw Airtable records
-      console.log(`[getSlotInventory] PART 1 - Raw fetch analysis:`);
-      console.log(`  Total raw Airtable records: ${records.length}`);
-      console.log(`  Unique record.id count: ${uniqueIds.size}`);
-      console.log(`  First 10 record IDs:`, recordIds.slice(0, 10));
       
       if (duplicateById) {
         const duplicates = recordIds.filter((id, idx) => recordIds.indexOf(id) !== idx);
@@ -1551,12 +1342,6 @@ export const nexusApi = {
           console.warn(`    composite "${key}": ${ids.length} records (${ids.slice(0, 3).join(', ')}...)`);
         });
       }
-      
-      // Summary
-      console.log(`[getSlotInventory] PART 1 Summary:`);
-      console.log(`  Duplicates by record.id: ${duplicateById ? 'YES' : 'NO'}`);
-      console.log(`  Duplicates by natural_key: ${duplicateByNaturalKey.length > 0 ? `YES (${duplicateByNaturalKey.length} keys)` : 'NO'}`);
-      console.log(`  Duplicates by composite key: ${duplicateByCompositeKey.length > 0 ? `YES (${duplicateByCompositeKey.length} keys)` : 'NO'}`);
     }
     
     // Keep records as-is for now (will dedupe in Part 2)
@@ -1590,28 +1375,8 @@ export const nexusApi = {
             : (typeof sourceValue === 'string' ? sourceValue : sourceValue?.id || undefined))
         : undefined;
       
-      // Extract status
       const statusField = getField('slotInventory', 'סטטוס');
-      const rawStatusValue = fields[statusField] || 'open';
-      // Normalize status value: trim whitespace and handle both Hebrew and English
-      const statusValue = typeof rawStatusValue === 'string' ? rawStatusValue.trim() : String(rawStatusValue).trim();
-      // Map status values (Hebrew and English) to internal enum for consistency
-      // Hebrew: "פתוח" → 'open', "סגור" → 'closed', "חסום ע"י מנהל" → 'blocked', "מבוטל" → 'canceled'
-      // English: "open" → 'open', "closed"/"booked" → 'closed', "blocked" → 'blocked', "canceled" → 'canceled'
-      const status = (
-        statusValue === 'פתוח' || statusValue === 'open'
-          ? 'open'
-          : statusValue === 'סגור' || statusValue === 'closed' || statusValue === 'booked'
-          ? 'closed'
-          : statusValue === 'חסום ע"י מנהל' || statusValue === 'חסום' || statusValue === 'blocked'
-          ? 'blocked'
-          : statusValue === 'מבוטל' || statusValue === 'canceled'
-          ? 'canceled'
-          : 'open' // Default to 'open' for unknown values
-      ) as 'open' | 'closed' | 'canceled' | 'blocked';
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:1180',message:'getSlotInventory: status mapping',data:{recordId:record.id,rawStatusValue:statusValue,mappedStatus:status,statusField},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-      // #endregion
+      const status = normalizeSlotStatus(fields[statusField]);
       
       const occupied = fields[getField('slotInventory', 'תפוסה_נוכחית' as any)] as number || 0;
       const capacity = fields[getField('slotInventory', 'קיבולת_כוללת' as any)] as number || 1;
@@ -1651,7 +1416,6 @@ export const nexusApi = {
         capacityOptional: capacity,
         students: studentIds,
         lessons: lessonIds, // Include linked lessons for filtering
-        dayOfWeek: fields.day_of_week,
         startDT: fields.StartDT,
         endDT: fields.EndDT,
         isFull: fields.is_full === true || fields.is_full === 1,
@@ -1662,7 +1426,6 @@ export const nexusApi = {
         lessonDate?: string; 
         lessonType?: string; 
         sourceWeeklySlot?: string; 
-        dayOfWeek?: number; 
         startDT?: string; 
         endDT?: string; 
         isFull?: boolean; 
@@ -1746,39 +1509,12 @@ export const nexusApi = {
         const winner = selectWinner(existing, slot);
         dedupeMap.set(key, winner);
         
-        if (import.meta.env?.DEV) {
-          const loser = winner.id === existing.id ? slot : existing;
-          console.log(`[getSlotInventory] PART 2 - Dedupe: key "${key}" had ${existing.id === winner.id ? 'existing' : 'new'} winner (${winner.id}), removed ${loser.id}`);
-        }
       }
     }
     
     const deduplicatedInventory = Array.from(dedupeMap.values());
     const afterCount = deduplicatedInventory.length;
     
-    // DEV: Log deduplication results
-    if (import.meta.env?.DEV) {
-      console.log(`[getSlotInventory] PART 2 - Deduplication results:`);
-      console.log(`  Before: ${beforeCount} slots`);
-      console.log(`  After: ${afterCount} slots`);
-      console.log(`  Removed: ${beforeCount - afterCount} duplicates`);
-      
-      if (beforeCount !== afterCount) {
-        // Show which keys had duplicates
-        const keyCounts = new Map<string, number>();
-        mappedInventory.forEach(slot => {
-          const key = getDedupeKey(slot);
-          keyCounts.set(key, (keyCounts.get(key) || 0) + 1);
-        });
-        const duplicateKeys = Array.from(keyCounts.entries()).filter(([_, count]) => count > 1);
-        if (duplicateKeys.length > 0) {
-          console.log(`  Duplicate keys found: ${duplicateKeys.length}`);
-          duplicateKeys.slice(0, 5).forEach(([key, count]) => {
-            console.log(`    "${key}": ${count} records`);
-          });
-        }
-      }
-    }
     
     // Sort deterministically: by date, then startTime
     deduplicatedInventory.sort((a, b) => {
@@ -1787,13 +1523,12 @@ export const nexusApi = {
       return a.startTime.localeCompare(b.startTime);
     });
     
-    console.log(`[nexusApi] Fetched ${deduplicatedInventory.length} slot inventory records (from ${records.length} raw records)`);
     return deduplicatedInventory as SlotInventory[];
   },
 
   updateWeeklySlot: async (id: string, updates: Partial<WeeklySlot>): Promise<WeeklySlot> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
     const tableId = AIRTABLE_CONFIG.tables.weekly_slot;
@@ -1948,13 +1683,12 @@ export const nexusApi = {
       status: 'active',
     };
     
-    console.log(`[nexusApi] Updated weekly slot ${id}`);
     return updatedSlot;
   },
 
   updateSlotInventory: async (id: string, updates: Partial<SlotInventory>): Promise<SlotInventory> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
     const tableId = AIRTABLE_CONFIG.tables.slot_inventory;
@@ -2026,7 +1760,6 @@ export const nexusApi = {
       
       fields[teacherIdField] = [trimmedTeacherId];
       
-      console.log(`[nexusApi] Setting teacherId field "${teacherIdField}" to array:`, [trimmedTeacherId]);
     }
     if (updates.date !== undefined || (updates as any).lessonDate !== undefined) {
       fields[getField('slotInventory', 'תאריך_שיעור')] = updates.date || (updates as any).lessonDate;
@@ -2053,15 +1786,9 @@ export const nexusApi = {
       fields[getField('slotInventory', 'סוג_שיעור')] = (updates as any).lessonType;
     }
     if (updates.status !== undefined) {
-      // Map new status values to Airtable values if needed
-      let statusValue = updates.status as string;
-      if (statusValue === 'closed') statusValue = 'סגור';
-      if (statusValue === 'canceled') statusValue = 'מבוטל';
-      if (statusValue === 'blocked') statusValue = 'חסום ע"י מנהל';
+      let statusValue = slotStatusToAirtable(updates.status as string);
       
-      // DATA LAYER: Prevent opening slot if lessons overlap
-      // If trying to set status to "open", check for overlapping lessons first
-      if (statusValue === 'open' || statusValue === 'פתוח') {
+      if (normalizeSlotStatus(statusValue) === 'open') {
         try {
           // Fetch current slot to get date/time/teacher if not in updates
           const currentSlot = await (async () => {
@@ -2144,12 +1871,6 @@ export const nexusApi = {
           const newNaturalKey = generateNaturalKeyFromStrings(finalTeacherId, finalDate, finalStartTime);
           fields.natural_key = newNaturalKey;
           
-          if (import.meta.env?.DEV) {
-            const oldNaturalKey = currentFields.natural_key || '';
-            if (oldNaturalKey !== newNaturalKey) {
-              console.log(`[updateSlotInventory] natural_key updated: "${oldNaturalKey}" -> "${newNaturalKey}"`);
-            }
-          }
         }
       } catch (nkError: any) {
         // Don't fail the update if natural_key recomputation fails - log and continue
@@ -2232,19 +1953,7 @@ export const nexusApi = {
     
     const dateField = getField('slotInventory', 'תאריך_שיעור');
     const statusField = getField('slotInventory', 'סטטוס');
-    const statusValue = responseFields[statusField] || 'open';
-    // Normalize status: handle Hebrew values and map to internal enum
-    const status = (
-      statusValue === 'open' || statusValue === 'פתוח'
-        ? 'open'
-        : statusValue === 'closed' || statusValue === 'סגור' || statusValue === 'booked'
-        ? 'closed'
-        : statusValue === 'canceled' || statusValue === 'מבוטל'
-        ? 'canceled'
-        : statusValue === 'blocked' || statusValue === 'חסום ע"י מנהל' || statusValue === 'חסום'
-        ? 'blocked'
-        : 'open' // Default to 'open' for unknown values
-    ) as 'open' | 'closed' | 'canceled' | 'blocked';
+    const status = normalizeSlotStatus(responseFields[statusField]);
     
     // Extract lesson IDs from linked record field
     const lessonsField = getField('slotInventory', 'lessons');
@@ -2267,7 +1976,6 @@ export const nexusApi = {
       lessons: lessonIds, // Include linked lessons for filtering
     };
     
-    console.log(`[nexusApi] Updated slot inventory ${id}`);
     return updatedInventory;
   },
 
@@ -2311,8 +2019,8 @@ export const nexusApi = {
   },
 
   deleteSlotInventory: async (id: string): Promise<void> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
     const tableId = AIRTABLE_CONFIG.tables.slot_inventory;
@@ -2325,7 +2033,6 @@ export const nexusApi = {
       }
     );
     
-    console.log(`[nexusApi] Deleted slot inventory ${id}`);
   },
 
   createWeeklySlot: async (slot: Partial<WeeklySlot>): Promise<WeeklySlot> => {
@@ -2378,56 +2085,241 @@ export const nexusApi = {
     slotInventoryCount: number;
     fixedLessonsCount: number;
   }> => {
-    console.log(`[nexusApi] openWeekSlots called for week starting ${weekStart.toISOString()}`);
     return openNewWeekService(weekStart);
   },
 
   getHomeworkLibrary: async (): Promise<HomeworkLibraryItem[]> => {
-    // Fetch from Airtable - no fallback
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
-    const params = new URLSearchParams({
-      pageSize: '100',
-    });
-    const response = await airtableRequest<{ records: any[] }>(`/${AIRTABLE_CONFIG.tables.homework}?${params}`);
-    const homework = response.records.map((record: any) => {
-      const fields = record.fields || {};
+    const homeworkTableId = getTableId('homework');
+    const params = new URLSearchParams({ pageSize: '100' });
+    const response = await airtableRequest<{ records: any[] }>(`/${homeworkTableId}?${params}`);
+    return response.records.map((record: any) => {
+      const f = record.fields || {};
+      const attachments = f['\u05DE\u05E1\u05DE\u05DB\u05D9\u05DD'];
       return {
         id: record.id,
-        title: fields['Title'] || fields['title'] || '',
-        subject: fields['Subject'] || fields['subject'] || '',
-        level: fields['Level'] || fields['level'] || '',
-        description: fields['Description'] || fields['description'] || '',
-        attachmentUrl: fields['Attachment_URL'] || fields['attachment_url'],
+        topic: f['topic'] || '',
+        description: f['description'] || '',
+        status: f['status'] || '',
+        level: f['\u05E8\u05DE\u05D4'] || '',
+        grade: f['\u05DB\u05D9\u05EA\u05D4'] || '',
+        subTopic: f['\u05EA\u05EA \u05E0\u05D5\u05E9\u05D0'] || '',
+        attachments: Array.isArray(attachments)
+          ? attachments.map((a: any) => ({ id: a.id, url: a.url, filename: a.filename }))
+          : undefined,
       };
     });
-    console.log(`[Airtable] Fetched ${homework.length} homework items`);
-    return homework;
   },
 
-  getHomeworkAssignments: (): Promise<HomeworkAssignment[]> => {
-    // Use mock data only
-    return Promise.resolve([
-      { id: 'as1', studentId: '1', studentName: 'אבי כהן', homeworkId: 'hw1', homeworkTitle: 'פונקציות קוויות', status: 'assigned', dueDate: '2024-03-30', assignedDate: '2024-03-20' }
-    ]);
+  getHomeworkAssignments: async (): Promise<HomeworkAssignment[]> => {
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
+    }
+
+    const assignmentsTableId = getTableId('homeworkAssignments');
+    const sortParams = 'sort%5B0%5D%5Bfield%5D=due_date&sort%5B0%5D%5Bdirection%5D=desc';
+    const statusMap: Record<string, 'assigned' | 'done' | 'reviewed'> = {
+      '\u05D4\u05D5\u05E7\u05E6\u05D4': 'assigned',
+      '\u05D4\u05D5\u05D2\u05E9': 'done',
+      '\u05E0\u05D1\u05D3\u05E7': 'reviewed',
+    };
+
+    const all: HomeworkAssignment[] = [];
+    let offsetToken: string | undefined;
+
+    do {
+      const offsetParam = offsetToken ? `&offset=${encodeURIComponent(offsetToken)}` : '';
+      const response = await airtableRequest<{ records: any[]; offset?: string }>(
+        `/${assignmentsTableId}?pageSize=100&${sortParams}${offsetParam}`
+      );
+
+      for (const record of response.records) {
+        const f = record.fields || {};
+        const rawStudentId = f['student_id'];
+        const studentId = Array.isArray(rawStudentId) ? rawStudentId[0] || '' : rawStudentId || '';
+        all.push({
+          id: record.id,
+          homeworkId: f['homework_id'] || 0,
+          studentId,
+          studentName: f['student_name'] || '',
+          homeworkTitle: f['homework_title'] || '',
+          dueDate: f['due_date'] || '',
+          assignedDate: f['assigned_date'] || '',
+          status: statusMap[f['status']] || 'assigned',
+          notes: f['notes'] || '',
+        });
+      }
+
+      offsetToken = response.offset;
+    } while (offsetToken);
+
+    return all;
   },
 
-  assignHomework: (payload: Partial<HomeworkAssignment>): Promise<HomeworkAssignment> => {
-    // Mock assignment only
-    return Promise.resolve({
-      id: Math.random().toString(36).substr(2, 9),
-      ...payload,
-      assignedDate: new Date().toISOString(),
-      status: 'assigned'
-    } as HomeworkAssignment);
+  assignHomework: async (payload: Partial<HomeworkAssignment>): Promise<HomeworkAssignment> => {
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
+    }
+
+    const assignmentsTableId = getTableId('homeworkAssignments');
+    const today = new Date().toISOString().split('T')[0];
+    // student_id may be a linked-record field (expects array) or plain text
+    const studentIdValue = payload.studentId?.startsWith('rec')
+      ? [payload.studentId]
+      : payload.studentId || '';
+    const response = await airtableRequest<{ id: string; fields: any }>(`/${assignmentsTableId}`, {
+      method: 'POST',
+      body: JSON.stringify({
+        fields: {
+          homework_id: payload.homeworkId || 0,
+          student_id: studentIdValue,
+          student_name: payload.studentName || '',
+          homework_title: payload.homeworkTitle || '',
+          due_date: payload.dueDate || '',
+          assigned_date: today,
+          status: '\u05D4\u05D5\u05E7\u05E6\u05D4',
+          notes: payload.notes || '',
+        },
+      }),
+    });
+    const rawId = response.fields['student_id'];
+    return {
+      id: response.id,
+      homeworkId: response.fields['homework_id'] || payload.homeworkId || 0,
+      studentId: Array.isArray(rawId) ? rawId[0] || '' : rawId || payload.studentId || '',
+      studentName: response.fields['student_name'] || payload.studentName || '',
+      homeworkTitle: response.fields['homework_title'] || payload.homeworkTitle || '',
+      dueDate: response.fields['due_date'] || payload.dueDate || '',
+      assignedDate: response.fields['assigned_date'] || today,
+      status: 'assigned',
+      notes: response.fields['notes'] || '',
+    };
+  },
+
+  createHomeworkLibraryItem: async (item: Partial<HomeworkLibraryItem>): Promise<HomeworkLibraryItem> => {
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
+    }
+    const homeworkTableId = getTableId('homework');
+    const fields: Record<string, any> = {};
+    if (item.topic) fields['topic'] = item.topic;
+    if (item.description) fields['description'] = item.description;
+    if (item.status) fields['status'] = item.status;
+    if (item.level) fields['\u05E8\u05DE\u05D4'] = item.level;
+    if (item.grade) fields['\u05DB\u05D9\u05EA\u05D4'] = item.grade;
+    if (item.subTopic) fields['\u05EA\u05EA \u05E0\u05D5\u05E9\u05D0'] = item.subTopic;
+    if (item.attachments && item.attachments.length > 0) {
+      fields['\u05DE\u05E1\u05DE\u05DB\u05D9\u05DD'] = item.attachments.map(a => ({ url: a.url }));
+    }
+    const response = await airtableRequest<{ id: string; fields: any }>(`/${homeworkTableId}`, {
+      method: 'POST',
+      body: JSON.stringify({ fields, typecast: true }),
+    });
+    const f = response.fields || {};
+    const attachments = f['\u05DE\u05E1\u05DE\u05DB\u05D9\u05DD'];
+    return {
+      id: response.id,
+      topic: f['topic'] || '',
+      description: f['description'] || '',
+      status: f['status'] || '',
+      level: f['\u05E8\u05DE\u05D4'] || '',
+      grade: f['\u05DB\u05D9\u05EA\u05D4'] || '',
+      subTopic: f['\u05EA\u05EA \u05E0\u05D5\u05E9\u05D0'] || '',
+      attachments: Array.isArray(attachments)
+        ? attachments.map((a: any) => ({ id: a.id, url: a.url, filename: a.filename }))
+        : undefined,
+    };
+  },
+
+  updateHomeworkLibraryItem: async (id: string, item: Partial<HomeworkLibraryItem>): Promise<HomeworkLibraryItem> => {
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
+    }
+    const homeworkTableId = getTableId('homework');
+    const fields: Record<string, any> = {};
+    if (item.topic !== undefined) fields['topic'] = item.topic;
+    if (item.description !== undefined) fields['description'] = item.description;
+    if (item.status !== undefined) fields['status'] = item.status;
+    if (item.level !== undefined) fields['\u05E8\u05DE\u05D4'] = item.level;
+    if (item.grade !== undefined) fields['\u05DB\u05D9\u05EA\u05D4'] = item.grade;
+    if (item.subTopic !== undefined) fields['\u05EA\u05EA \u05E0\u05D5\u05E9\u05D0'] = item.subTopic;
+    if (item.attachments !== undefined) {
+      // For existing attachments, send their Airtable ID to keep them.
+      // For new attachments, send the URL so Airtable downloads them.
+      fields['\u05DE\u05E1\u05DE\u05DB\u05D9\u05DD'] = item.attachments.map(a =>
+        a.id ? { id: a.id } : { url: a.url }
+      );
+    }
+    const response = await airtableRequest<{ id: string; fields: any }>(`/${homeworkTableId}/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ fields, typecast: true }),
+    });
+    const f = response.fields || {};
+    const attachments = f['\u05DE\u05E1\u05DE\u05DB\u05D9\u05DD'];
+    return {
+      id: response.id,
+      topic: f['topic'] || '',
+      description: f['description'] || '',
+      status: f['status'] || '',
+      level: f['\u05E8\u05DE\u05D4'] || '',
+      grade: f['\u05DB\u05D9\u05EA\u05D4'] || '',
+      subTopic: f['\u05EA\u05EA \u05E0\u05D5\u05E9\u05D0'] || '',
+      attachments: Array.isArray(attachments)
+        ? attachments.map((a: any) => ({ id: a.id, url: a.url, filename: a.filename }))
+        : undefined,
+    };
+  },
+
+  deleteHomeworkLibraryItem: async (id: string): Promise<void> => {
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
+    }
+    const homeworkTableId = getTableId('homework');
+    await airtableRequest(`/${homeworkTableId}/${id}`, {
+      method: 'DELETE',
+    });
+  },
+
+  uploadTmpFile: async (file: File): Promise<{ url: string; fileId: string }> => {
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
+    }
+    const token = getAuthToken();
+    const base64 = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = reader.result as string;
+        resolve(result.split(',')[1]);
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+    const response = await fetch(apiUrl('/api/tmp-upload'), {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        filename: file.name,
+        contentType: file.type || 'application/octet-stream',
+        data: base64,
+      }),
+    });
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`Upload failed: ${errText}`);
+    }
+    return response.json();
   },
 
   updateLesson: async (id: string, updates: Partial<Lesson>): Promise<Lesson> => {
     // Update in Airtable - no fallback
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
     // NOTE: Slot conflict checking removed from updateLesson
@@ -2443,24 +2335,17 @@ export const nexusApi = {
       `/${lessonsTableId}/${id}`,
       {
         method: 'PATCH',
-        body: JSON.stringify(airtableFields),
+        body: JSON.stringify({ ...airtableFields, typecast: true }),
       }
     );
     // Airtable returns { id, fields } on PATCH
     const updatedLesson = mapAirtableToLesson({ id: response.id || id, fields: response.fields });
-    console.log(`[Airtable] Updated lesson ${id}`);
     return updatedLesson;
   },
 
   getBillingKPIs: async (month: string): Promise<ChargesReportKPIs> => {
     try {
-      if (import.meta.env.DEV) {
-        console.log('[nexusApi] Fetching billing KPIs for month:', month);
-      }
       const kpis = await getChargesReportKPIs(airtableClient, month);
-      if (import.meta.env.DEV) {
-        console.log('[nexusApi] Received KPIs:', kpis);
-      }
       return kpis;
     } catch (error) {
       console.error('[nexusApi] Error fetching billing KPIs:', error);
@@ -2475,7 +2360,7 @@ export const nexusApi = {
     latePercent: number;
     revenueFromLate: number;
   }> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
+    if (!getAuthToken()) {
       return { totalCancellations: 0, lateCancellations: 0, latePercent: 0, revenueFromLate: 0 };
     }
     try {
@@ -2519,9 +2404,6 @@ export const nexusApi = {
       // Pass status filter directly to API (no mapping needed - getChargesReport supports all values)
       const apiStatusFilter: 'all' | 'draft' | 'sent' | 'paid' | 'link_sent' = options?.statusFilter || 'all';
       
-      if (import.meta.env.DEV) {
-        console.log('[nexusApi.getMonthlyBills] Fetching for month:', month, 'statusFilter:', apiStatusFilter, 'searchQuery:', options?.searchQuery);
-      }
       
       // Use the new charges report service with filters
       const report = await getChargesReport(airtableClient, {
@@ -2530,9 +2412,6 @@ export const nexusApi = {
         searchQuery: options?.searchQuery,
       });
       
-      if (import.meta.env.DEV) {
-        console.log('[nexusApi.getMonthlyBills] Got', report.rows.length, 'rows from getChargesReport');
-      }
       
       // Update cached schema if not already set (discovery already happened inside getChargesReport)
       if (!cachedChargeSchema) {
@@ -2553,7 +2432,7 @@ export const nexusApi = {
       }
 
       const studentNameMap = new Map<string, { name: string; parentName?: string; parentPhone?: string }>();
-      if (studentIds.size > 0 && AIRTABLE_API_KEY && AIRTABLE_BASE_ID) {
+      if (studentIds.size > 0 && getAuthToken()) {
         const studentsTableId = getTableId('students');
         const allIds = Array.from(studentIds);
         const chunkSize = 50; 
@@ -2711,21 +2590,11 @@ export const nexusApi = {
       if (fields.linkSent !== undefined) airtableFields[linkSentField] = fields.linkSent;
       if (fields.paid !== undefined) airtableFields[paidField] = fields.paid;
 
-      if (import.meta.env.DEV) {
-        console.log(`[nexusApi.updateBillStatus] Sending update to Airtable.`, {
-          table: billingTableId,
-          record: billId,
-          fields: airtableFields,
-        });
-      }
 
       return await airtableClient.updateRecord(billingTableId, billId, airtableFields, { typecast: true });
     };
 
     try {
-      if (import.meta.env.DEV) {
-        console.log(`[nexusApi.updateBillStatus] Starting update for bill ${billId}`, fields);
-      }
 
       // Try multiple known variations of field names if discovery is not reliable
       const approvedVariations = ['מאושר לחיוב', 'מאושר_לחיוב', 'Approved', 'מאושר'];
@@ -2761,7 +2630,7 @@ export const nexusApi = {
       const defaultPaid = AIRTABLE_CONFIG.fields.billingPaid || 'שולם';
 
       await performUpdate(defaultApproved, defaultLinkSent, defaultPaid);
-      if (import.meta.env.DEV) console.log('[nexusApi.updateBillStatus] Update successful with defaults');
+
 
     } catch (error: any) {
       console.error('[nexusApi.updateBillStatus] Final update failure:', {
@@ -2820,8 +2689,8 @@ export const nexusApi = {
 
   getSubscriptions: async (): Promise<Subscription[]> => {
     // Fetch from Airtable
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
     const params = new URLSearchParams({
@@ -2830,13 +2699,12 @@ export const nexusApi = {
     const subscriptionsTableId = getTableId('subscriptions');
     const response = await airtableRequest<{ records: any[] }>(`/${subscriptionsTableId}?${params}`);
     const subscriptions = response.records.map((record: any) => nexusApi.mapAirtableToSubscription(record));
-    console.log(`[Airtable] Fetched ${subscriptions.length} subscriptions`);
     return subscriptions;
   },
 
   createSubscription: async (subscription: Partial<Subscription>): Promise<Subscription> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
     if (!subscription.studentId) {
@@ -2881,13 +2749,12 @@ export const nexusApi = {
     );
 
     const newSubscription = nexusApi.mapAirtableToSubscription({ id: response.id, fields: response.fields });
-    console.log(`[Airtable] Created subscription ${response.id}`);
     return newSubscription;
   },
 
   updateSubscription: async (id: string, updates: Partial<Subscription>): Promise<Subscription> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
     const airtableFields: any = {
@@ -2929,7 +2796,6 @@ export const nexusApi = {
     );
 
     const updatedSubscription = nexusApi.mapAirtableToSubscription({ id: response.id || id, fields: response.fields });
-    console.log(`[Airtable] Updated subscription ${id}`);
     return updatedSubscription;
   },
 
@@ -2947,118 +2813,67 @@ export const nexusApi = {
     });
   },
 
-  // Search students with autocomplete
   searchStudents: async (query: string, limit: number = 15): Promise<Student[]> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
     if (query.length < 2) {
-      return []; // Require at least 2 characters
+      return [];
     }
 
     const searchQuery = query.trim().toLowerCase();
-    
+    const isActiveField = getField('students', 'is_active');
+    const fullNameField = getField('students', 'full_name');
+    const phoneField = getField('students', 'phone_number');
+
     // Try formula-based search first
     try {
-      // Use SEARCH-based formula for case-insensitive matching
-      // Try multiple possible field names for status and name
-      // Airtable field names might be: 'full_name', 'Full Name', 'fullName', etc.
-      const fullNameField = getField('students', 'full_name');
-      const phoneField = getField('students', 'phone_number');
       const filterFormula = `AND(
-        OR({is_active}=1, {Status}!='inactive', {status}!='inactive', {is_active}=TRUE()),
+        {${isActiveField}}=TRUE(),
         OR(
           SEARCH(LOWER("${searchQuery}"), LOWER({${fullNameField}}&"")),
           SEARCH(LOWER("${searchQuery}"), LOWER({${phoneField}}&""))
         )
       )`;
 
-      // URL-encode the filterByFormula
-      const encodedFormula = encodeURIComponent(filterFormula);
-      
       const params = new URLSearchParams({
-        filterByFormula: filterFormula, // URLSearchParams will encode it, but we also log the raw formula
+        filterByFormula: filterFormula,
         pageSize: String(limit),
         maxRecords: String(limit),
       });
       params.append('sort[0][field]', fullNameField);
       params.append('sort[0][direction]', 'asc');
-      
-      // Remove any view parameter if present
-      // params.delete('view'); // Not needed if we don't add it
 
       const studentsTableId = getTableId('students');
-      const url = `/${studentsTableId}?${params}`;
-      const fullUrl = `${API_BASE_URL}/${encodeURIComponent(AIRTABLE_BASE_ID)}${url}`;
-      
-      console.log(`[DEBUG Student Search] Query: "${query}"`);
-      console.log(`[DEBUG Student Search] Full URL: ${fullUrl}`);
-      console.log(`[DEBUG Student Search] Raw filterByFormula: ${filterFormula}`);
-      console.log(`[DEBUG Student Search] URL-encoded formula: ${encodedFormula}`);
-      console.log(`[DEBUG Student Search] Field names used: full_name="${fullNameField}", phone_number="${phoneField}"`);
-
       const response = await airtableRequest<{ records: any[] }>(`/${studentsTableId}?${params}`);
-      
-      console.log(`[DEBUG Student Search] Raw Airtable response:`, JSON.stringify(response, null, 2));
-      console.log(`[DEBUG Student Search] Number of records: ${response.records?.length || 0}`);
-      
-      if (response.records && response.records.length > 0) {
-        const firstRecord = response.records[0];
-        console.log(`[DEBUG Student Search] First record fields:`, Object.keys(firstRecord.fields || {}));
-        console.log(`[DEBUG Student Search] First record full_name value:`, firstRecord.fields?.[fullNameField]);
-        console.log(`[DEBUG Student Search] First record phone_number value:`, firstRecord.fields?.[phoneField]);
-        console.log(`[DEBUG Student Search] First record Status/is_active:`, firstRecord.fields?.Status || firstRecord.fields?.status || firstRecord.fields?.is_active);
-      }
-
       const students = response.records.map(mapAirtableToStudent);
-      console.log(`[Airtable] Searched students: found ${students.length} results for "${query}"`);
-      
+
       if (students.length > 0) {
         return students;
       }
     } catch (formulaError: any) {
-      console.warn(`[DEBUG Student Search] Formula-based search failed:`, formulaError);
-      console.warn(`[DEBUG Student Search] Falling back to local filtering...`);
+      console.warn('[searchStudents] Formula search failed, falling back to local filter:', formulaError);
     }
 
-    // Fallback: Fetch all active students and filter locally
-    console.log(`[DEBUG Student Search] Using fallback: fetching all students and filtering locally`);
+    // Fallback: fetch first page and filter locally
     try {
-      // Fetch directly using airtableRequest to avoid circular dependency
       const params = new URLSearchParams({ pageSize: '100' });
       const studentsTableId = getTableId('students');
       const response = await airtableRequest<{ records: any[] }>(`/${studentsTableId}?${params}`);
-      
-      // Log available field names from first record for debugging
-      if (response.records && response.records.length > 0) {
-        const firstRecord = response.records[0];
-        console.log(`[DEBUG Student Search Fallback] Available field names in first record:`, Object.keys(firstRecord.fields || {}));
-        console.log(`[DEBUG Student Search Fallback] First record fields object:`, firstRecord.fields);
-      }
-      
       const allStudents = response.records.map(mapAirtableToStudent);
-      console.log(`[DEBUG Student Search] Fetched ${allStudents.length} total students`);
-      
-      // Filter locally: case-insensitive search in name or phone, only active students
-      const filtered = allStudents
+
+      return allStudents
         .filter(student => {
-          // Check if student is active
-          const isActive = student.status !== 'inactive';
-          
-          // Case-insensitive search in name or phone
+          if (student.status === 'inactive') return false;
           const nameMatch = student.name?.toLowerCase().includes(searchQuery);
           const phoneMatch = student.phone?.toLowerCase().includes(searchQuery);
-          
-          return isActive && (nameMatch || phoneMatch);
+          return nameMatch || phoneMatch;
         })
         .slice(0, limit)
         .sort((a, b) => (a.name || '').localeCompare(b.name || '', 'he'));
-      
-      console.log(`[DEBUG Student Search] Local filter found ${filtered.length} results`);
-      return filtered;
     } catch (fallbackError: any) {
-      console.error(`[DEBUG Student Search] Fallback also failed:`, fallbackError);
+      console.error('[searchStudents] Fallback also failed:', fallbackError);
       return [];
     }
   },
@@ -3066,17 +2881,14 @@ export const nexusApi = {
   getStudentByRecordId: async (recordId: string): Promise<Student | null> => {
     if (!recordId || !recordId.startsWith('rec')) return null;
     
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
     try {
       const studentsTableId = getTableId('students');
       const response = await airtableRequest<{ id: string; fields: any }>(`/${studentsTableId}/${recordId}`);
       
-      if (import.meta.env.DEV) {
-        console.log('[nexusApi.getStudentByRecordId] Fetched student:', recordId, response.fields?.[getField('students', 'full_name')]);
-      }
       
       return mapAirtableToStudent(response);
     } catch (err: any) {
@@ -3095,8 +2907,8 @@ export const nexusApi = {
     teacherId?: string,
     excludeLessonId?: string
   ): Promise<Lesson[]> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
     // Build filter formula for overlapping lessons
@@ -3163,17 +2975,13 @@ export const nexusApi = {
     }
     
     const conflicts = filteredRecords.map(mapAirtableToLesson);
-    console.log(`[Airtable] Conflict check: found ${conflicts.length} conflicting lessons`);
     return conflicts;
   },
 
   // Create a new lesson with server-side validation
   createLesson: async (lesson: Partial<Lesson>): Promise<Lesson> => {
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:createLesson:entry',message:'createLesson ENTRY - starting function',data:{teacherId:lesson.teacherId,date:lesson.date,startTime:lesson.startTime,duration:lesson.duration,studentId:lesson.studentId,lessonType:lesson.lessonType,source:(lesson as any).source},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H1,H2'})}).catch(()=>{});
-    // #endregion
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
     // Validate required fields
@@ -3195,7 +3003,6 @@ export const nexusApi = {
       if (!studentCheck.records || studentCheck.records.length === 0) {
         console.warn(`[DEBUG createLesson] WARNING - Student ID ${lesson.studentId} not found in Students table`);
       } else {
-        console.log(`[DEBUG createLesson] Verified student ${lesson.studentId} exists in Students table`);
       }
     } catch (verifyError) {
       console.warn(`[DEBUG createLesson] Could not verify student ID (non-blocking):`, verifyError);
@@ -3221,7 +3028,6 @@ export const nexusApi = {
       };
     }
     
-    console.log(`[DEBUG createLesson] PART B - Validated student ID: ${studentRecordId}`);
 
     // PART C: Calculate start_datetime and end_datetime
     // FIX: Airtable interprets datetimes without timezone as UTC
@@ -3258,19 +3064,11 @@ export const nexusApi = {
       };
     }
     
-    console.log(`[DEBUG createLesson] PART C - Datetime calculation:`);
-    console.log(`[DEBUG createLesson] PART C - start_datetime (UTC): ${startDatetime}`);
-    console.log(`[DEBUG createLesson] PART C - duration: ${lesson.duration} minutes`);
-    console.log(`[DEBUG createLesson] PART C - end_datetime (UTC): ${endDatetime}`);
-    console.log(`[DEBUG createLesson] PART C - Validation: end > start: ${endTimeMs > startTimeMs} (${endTimeMs} > ${startTimeMs})`);
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:createLesson:beforeConflictCheck',message:'createLesson - BEFORE server-side lesson conflict check',data:{startDatetime,endDatetime,studentId:studentRecordId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H2,H4'})}).catch(()=>{});
-    // #endregion
 
     // Server-side conflict check (call the function directly, not through nexusApi to avoid circular reference)
     const conflicts = await (async () => {
-      if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-        throw new Error('Airtable API Key or Base ID not configured');
+      if (!getAuthToken()) {
+        throw new Error('Authentication required. Please log in.');
       }
 
       // Build filter formula for overlapping lessons
@@ -3335,9 +3133,6 @@ export const nexusApi = {
       return mappedConflicts;
     })();
 
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:createLesson:afterConflictCheck',message:'createLesson - AFTER server-side lesson conflict check',data:{conflictsCount:conflicts.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H2,H4'})}).catch(()=>{});
-    // #endregion
     if (conflicts.length > 0) {
       // Build detailed conflict message
       const conflictDetails = conflicts.map(c => 
@@ -3360,22 +3155,10 @@ export const nexusApi = {
     // (source === 'slot_inventory'), because slotBookingService already handles slot closure
     // This allows manual lesson creation without affecting slot_inventory
     const isFromSlotBooking = (lesson as any).source === 'slot_inventory';
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:2653',message:'createLesson: checking if conflict check should run',data:{teacherId:lesson.teacherId,date:lesson.date,startTime:lesson.startTime,hasAllRequired:!!(lesson.date && lesson.startTime),isFromSlotBooking},timestamp:Date.now(),sessionId:'debug-session',runId:'run2',hypothesisId:'B'})}).catch(()=>{});
-    // #endregion
-    if (isFromSlotBooking && import.meta.env.DEV) {
-      console.log(`[createLesson] Skipping slot conflict check - lesson is from slot_inventory booking (slotBookingService handles slot closure)`);
-    }
     if (lesson.date && lesson.startTime && !isFromSlotBooking) {
       try {
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:2656',message:'createLesson: resolving teacherId',data:{originalTeacherId:lesson.teacherId,teacherIdIsRecordId:lesson.teacherId?.startsWith('rec'),date:lesson.date,startTime:lesson.startTime,duration:lesson.duration || 60},timestamp:Date.now(),sessionId:'debug-session',runId:'run3',hypothesisId:'B'})}).catch(()=>{});
-        // #endregion
         // Resolve teacherId: convert number (e.g., "1") to record ID if needed
         const resolvedTeacherId = await resolveTeacherRecordId(lesson.teacherId);
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:2660',message:'createLesson: resolved teacherId',data:{originalTeacherId:lesson.teacherId,resolvedTeacherId,date:lesson.date,startTime:lesson.startTime,duration:lesson.duration || 60},timestamp:Date.now(),sessionId:'debug-session',runId:'run3',hypothesisId:'B'})}).catch(()=>{});
-        // #endregion
         const { validateConflicts } = await import('./conflictValidationService');
         const validationResult = await validateConflicts({
           teacherId: resolvedTeacherId, // undefined means check all teachers
@@ -3383,9 +3166,6 @@ export const nexusApi = {
           startTime: lesson.startTime,
           endTime: lesson.duration || 60, // duration in minutes
         });
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:2664',message:'createLesson: validateConflicts result',data:{openSlotsCount:validationResult.conflicts.openSlots.length,lessonsCount:validationResult.conflicts.lessons.length,openSlots:validationResult.conflicts.openSlots.map(s=>({id:s.id,status:s.status,date:s.date,startTime:s.startTime,endTime:s.endTime,teacherId:s.teacherId}))},timestamp:Date.now(),sessionId:'debug-session',runId:'run2',hypothesisId:'B,D,E'})}).catch(()=>{});
-        // #endregion
 
         // If there are overlapping open slots, prevent lesson creation
         if (validationResult.conflicts.openSlots.length > 0) {
@@ -3413,24 +3193,15 @@ export const nexusApi = {
           lesson.startTime,
           lesson.duration || 60
         );
-        if (closedSlots.length > 0 && import.meta.env.DEV) {
-          console.log(`[createLesson] Auto-closed ${closedSlots.length} overlapping open slot(s)`);
-        }
       } catch (conflictError: any) {
         // Re-throw conflict errors (they should prevent lesson creation)
         if (conflictError.code === 'CONFLICT_ERROR') {
-          // #region agent log
-          fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:createLesson:slotConflictError',message:'createLesson - SLOT CONFLICT ERROR thrown',data:{errorCode:conflictError.code,errorMessage:conflictError.message},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H1,H2'})}).catch(()=>{});
-          // #endregion
           throw conflictError;
         }
         // Log but don't fail lesson creation if other errors occur
         console.warn(`[createLesson] Failed to check/close overlapping slots:`, conflictError);
       }
     }
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:createLesson:afterSlotCheck',message:'createLesson - AFTER slot conflict check - preparing Airtable fields',data:{isFromSlotBooking},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H1'})}).catch(()=>{});
-    // #endregion
 
     // Prepare Airtable fields - ONLY use mapped fields from fieldMap
     const airtableFields: any = { fields: {} };
@@ -3487,7 +3258,6 @@ export const nexusApi = {
     // Write to the mapped field name (discovered from getLessons logs)
     // Format: array of record ID strings for linked record fields
     airtableFields.fields[studentFieldName] = studentIdsToLink;
-    console.log(`[DEBUG createLesson] PART B - Writing student(s) to field "${studentFieldName}" = ${JSON.stringify(studentIdsToLink)}`);
 
     // Add source if available
     try {
@@ -3516,16 +3286,12 @@ export const nexusApi = {
       if (lesson.teacherId.startsWith('rec')) {
         const teacherFieldName = getField('lessons', 'teacher_id');
         airtableFields.fields[teacherFieldName] = [lesson.teacherId];
-        console.log(`[DEBUG createLesson] Added teacher field "${teacherFieldName}" = ["${lesson.teacherId}"]`);
       } else {
         console.warn(`[DEBUG createLesson] Invalid teacher ID format: ${lesson.teacherId}`);
       }
     }
 
-    if (lesson.notes) {
-      const lessonDetailsField = getField('lessons', 'פרטי_השיעור' as any);
-      airtableFields.fields[lessonDetailsField] = lesson.notes;
-    }
+    // Notes: 'פרטי השיעור' is a computed/formula field in Airtable – skip writing to it
 
     // Price - for private: per-lesson amount; for pair/group: total amount (each student charged half when no subscription)
     const priceField = getField('lessons', 'price');
@@ -3534,11 +3300,9 @@ export const nexusApi = {
         ? lesson.price 
         : ((lesson.duration || 60) / 60) * 175;
       airtableFields.fields[priceField] = Math.round(calculatedPrice * 100) / 100;
-      console.log(`[DEBUG createLesson] Added price field "${priceField}" = ${airtableFields.fields[priceField]} (private)`);
     } else if (lesson.lessonType === 'pair') {
       const pairTotalPrice = lesson.price !== undefined ? lesson.price : 225;
       airtableFields.fields[priceField] = Math.round(pairTotalPrice * 100) / 100;
-      console.log(`[DEBUG createLesson] Added price field "${priceField}" = ${airtableFields.fields[priceField]} (pair total)`);
     }
     // Group (קבוצתי): fixed 120 per student at billing time - do not write price
 
@@ -3559,44 +3323,30 @@ export const nexusApi = {
       };
       const hebrewType = typeMap[lesson.lessonType] || lesson.lessonType;
       airtableFields.fields[lessonTypeField] = hebrewType;
-      console.log(`[DEBUG createLesson] Added lesson type field "${lessonTypeField}" = "${hebrewType}"`);
     }
 
-    console.log(`[DEBUG createLesson] Final payload fields:`, Object.keys(airtableFields.fields));
-    console.log(`[DEBUG createLesson] All fields are from config mapping - no hardcoded field names`);
-    console.log(`[DEBUG createLesson] Complete Airtable payload:`, JSON.stringify(airtableFields, null, 2));
 
     // Create the lesson in Airtable using STRICT field mapping (no fallbacks)
     // All field names must be defined in fieldMap
     try {
       const lessonsTableId = getTableId('lessons');
       
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:createLesson:beforeAirtable',message:'About to call Airtable API',data:{lessonsTableId,fieldCount:Object.keys(airtableFields.fields).length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H5'})}).catch(()=>{});
-      // #endregion
       const response = await airtableRequest<{ id: string; fields: any }>(
         `/${lessonsTableId}`,
         {
           method: 'POST',
-          body: JSON.stringify(airtableFields),
+          body: JSON.stringify({ ...airtableFields, typecast: true }),
         }
       );
       
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:createLesson:airtableSuccess',message:'Airtable returned successfully',data:{lessonId:response.id,fieldKeys:Object.keys(response.fields||{})},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H5'})}).catch(()=>{});
-      // #endregion
-      console.log(`[DEBUG createLesson] STEP 5 - SUCCESS! Created lesson ${response.id}`);
-      console.log(`[DEBUG createLesson] STEP 5 - Response fields:`, Object.keys(response.fields || {}));
       
       // Map response to Lesson
       const newLesson = mapAirtableToLesson({ id: response.id, fields: response.fields });
       
-      console.log(`[Airtable] Created lesson ${response.id}`);
       
       // STEP 6: Trigger Make.com scenario to create calendar event
       // This is non-blocking - we don't fail the lesson creation if Make fails
       try {
-        console.log(`[DEBUG createLesson] STEP 6 - Triggering Make.com scenario for calendar sync`);
         const makeResult = await triggerCreateLessonScenario({
           lessonId: response.id,
           studentId: studentRecordId,
@@ -3608,7 +3358,6 @@ export const nexusApi = {
         });
         
         if (makeResult.success) {
-          console.log(`[DEBUG createLesson] STEP 6 - Make.com scenario triggered successfully`);
         } else {
           console.warn(`[DEBUG createLesson] STEP 6 - Make.com scenario failed (non-blocking):`, makeResult.error);
         }
@@ -3619,9 +3368,6 @@ export const nexusApi = {
       
       return newLesson;
     } catch (error: any) {
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'nexusApi.ts:createLesson:catch',message:'createLesson failed',data:{errorMessage:error?.message,errorCode:error?.code,errorStatus:error?.status},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H2'})}).catch(()=>{});
-      // #endregion
       console.error(`[DEBUG createLesson] STEP 5 - ERROR creating lesson:`, error);
       console.error(`[DEBUG createLesson] STEP 5 - Error message:`, error.message);
       console.error(`[DEBUG createLesson] STEP 5 - Error details:`, error.details);
@@ -3634,23 +3380,23 @@ export const nexusApi = {
   },
 
   createMonthlyCharges: async (billingMonth: string): Promise<CreateMonthlyChargesResult> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
     
     return await createMonthlyCharges(airtableClient, billingMonth);
   },
 
   recalculateBill: async (studentId: string, billingMonth: string): Promise<RecalculateBillResult> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
     return await recalculateBill(airtableClient, studentId, billingMonth);
   },
 
   updateBillAdjustment: async (billId: string, adjustment: { amount: number; reason: string }): Promise<void> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
     const billingTableId = getTableId('monthlyBills');
@@ -3677,9 +3423,6 @@ export const nexusApi = {
 
       await airtableClient.updateRecord(billingTableId, billId, updateFields);
 
-      if (import.meta.env.DEV) {
-        console.log(`[nexusApi.updateBillAdjustment] Updated adjustment for bill ${billId}`, adjustment);
-      }
     } catch (error: any) {
       console.error('[nexusApi.updateBillAdjustment] Failed to update adjustment:', error);
       throw {
@@ -3692,8 +3435,8 @@ export const nexusApi = {
   },
 
   deleteBill: async (billId: string): Promise<void> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
     const billingTableId = getTableId('monthlyBills');
@@ -3701,9 +3444,6 @@ export const nexusApi = {
     try {
       await airtableClient.deleteRecord(billingTableId, billId);
 
-      if (import.meta.env.DEV) {
-        console.log(`[nexusApi.deleteBill] Deleted bill ${billId}`);
-      }
     } catch (error: any) {
       console.error('[nexusApi.deleteBill] Failed to delete bill:', error);
       throw {
@@ -3724,8 +3464,8 @@ export const nexusApi = {
   // - email: email address
   // - הערות: notes
   getEntities: async (): Promise<Entity[]> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
     const entitiesTableId = AIRTABLE_CONFIG.tables.entities;
@@ -3752,13 +3492,12 @@ export const nexusApi = {
       };
     });
 
-    console.log(`[Airtable] Fetched ${entities.length} entities`);
     return entities;
   },
 
   createEntity: async (data: Partial<Entity>): Promise<Entity> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
     const entitiesTableId = AIRTABLE_CONFIG.tables.entities;
@@ -3788,7 +3527,6 @@ export const nexusApi = {
         permission: (response.fields.role || data.permission || 'student') as EntityPermission,
       };
 
-      console.log(`[Airtable] Created entity ${response.id}`);
       return newEntity;
     } catch (error: any) {
       console.error('[nexusApi.createEntity] Failed to create entity:', error);
@@ -3802,8 +3540,8 @@ export const nexusApi = {
   },
 
   updateEntity: async (entityId: string, data: Partial<Entity>): Promise<Entity> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
     const entitiesTableId = AIRTABLE_CONFIG.tables.entities;
@@ -3830,7 +3568,6 @@ export const nexusApi = {
         permission: (response.fields.role || 'student') as EntityPermission,
       };
 
-      console.log(`[Airtable] Updated entity ${entityId}`);
       return updatedEntity;
     } catch (error: any) {
       console.error('[nexusApi.updateEntity] Failed to update entity:', error);
@@ -3844,8 +3581,8 @@ export const nexusApi = {
   },
 
   deleteEntity: async (entityId: string): Promise<void> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
+    if (!getAuthToken()) {
+      throw new Error('Authentication required. Please log in.');
     }
 
     const entitiesTableId = AIRTABLE_CONFIG.tables.entities;
@@ -3856,7 +3593,6 @@ export const nexusApi = {
         { method: 'DELETE' }
       );
 
-      console.log(`[Airtable] Deleted entity ${entityId}`);
     } catch (error: any) {
       console.error('[nexusApi.deleteEntity] Failed to delete entity:', error);
       throw {
@@ -3866,6 +3602,113 @@ export const nexusApi = {
         details: error,
       };
     }
+  },
+
+  // =========================================================================
+  // Student Groups CRUD
+  // =========================================================================
+
+  fetchGroups: async (): Promise<StudentGroup[]> => {
+    if (!getAuthToken()) {
+      throw { message: 'Authentication required', code: 'AUTH_REQUIRED', status: 401 };
+    }
+    const tableId = getTableId('studentGroups');
+    const params = new URLSearchParams({ pageSize: '100' });
+    const response = await airtableRequest<{ records: any[] }>(`/${tableId}?${params}`);
+    return response.records.map((record: any) => {
+      const f = record.fields || {};
+      const studentIds = f.students || [];
+      return {
+        id: record.id,
+        name: f.group_name || '',
+        studentIds: Array.isArray(studentIds) ? studentIds : studentIds ? [studentIds] : [],
+        studentNames: Array.isArray(f.student_names) ? f.student_names : f.student_names ? [f.student_names] : [],
+        studentCount: f.student_count ?? (Array.isArray(studentIds) ? studentIds.length : 0),
+        status: f.status || 'active',
+      } as StudentGroup;
+    });
+  },
+
+  fetchGroup: async (id: string): Promise<StudentGroup> => {
+    if (!getAuthToken()) {
+      throw { message: 'Authentication required', code: 'AUTH_REQUIRED', status: 401 };
+    }
+    const tableId = getTableId('studentGroups');
+    const response = await airtableRequest<{ id: string; fields: any }>(`/${tableId}/${id}`);
+    const f = response.fields || {};
+    const studentIds = f.students || [];
+    return {
+      id: response.id,
+      name: f.group_name || '',
+      studentIds: Array.isArray(studentIds) ? studentIds : studentIds ? [studentIds] : [],
+      studentNames: Array.isArray(f.student_names) ? f.student_names : f.student_names ? [f.student_names] : [],
+      studentCount: f.student_count ?? (Array.isArray(studentIds) ? studentIds.length : 0),
+      status: f.status || 'active',
+    };
+  },
+
+  createGroup: async (group: { name: string; studentIds: string[]; status: 'active' | 'paused' }): Promise<StudentGroup> => {
+    if (!getAuthToken()) {
+      throw { message: 'Authentication required', code: 'AUTH_REQUIRED', status: 401 };
+    }
+    const tableId = getTableId('studentGroups');
+    const fields: Record<string, any> = {
+      group_name: group.name,
+      status: group.status,
+    };
+    if (group.studentIds.length > 0) {
+      fields.students = group.studentIds;
+    }
+    const response = await airtableRequest<{ id: string; fields: any }>(`/${tableId}`, {
+      method: 'POST',
+      body: JSON.stringify({ fields, typecast: true }),
+    });
+    const f = response.fields || {};
+    const studentIds = f.students || [];
+    return {
+      id: response.id,
+      name: f.group_name || group.name,
+      studentIds: Array.isArray(studentIds) ? studentIds : studentIds ? [studentIds] : [],
+      studentNames: Array.isArray(f.student_names) ? f.student_names : [],
+      studentCount: f.student_count ?? group.studentIds.length,
+      status: f.status || group.status,
+    };
+  },
+
+  updateGroup: async (id: string, updates: { name?: string; studentIds?: string[]; status?: 'active' | 'paused' }): Promise<StudentGroup> => {
+    if (!getAuthToken()) {
+      throw { message: 'Authentication required', code: 'AUTH_REQUIRED', status: 401 };
+    }
+    const tableId = getTableId('studentGroups');
+    const fields: Record<string, any> = {};
+    if (updates.name !== undefined) fields.group_name = updates.name;
+    if (updates.status !== undefined) fields.status = updates.status;
+    if (updates.studentIds !== undefined) fields.students = updates.studentIds;
+
+    const response = await airtableRequest<{ id: string; fields: any }>(`/${tableId}/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ fields, typecast: true }),
+    });
+    const f = response.fields || {};
+    const studentIds = f.students || [];
+    return {
+      id: response.id,
+      name: f.group_name || '',
+      studentIds: Array.isArray(studentIds) ? studentIds : studentIds ? [studentIds] : [],
+      studentNames: Array.isArray(f.student_names) ? f.student_names : [],
+      studentCount: f.student_count ?? (Array.isArray(studentIds) ? studentIds.length : 0),
+      status: f.status || 'active',
+    };
+  },
+
+  deleteGroup: async (id: string): Promise<void> => {
+    if (!getAuthToken()) {
+      throw { message: 'Authentication required', code: 'AUTH_REQUIRED', status: 401 };
+    }
+    const tableId = getTableId('studentGroups');
+    await airtableRequest<{ id: string; deleted: boolean }>(`/${tableId}/${id}`, {
+      method: 'DELETE',
+    });
   },
 };
 

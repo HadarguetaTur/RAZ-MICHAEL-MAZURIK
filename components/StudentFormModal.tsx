@@ -46,17 +46,14 @@ const StudentFormModal: React.FC<StudentFormModalProps> = ({ onClose, onSuccess 
   const handleSubmit = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     
-    console.log('[StudentFormModal] handleSubmit called with formData:', formData);
     
     // Validation
     if (!formData.name.trim()) {
       setError('שם התלמיד הוא שדה חובה');
-      console.log('[StudentFormModal] Validation failed: missing name');
       return;
     }
     if (!formData.phone.trim()) {
       setError('מספר טלפון הוא שדה חובה');
-      console.log('[StudentFormModal] Validation failed: missing phone');
       return;
     }
 
@@ -75,9 +72,7 @@ const StudentFormModal: React.FC<StudentFormModalProps> = ({ onClose, onSuccess 
         weeklyLessonsLimit: formData.weeklyLessonsLimit ? parseInt(formData.weeklyLessonsLimit) : undefined,
       };
 
-      console.log('[StudentFormModal] Calling createStudent with:', studentData);
       const newStudent = await createStudent(studentData);
-      console.log('[StudentFormModal] Successfully created student:', newStudent);
       onSuccess(newStudent);
     } catch (err: any) {
       console.error('[StudentFormModal] Error creating student:', err);

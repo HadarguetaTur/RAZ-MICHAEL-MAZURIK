@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { nexusApi, parseApiError } from '../services/nexusApi';
 import { reserveSlotAndCreateLessons } from '../services/slotBookingService';
 import StudentsPicker from './StudentsPicker';
+import GroupPicker from './GroupPicker';
 import Toast from './Toast';
 
 interface SlotInventoryModalProps {
@@ -11,16 +12,19 @@ interface SlotInventoryModalProps {
     endDateTime: string;
     teacherId?: string;
     status?: string;
+    slotType?: 'private' | 'pair' | 'group';
   };
   onClose: () => void;
   onSuccess: () => void;
-  requireStudentForReserve?: boolean; // New prop: require student selection for reservation
+  requireStudentForReserve?: boolean;
 }
 
 const SlotInventoryModal: React.FC<SlotInventoryModalProps> = ({ slot, onClose, onSuccess, requireStudentForReserve = false }) => {
   const [isProcessing, setIsProcessing] = useState(false);
   const [selectedStudentIds, setSelectedStudentIds] = useState<string[]>([]);
+  const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
+  const isGroupSlot = slot.slotType === 'group';
 
   const startDate = new Date(slot.startDateTime);
   const endDate = new Date(slot.endDateTime);
@@ -38,9 +42,6 @@ const SlotInventoryModal: React.FC<SlotInventoryModalProps> = ({ slot, onClose, 
 
   // "שריין חלון" - Reserve/Book the slot
   const handleReserveSlot = async () => {
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'SlotInventoryModal.tsx:handleReserveSlot:entry',message:'handleReserveSlot called',data:{requireStudentForReserve,slotId:slot.id,selectedStudentIds},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H6'})}).catch(()=>{});
-    // #endregion
     // If requireStudentForReserve is true, validate student selection
     if (requireStudentForReserve) {
       if (!selectedStudentIds || selectedStudentIds.length === 0) {
@@ -50,31 +51,19 @@ const SlotInventoryModal: React.FC<SlotInventoryModalProps> = ({ slot, onClose, 
       
       setIsProcessing(true);
       try {
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'SlotInventoryModal.tsx:handleReserveSlot:beforeCreate',message:'About to call reserveSlotAndCreateLessons',data:{slotId:slot.id,studentCount:selectedStudentIds.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H6'})}).catch(()=>{});
-        // #endregion
         // Reserve slot and create lessons for selected students
         await reserveSlotAndCreateLessons(slot.id, selectedStudentIds);
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'SlotInventoryModal.tsx:handleReserveSlot:success',message:'reserveSlotAndCreateLessons completed',data:{slotId:slot.id},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H6'})}).catch(()=>{});
-        // #endregion
         setToast({ message: 'החלון נשמר והשיעור נוצר בהצלחה', type: 'success' });
         setTimeout(() => {
           onSuccess();
           onClose();
         }, 1000);
       } catch (err: any) {
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'SlotInventoryModal.tsx:handleReserveSlot:error',message:'reserveSlotAndCreateLessons failed',data:{slotId:slot.id,error:err?.message},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H6'})}).catch(()=>{});
-        // #endregion
         setToast({ message: parseApiError(err), type: 'error' });
       } finally {
         setIsProcessing(false);
       }
     } else {
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'SlotInventoryModal.tsx:handleReserveSlot:noStudentRequired',message:'requireStudentForReserve is FALSE - only updating status',data:{slotId:slot.id},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H6'})}).catch(()=>{});
-      // #endregion
       // Original behavior: just update status to 'closed'
       setIsProcessing(true);
       try {
@@ -140,28 +129,53 @@ const SlotInventoryModal: React.FC<SlotInventoryModalProps> = ({ slot, onClose, 
               </div>
             </div>
 
-            {/* Show StudentsPicker only if requireStudentForReserve is true */}
+            {/* Show group/student picker if requireStudentForReserve is true */}
             {requireStudentForReserve && (
               <div className="space-y-3">
-                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-                  תלמידים (חובה)
-                </label>
-                <StudentsPicker
-                  values={selectedStudentIds}
-                  onChange={(ids) => {
-                    setSelectedStudentIds(ids);
-                    // Clear error toast when user selects a student
-                    if (ids.length > 0 && toast?.type === 'error' && toast.message === 'יש לבחור לפחות תלמיד אחד') {
-                      setToast(null);
-                    }
-                  }}
-                  placeholder="חפש תלמידים..."
-                  disabled={isProcessing}
-                  filterActiveOnly={true}
-                />
+                {isGroupSlot ? (
+                  <>
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                      קבוצה (חובה)
+                    </label>
+                    <GroupPicker
+                      value={selectedGroupId}
+                      onChange={(groupId, studentIds) => {
+                        setSelectedGroupId(groupId);
+                        setSelectedStudentIds(studentIds);
+                        if (studentIds.length > 0 && toast?.type === 'error') {
+                          setToast(null);
+                        }
+                      }}
+                      disabled={isProcessing}
+                    />
+                    {selectedStudentIds.length > 0 && (
+                      <div className="text-xs text-slate-500 font-medium">
+                        {selectedStudentIds.length} תלמידים ייכללו בשיעור
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                      תלמידים (חובה)
+                    </label>
+                    <StudentsPicker
+                      values={selectedStudentIds}
+                      onChange={(ids) => {
+                        setSelectedStudentIds(ids);
+                        if (ids.length > 0 && toast?.type === 'error' && toast.message === 'יש לבחור לפחות תלמיד אחד') {
+                          setToast(null);
+                        }
+                      }}
+                      placeholder="חפש תלמידים..."
+                      disabled={isProcessing}
+                      filterActiveOnly={true}
+                    />
+                  </>
+                )}
                 {selectedStudentIds.length === 0 && (
                   <div className="text-xs text-amber-600 font-medium">
-                    יש לבחור לפחות תלמיד אחד כדי לשריין את החלון
+                    {isGroupSlot ? 'יש לבחור קבוצה כדי לשריין את החלון' : 'יש לבחור לפחות תלמיד אחד כדי לשריין את החלון'}
                   </div>
                 )}
               </div>

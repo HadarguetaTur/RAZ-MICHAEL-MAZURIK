@@ -1,83 +1,52 @@
-# Security TODO - Airtable API Key Exposure
+# Security Status
 
-## Critical Issue
+## Completed (February 2025)
 
-The Airtable API Key (`VITE_AIRTABLE_API_KEY`) is currently exposed in the frontend bundle.
-This means anyone can inspect the browser's network tab or JS bundle and extract the API key.
+### API Key Protection ✅
+- All Airtable API calls routed through backend proxy (`/api/airtable/*`)
+- `VITE_AIRTABLE_API_KEY` and `VITE_AIRTABLE_BASE_ID` removed from frontend bundle
+- Gemini API key references removed entirely
+- API keys are now server-side only (`server/airtableProxy.ts`)
 
-## Affected Files
+### Authentication ✅
+- JWT-based authentication system (`server/auth.ts`)
+- Login endpoint with rate limiting (`server/loginHandler.ts`)
+- All API endpoints require valid JWT (except `/health` and `/api/auth/login`)
+- Token stored in `sessionStorage` (cleared on tab close)
+- Auth state managed via React Context (`hooks/useAuth.tsx`)
 
-### Direct Airtable Calls from Frontend (API Key Exposed)
+### Security Headers ✅
+- `X-Content-Type-Options: nosniff`
+- `X-Frame-Options: DENY`
+- `X-XSS-Protection: 1; mode=block`
+- `Referrer-Policy: strict-origin-when-cross-origin`
+- `Permissions-Policy: camera=(), microphone=(), geolocation=()`
+- `Content-Security-Policy` (self + Google Fonts + Airtable + Make.com)
 
-| File | Line | Impact |
-|------|------|--------|
-| `services/nexusApi.ts` | 16-17 | Main API client - exposes `VITE_AIRTABLE_API_KEY` in all requests |
-| `services/airtableClient.ts` | 14-18 | Secondary client - same exposure |
-| `services/subscriptionsService.ts` | 7-8 | Subscriptions API - same exposure |
-| `billing/airtableClient.ts` | 15-35 | Billing client - may be used both server/client side |
+### CORS Hardened ✅
+- Removed wildcard (`*`) origin support
+- Explicit origin matching only
+- Production origins configured via `ALLOWED_ORIGINS` env var
 
-## Current State
+### Debug Code Removed ✅
+- All `127.0.0.1:7242` debug fetch calls removed (~94 occurrences across 10 files)
+- All console.log/debug statements removed (~780 lines across 23 files)
 
-```typescript
-// Example from services/nexusApi.ts
-const AIRTABLE_API_KEY = import.meta.env.VITE_AIRTABLE_API_KEY || '';
-// This key is bundled into the frontend JS and visible to anyone!
-```
+### Dependencies Updated ✅
+- jspdf upgraded from v2.5.2 to v4.1.0 (fixes 4 CVEs including critical path traversal)
+- Unused jspdf-autotable dependency removed
+- Tailwind CSS moved from CDN to bundled npm package (v4.1.18 + @tailwindcss/vite)
 
-## Recommended Fix
+## Remaining TODO
 
-### Option 1: Backend Proxy (Recommended)
+### Short-term
+- [ ] Rotate Airtable API key (current key was previously exposed)
+- [ ] Add Google OAuth as second auth method
+- [ ] Create "הקצאות שיעורי בית" table in Airtable (PAT needs schema.bases:write scope)
 
-Move ALL Airtable calls through the backend API server:
-
-1. **Keep API key on server only** (remove `VITE_AIRTABLE_API_KEY`)
-2. **Extend `server/apiServer.ts`** with new endpoints:
-   - `GET /api/students`
-   - `GET /api/lessons`
-   - `POST /api/lessons`
-   - etc.
-3. **Update frontend services** to use `apiUrl()` helper for all calls
-4. **Benefit**: API key never leaves the server
-
-### Option 2: Airtable API Scoping (Partial Mitigation)
-
-If moving all calls to backend is too much work:
-
-1. Create a **restricted Airtable token** with:
-   - Read-only access where possible
-   - Limited to specific tables
-   - Limited to specific scopes
-2. This reduces damage if key is exposed, but doesn't eliminate risk
-
-### Option 3: Serverless Functions (If using Vercel)
-
-Use Vercel serverless functions (`/api/` folder) as a proxy:
-
-```
-frontend → /api/airtable/* → Vercel serverless → Airtable
-```
-
-## Priority
-
-**HIGH** - Should be addressed before going to production with real user data.
-
-## Implementation Estimate
-
-- Option 1: Medium effort (extend existing backend, update all fetch calls)
-- Option 2: Low effort (reconfigure Airtable token)
-- Option 3: Medium effort (create new Vercel API routes)
-
-## Temporary Mitigation (Already Done)
-
-For the `/api/conflicts/check` endpoint:
-- ✅ Already moved to backend (`server/apiServer.ts`)
-- ✅ Frontend uses `apiUrl()` helper
-- ✅ API key stays on server for conflict checking
-
-## Next Steps
-
-1. [ ] Discuss with team which option to pursue
-2. [ ] Create backend endpoints for remaining Airtable operations
-3. [ ] Update frontend to use new backend endpoints
-4. [ ] Remove `VITE_AIRTABLE_API_KEY` from production frontend
-5. [ ] Rotate Airtable API key after migration
+### Medium-term
+- [ ] Set up CI/CD with automated security scanning
+- [ ] Add request logging/monitoring
+- [ ] Implement role-based access control (admin vs teacher vs staff)
+- [ ] Add API rate limiting beyond login endpoint
+- [ ] Encrypt localStorage cache data

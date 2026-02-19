@@ -121,9 +121,6 @@ export async function getBillingBreakdown(
   studentId: string,
   monthKey: string
 ): Promise<BillingBreakdown> {
-  if (import.meta.env.DEV) {
-    console.log('[getBillingBreakdown] Start', { studentId, monthKey });
-  }
   const L = FIELDS.lessons;
   const C = FIELDS.cancellations;
   const S = FIELDS.subscriptions;
@@ -153,19 +150,6 @@ export async function getBillingBreakdown(
       filterByFormula: lessonsFilter,
       maxRecords: 5000,
     });
-    if (import.meta.env.DEV) {
-      console.log('[getBillingBreakdown] Fetched lessons', {
-        monthKey,
-        studentId,
-        filter: lessonsFilter,
-        count: lessonsRaw.length,
-        sampleLessons: lessonsRaw.slice(0, 3).map(r => ({
-          id: r.id,
-          studentLink: r.fields[L.full_name],
-          billingMonth: r.fields[L.billing_month],
-        })),
-      });
-    }
   } catch (e) {
     if (import.meta.env.DEV) console.warn('[getBillingBreakdown] lessons fetch failed', e);
   }
@@ -244,14 +228,6 @@ export async function getBillingBreakdown(
     lessonsTotal += lineAmount;
   }
 
-  if (import.meta.env.DEV) {
-    console.log('[getBillingBreakdown] Lessons summary', {
-      studentId,
-      monthKey,
-      count: lessons.length,
-      lessonsTotal,
-    });
-  }
 
   // --- B) Paid cancellations: billing_month = monthKey AND student contains studentId AND is_charged = true ---
   const cancellationsTableId = TABLES.cancellations.id;
@@ -285,19 +261,6 @@ export async function getBillingBreakdown(
   }
 
   // --- C) Subscriptions: use subsRaw already fetched (student_id contains studentId, active in month) ---
-  if (import.meta.env.DEV) {
-    console.log('[getBillingBreakdown] Subscriptions (from same fetch)', {
-      studentId,
-      monthKey,
-      count: subsRaw.length,
-      sampleSubs: subsRaw.slice(0, 3).map(r => ({
-        id: r.id,
-        studentLink: r.fields[S.student_id],
-        type: r.fields[S.subscription_type],
-        paused: r.fields[S.pause_subscription],
-      })),
-    });
-  }
 
   const subscriptions: BreakdownSubscription[] = [];
   let subscriptionsTotal = 0;
@@ -306,14 +269,6 @@ export async function getBillingBreakdown(
     const f = r.fields;
     const rawStudentLink = f[subsStudentField] ?? (f as Record<string, unknown>)['student_id'];
     const linkId = extractLinkedId(rawStudentLink);
-    if (import.meta.env.DEV && subsRaw.length > 0) {
-      console.log('[getBillingBreakdown] Checking subscription', {
-        subId: r.id,
-        linkId,
-        studentId,
-        matches: linkId === studentId,
-      });
-    }
     if (linkId !== studentId) continue;
     const paused = f[S.pause_subscription] === true || f[S.pause_subscription] === 1;
     const startDate = f[S.subscription_start_date] ? String(f[S.subscription_start_date]).split('T')[0] : '';
@@ -336,22 +291,6 @@ export async function getBillingBreakdown(
     subscriptionsTotal += amount;
   }
 
-  if (import.meta.env.DEV) {
-    console.log('[getBillingBreakdown] Subscriptions summary', {
-      studentId,
-      monthKey,
-      rawCount: subsRaw.length,
-      matchedCount: subscriptions.length,
-      subscriptionsTotal,
-      details: subscriptions.map(s => ({
-        type: s.type,
-        amount: s.amount,
-        startDate: s.startDate,
-        endDate: s.endDate,
-        paused: s.paused,
-      })),
-    });
-  }
 
   const result: BillingBreakdown = {
     lessons,
@@ -366,19 +305,6 @@ export async function getBillingBreakdown(
     },
   };
 
-
-  if (import.meta.env.DEV) {
-    console.log('[getBillingBreakdown] Result', {
-      studentId,
-      monthKey,
-      lessonsTotal: result.totals.lessonsTotal,
-      subscriptionsTotal: result.totals.subscriptionsTotal,
-      cancellationsTotal: result.totals.cancellationsTotal,
-      lessonsCount: result.lessons.length,
-      subscriptionsCount: result.subscriptions.length,
-      paidCancellationsCount: result.paidCancellations.length,
-    });
-  }
 
   return result;
 }

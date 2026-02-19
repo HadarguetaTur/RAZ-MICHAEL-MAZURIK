@@ -8,7 +8,7 @@
 | **Lesson-over-slots modal appears only when overlap exists** | ✓ | SlotOverlapModal is shown only when `findOverlappingOpenSlots(lessonDraft, openSlots).length > 0`. Save is blocked and modal is shown; otherwise save proceeds without modal. |
 | **Slot-over-lessons modal appears only when overlap exists** | ✓ | SlotOverlapsLessonModal is shown only when `findOverlappingLessons(slotDraft, lessonsForSlotOverlap).length > 0` on slot-edit Save. |
 | **Save + close slot: link records if linking fields exist; otherwise skip linking but still close** | ✓ | `updateSlotInventory` sets `status: 'booked'` always. When `linkedLessonId` is present it tries `getField('slotInventory','lessons')` inside try/catch; on success it sets `fields[lessonsField] = [lessonId]`. On missing field or getField throw, linking is skipped and only status is updated. |
-| **Noisy logs removed; only DEV logs kept** | ✓ | Removed all `#region agent log` / `fetch('http://127.0.0.1:7242/...')` and verbose `console.log` from Calendar and from `updateSlotInventory` in nexusApi. Calendar `console.error`/`console.warn` are gated with `import.meta.env?.DEV`. updateSlotInventory keeps `console.warn` for permission/retry (DEV-only style) and adds a DEV-only warn when linking is skipped. |
+| **Noisy logs removed; only DEV logs kept** | ✓ | Removed all `#region agent log` debug fetch calls and verbose `console.log` from Calendar and from `updateSlotInventory` in nexusApi. Calendar `console.error`/`console.warn` are gated with `import.meta.env?.DEV`. updateSlotInventory keeps `console.warn` for permission/retry (DEV-only style) and adds a DEV-only warn when linking is skipped. |
 
 ## Known limitations
 

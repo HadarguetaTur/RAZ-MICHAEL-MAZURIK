@@ -1,14 +1,11 @@
 /**
- * Get env var: process.env first (Jest/Node), then import.meta.env in browser
- * so Vite client has AIRTABLE credentials without relying on define at build time.
+ * Server-side env accessor only.
+ * Airtable secrets must never be resolved from import.meta.env / VITE_*.
  */
 const getEnv = (name: string): string => {
   if (typeof process !== 'undefined' && process.env) {
-    const fromProcess = process.env[name] || process.env[`VITE_${name}`] || '';
+    const fromProcess = process.env[name] || '';
     if (fromProcess) return fromProcess;
-  }
-  if (typeof window !== 'undefined' && typeof import.meta !== 'undefined' && import.meta.env) {
-    return (import.meta.env as Record<string, string>)[`VITE_${name}`] || (import.meta.env as Record<string, string>)[name] || '';
   }
   return '';
 };
@@ -21,13 +18,14 @@ export const AIRTABLE_CONFIG = {
     students: 'tblSEiCD3DrOfcnR8', // Display name: 'תלמידים'
     lessons: 'tblz6twflNw2iB832',  // Display name: 'lessons'
     teachers: 'tblZz1lyROGM0Bkjy', // Display name: 'מורים'
-    homework: 'שיעורי בית',
+    homework: 'tbllzo51a55mbuP0E',
     subscriptions: 'tblEr05NrA5PT8dlH', // Display name: 'מנויים'
     cancellations: 'tblr0UIVvJr85vEfL', // Display name: 'cancellations'
     monthlyBills: 'tblyEsDpiRkw8doxQ', // Display name: 'חיובים'
     weekly_slot: 'tbloC7G7ixYDMtdK6', // Display name: 'weekly_slot'
     slot_inventory: 'tblqMt721kMMtRIWm', // Display name: 'slot_inventory'
-    entities: 'Entities', // Display name: 'Entities' - bot authorized users
+    entities: 'tblhjI6Qe6yYDRF6L', // Display name: 'Entities' - bot authorized users
+    studentGroups: 'tblUURXeFzvg2hcGQ', // Display name: 'קבוצות תלמידים'
   },
   fields: {
     // Students fields

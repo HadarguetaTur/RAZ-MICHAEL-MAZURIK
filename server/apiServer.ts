@@ -1,14 +1,42 @@
 /**
- * API server for conflicts checking: /api/conflicts/check
+ * API server — Airtable proxy + conflicts checking + auth
  * Run: npx tsx server/apiServer.ts
- * Env: AIRTABLE_API_KEY, AIRTABLE_BASE_ID, PORT (for cloud platforms)
+ * Env: AIRTABLE_API_KEY, AIRTABLE_BASE_ID, JWT_SECRET, ADMIN_PASSWORD, PORT
  * 
  * Production deployment:
- * - Render/Railway will set PORT automatically
+ * - Railway will set PORT automatically
  * - Set ALLOWED_ORIGINS env var for CORS (comma-separated list)
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
+
+// Load .env.local for local development (Vite loads it for frontend, but tsx does not)
+(function loadEnvFile() {
+  const envFiles = ['.env.local', '.env'];
+  for (const file of envFiles) {
+    try {
+      const envPath = path.resolve(process.cwd(), file);
+      const content = fs.readFileSync(envPath, 'utf-8');
+      for (const line of content.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const eqIndex = trimmed.indexOf('=');
+        if (eqIndex === -1) continue;
+        const key = trimmed.slice(0, eqIndex).trim();
+        const value = trimmed.slice(eqIndex + 1).trim();
+        if (!process.env[key]) {
+          process.env[key] = value;
+        }
+      }
+    } catch {
+      // File doesn't exist — fine in production where env vars are set directly
+    }
+  }
+})();
+
 import http from 'node:http';
+import crypto from 'node:crypto';
 import { checkConflicts } from '../services/conflictsCheckService';
 import type {
   CheckConflictsParams,
@@ -17,10 +45,48 @@ import type {
   OpenSlotLike,
 } from '../services/conflictsCheckService';
 import { getTableId, getField } from '../contracts/fieldMap';
+import { initUsers, getAuthFromRequest, createToken } from './auth';
+import { handleAirtableProxy } from './airtableProxy';
+import { handleLogin } from './loginHandler';
+import {
+  assertJsonContentType,
+  getTrustedClientIp,
+  isValidRecordId,
+  readJsonBodyWithLimit,
+  readBodyWithLimit,
+} from './httpSecurity';
+
+// ---------------------------------------------------------------------------
+// Temporary file store for homework attachments
+// Files are stored in memory and auto-cleaned after 10 minutes.
+// Airtable downloads the file from the temporary URL when the record is created.
+// ---------------------------------------------------------------------------
+const TMP_FILE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const TMP_FILE_MAX_SIZE = 10 * 1024 * 1024; // 10MB
+interface TmpFile {
+  data: Buffer;
+  contentType: string;
+  filename: string;
+  createdAt: number;
+}
+const tmpFileStore = new Map<string, TmpFile>();
+
+// Cleanup expired files every 2 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, file] of tmpFileStore) {
+    if (now - file.createdAt > TMP_FILE_TTL_MS) {
+      tmpFileStore.delete(id);
+    }
+  }
+}, 2 * 60 * 1000);
 
 const API_BASE = 'https://api.airtable.com/v0';
 const CANCELLED_STATUS = 'בוטל';
-const PENDING_CANCEL_STATUS = 'ממתין לאישור ביטול';
+const CANCELLED_BY_ADMIN_STATUS = 'בוטל ע"י מנהל';
+const PROXY_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const PROXY_RATE_LIMIT_MAX_REQUESTS = 120;
+const proxyRateLimitMap = new Map<string, number[]>();
 
 // CORS configuration - add your production domains here or via ALLOWED_ORIGINS env var
 const DEFAULT_ALLOWED_ORIGINS = [
@@ -42,21 +108,78 @@ function setCorsHeaders(req: http.IncomingMessage, res: http.ServerResponse): bo
   const origin = req.headers.origin || '';
   const allowedOrigins = getAllowedOrigins();
   
-  // Allow if origin matches or if no origin (same-origin request)
-  if (!origin || allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
-    res.setHeader('Access-Control-Allow-Origin', origin || '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  // Allow if origin is in the allowed list
+  // For same-origin requests (no origin header), CORS headers are not needed
+  if (origin && allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     res.setHeader('Access-Control-Max-Age', '86400'); // 24 hours
     return true;
   }
+  // For same-origin requests (no origin header), allow without CORS headers
+  if (!origin) return true;
   return false;
 }
 
+function isProxyRateLimited(key: string): boolean {
+  const now = Date.now();
+  const existing = proxyRateLimitMap.get(key) ?? [];
+  const recent = existing.filter((ts) => now - ts < PROXY_RATE_LIMIT_WINDOW_MS);
+  if (recent.length >= PROXY_RATE_LIMIT_MAX_REQUESTS) {
+    proxyRateLimitMap.set(key, recent);
+    return true;
+  }
+  recent.push(now);
+  proxyRateLimitMap.set(key, recent);
+  return false;
+}
+
+function setSecurityHeaders(res: http.ServerResponse): void {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '0');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  res.setHeader(
+    'Content-Security-Policy',
+    [
+      "default-src 'self'",
+      "script-src 'self'",
+      "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+      "font-src https://fonts.gstatic.com",
+      "img-src 'self' data: blob:",
+      "connect-src 'self' https://*.make.com",
+      "object-src 'none'",
+      "base-uri 'self'",
+      "frame-ancestors 'none'",
+    ].join('; '),
+  );
+}
+
 function env(name: string): string {
-  const v =
-    process.env[name] ?? process.env[name.replace('AIRTABLE_', 'VITE_AIRTABLE_')] ?? '';
+  const v = process.env[name] ?? '';
   return String(v).trim();
+}
+
+function assertRequiredServerConfig(): void {
+  const jwtSecret = env('JWT_SECRET');
+  const adminPassword = env('ADMIN_PASSWORD');
+  const airtableApiKey = env('AIRTABLE_API_KEY');
+  const airtableBaseId = env('AIRTABLE_BASE_ID');
+  if (!jwtSecret || jwtSecret.length < 48) {
+    throw new Error('[apiServer] JWT_SECRET missing or weak (min 48 chars required).');
+  }
+  if (!adminPassword || adminPassword.length < 12) {
+    throw new Error('[apiServer] ADMIN_PASSWORD missing or weak (min 12 chars required).');
+  }
+  if (!airtableApiKey) {
+    throw new Error('[apiServer] AIRTABLE_API_KEY is required.');
+  }
+  if (!airtableBaseId) {
+    throw new Error('[apiServer] AIRTABLE_BASE_ID is required.');
+  }
 }
 
 function escapeFormula(s: string): string {
@@ -95,9 +218,9 @@ async function getLessonsForConflicts(
   const teacherF = getField('lessons', 'teacher_id');
   const studentF = getField('lessons', 'full_name');
 
-  // Exclude cancelled lessons: 'בוטל' (CANCELLED) and 'ממתין לאישור ביטול' (PENDING_CANCEL)
-  let formula = `AND({${statusF}} != "${escapeFormula(CANCELLED_STATUS)}", {${statusF}} != "${escapeFormula(PENDING_CANCEL_STATUS)}", IS_AFTER({${startDtF}}, "${escapeFormula(startDate)}"), IS_BEFORE({${endDtF}}, "${escapeFormula(endDate)}"))`;
-  if (teacherId && teacherId.startsWith('rec')) {
+  // Exclude cancelled lessons: 'בוטל' (CANCELLED) and 'בוטל ע"י מנהל' (CANCELLED_BY_ADMIN)
+  let formula = `AND({${statusF}} != "${escapeFormula(CANCELLED_STATUS)}", {${statusF}} != "${escapeFormula(CANCELLED_BY_ADMIN_STATUS)}", IS_AFTER({${startDtF}}, "${escapeFormula(startDate)}"), IS_BEFORE({${endDtF}}, "${escapeFormula(endDate)}"))`;
+  if (teacherId && isValidRecordId(teacherId)) {
     formula = `AND(${formula}, FIND("${escapeFormula(teacherId)}", ARRAYJOIN({${teacherF}})) > 0)`;
   }
   const params: Record<string, string> = {
@@ -153,7 +276,7 @@ async function getOpenSlotsForConflicts(
 
   // Only include open slots: 'open' (English) or 'פתוח' (Hebrew)
   let formula = `AND({${startDtF}} < "${escapeFormula(endISO)}", {${endDtF}} > "${escapeFormula(startISO)}", OR({${statusF}} = "open", {${statusF}} = "פתוח"))`;
-  if (teacherId && teacherId.startsWith('rec')) {
+  if (teacherId && isValidRecordId(teacherId)) {
     formula = `AND(${formula}, FIND("${escapeFormula(teacherId)}", ARRAYJOIN({${teacherF}})) > 0)`;
   }
   const params: Record<string, string> = {
@@ -359,7 +482,6 @@ async function getSlotInventoryForAPI(
       capacityOptional: capacity,
       students: studentIds,
       lessons: lessonIds,
-      dayOfWeek: fields.day_of_week,
       startDT: fields.StartDT,
       endDT: fields.EndDT,
       isFull: fields.is_full === true || fields.is_full === 1,
@@ -444,12 +566,69 @@ const server = http.createServer(async (req, res) => {
   const url = req.url ?? '';
 
   // Set CORS headers for all requests
-  setCorsHeaders(req, res);
+  const corsAllowed = setCorsHeaders(req, res);
+  if (!corsAllowed) {
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Origin not allowed' }));
+    return;
+  }
+  setSecurityHeaders(res);
 
   // Handle CORS preflight requests
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
     res.end();
+    return;
+  }
+
+  // --- Auth: POST /api/auth/login ---
+  if (req.method === 'POST' && (url === '/api/auth/login' || url === '/api/login')) {
+    await handleLogin(req, res);
+    return;
+  }
+
+  // --- Auth: GET /api/auth/me ---
+  if (req.method === 'GET' && url === '/api/auth/me') {
+    const user = getAuthFromRequest(req);
+    if (!user) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ username: user.username, role: user.role }));
+    return;
+  }
+
+  // --- Auth: POST /api/auth/refresh ---
+  if (req.method === 'POST' && url === '/api/auth/refresh') {
+    const user = getAuthFromRequest(req);
+    if (!user) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+    const newToken = createToken({ username: user.username, role: user.role });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ token: newToken, user: { username: user.username, role: user.role } }));
+    return;
+  }
+
+  // --- Airtable Proxy: /api/airtable/* ---
+  if (url.startsWith('/api/airtable/')) {
+    const user = getAuthFromRequest(req);
+    if (!user) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+    const key = `${user.username}:${getTrustedClientIp(req)}`;
+    if (isProxyRateLimited(key)) {
+      res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
+      res.end(JSON.stringify({ error: 'Too many Airtable proxy requests. Try again soon.' }));
+      return;
+    }
+    await handleAirtableProxy(req, res, url);
     return;
   }
 
@@ -462,6 +641,12 @@ const server = http.createServer(async (req, res) => {
 
   // --- Slot Inventory: GET /api/slot-inventory ---
   if (req.method === 'GET' && url.startsWith('/api/slot-inventory')) {
+    const authUser = getAuthFromRequest(req);
+    if (!authUser) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
     const parsedUrl = new URL(url, `http://${req.headers.host || 'localhost'}`);
     const start = parsedUrl.searchParams.get('start');
     const end = parsedUrl.searchParams.get('end');
@@ -472,9 +657,14 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'Missing required query params: start, end' }));
       return;
     }
+    if (teacherId && !isValidRecordId(teacherId)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid teacherId format' }));
+      return;
+    }
     
-    const baseId = env('AIRTABLE_BASE_ID') || env('VITE_AIRTABLE_BASE_ID');
-    const token = env('AIRTABLE_API_KEY') || env('VITE_AIRTABLE_API_KEY');
+    const baseId = env('AIRTABLE_BASE_ID');
+    const token = env('AIRTABLE_API_KEY');
     if (!baseId || !token) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Airtable credentials not configured' }));
@@ -496,14 +686,23 @@ const server = http.createServer(async (req, res) => {
 
   // --- Conflicts: POST /api/conflicts/check ---
   if (req.method === 'POST' && url === '/api/conflicts/check') {
-    let body = '';
-    for await (const chunk of req) body += chunk;
+    const authUser = getAuthFromRequest(req);
+    if (!authUser) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
     let params: CheckConflictsParams;
     try {
-      params = JSON.parse(body || '{}') as CheckConflictsParams;
+      if (!assertJsonContentType(req)) {
+        res.writeHead(415, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Content-Type must be application/json' }));
+        return;
+      }
+      params = await readJsonBodyWithLimit<CheckConflictsParams>(req);
     } catch {
       res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+      res.end(JSON.stringify({ error: 'Invalid or oversized JSON body' }));
       return;
     }
     
@@ -518,9 +717,14 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'Missing required fields: teacherId, date, start, end' }));
       return;
     }
+    if (typeof params.teacherId !== 'string' || !isValidRecordId(params.teacherId)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid teacherId format' }));
+      return;
+    }
     
-    const baseId = env('AIRTABLE_BASE_ID') || env('VITE_AIRTABLE_BASE_ID');
-    const token = env('AIRTABLE_API_KEY') || env('VITE_AIRTABLE_API_KEY');
+    const baseId = env('AIRTABLE_BASE_ID');
+    const token = env('AIRTABLE_API_KEY');
     if (!baseId || !token) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ message: 'שגיאה בבדיקת חפיפות. נסה שוב.' }));
@@ -547,9 +751,89 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // --- Temp File Upload: POST /api/tmp-upload ---
+  if (req.method === 'POST' && url === '/api/tmp-upload') {
+    const authUser = getAuthFromRequest(req);
+    if (!authUser) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+    try {
+      if (!assertJsonContentType(req)) {
+        res.writeHead(415, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Content-Type must be application/json' }));
+        return;
+      }
+      const body = await readBodyWithLimit(req, TMP_FILE_MAX_SIZE + 1024 * 100);
+      const { filename, contentType, data } = JSON.parse(body) as {
+        filename?: string;
+        contentType?: string;
+        data?: string;
+      };
+      if (!filename || !contentType || !data) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing filename, contentType, or data' }));
+        return;
+      }
+      const buffer = Buffer.from(data, 'base64');
+      if (buffer.length > TMP_FILE_MAX_SIZE) {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'File too large (max 10MB)' }));
+        return;
+      }
+      const fileId = crypto.randomUUID();
+      tmpFileStore.set(fileId, {
+        data: buffer,
+        contentType,
+        filename,
+        createdAt: Date.now(),
+      });
+      const protocol = req.headers['x-forwarded-proto'] || 'http';
+      const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
+      const fileUrl = `${protocol}://${host}/api/tmp-files/${fileId}/${encodeURIComponent(filename)}`;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ url: fileUrl, fileId }));
+    } catch (err) {
+      console.error('[apiServer] tmp-upload error:', err instanceof Error ? err.message : err);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Failed to upload file' }));
+    }
+    return;
+  }
+
+  // --- Temp File Serve: GET /api/tmp-files/:fileId/:filename ---
+  if (req.method === 'GET' && url.startsWith('/api/tmp-files/')) {
+    const parts = url.slice('/api/tmp-files/'.length).split('/');
+    const fileId = parts[0];
+    if (!fileId) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'File not found' }));
+      return;
+    }
+    const file = tmpFileStore.get(fileId);
+    if (!file) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'File not found or expired' }));
+      return;
+    }
+    res.writeHead(200, {
+      'Content-Type': file.contentType,
+      'Content-Length': String(file.data.length),
+      'Content-Disposition': `inline; filename="${file.filename}"`,
+      'Cache-Control': 'no-store',
+    });
+    res.end(file.data);
+    return;
+  }
+
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Not Found' }));
 });
+
+assertRequiredServerConfig();
+// Initialize authentication system
+initUsers();
 
 server.listen(PORT, () => {
   console.info(`[apiServer] Server running on port ${PORT}`);

@@ -386,7 +386,6 @@ export async function syncSlots(options: SyncSlotsOptions = {}): Promise<{
   const daysAhead = options.daysAhead || 14;
   const teacherId = options.teacherId;
 
-  console.log(`[slotSync] Starting sync: startDate=${formatDate(startDate)}, daysAhead=${daysAhead}, teacherId=${teacherId || 'all'}`);
 
   const errors: Array<{ slot: string; error: string }> = [];
   let created = 0;
@@ -395,7 +394,6 @@ export async function syncSlots(options: SyncSlotsOptions = {}): Promise<{
 
   try {
     // 1. Load weekly_slot templates
-    console.log('[slotSync] Loading weekly_slot templates...');
     const weeklySlotTableId = getTableId('weeklySlot');
     const teacherIdField = getField('weeklySlot', 'teacher_id');
     const dayOfWeekField = getField('weeklySlot', 'day_of_week');
@@ -439,18 +437,14 @@ export async function syncSlots(options: SyncSlotsOptions = {}): Promise<{
       };
     }).filter(t => t.teacherId && t.startTime && t.endTime);
 
-    console.log(`[slotSync] Loaded ${templates.length} templates`);
 
     // Build set of active template IDs
     const activeTemplateIds = new Set(templates.map(t => t.id));
 
     // 2. Generate inventory from templates
-    console.log('[slotSync] Generating inventory from templates...');
     const generated = generateInventoryFromTemplates(templates, startDate, daysAhead);
-    console.log(`[slotSync] Generated ${generated.length} slots`);
 
     // 3. Load existing slot_inventory in date range
-    console.log('[slotSync] Loading existing slot_inventory...');
     const weekStart = getWeekStart(startDate);
     const endDate = new Date(weekStart);
     endDate.setDate(endDate.getDate() + daysAhead);
@@ -512,10 +506,8 @@ export async function syncSlots(options: SyncSlotsOptions = {}): Promise<{
       };
     });
 
-    console.log(`[slotSync] Loaded ${existingInventory.length} existing inventory records`);
 
     // 4. Detect overlaps
-    console.log('[slotSync] Detecting overlaps...');
     const overlapReport = detectOverlaps(existingInventory);
     if (overlapReport.overlaps.length > 0) {
       console.warn(`[slotSync] WARNING: Found ${overlapReport.overlaps.length} overlaps:`);
@@ -525,12 +517,9 @@ export async function syncSlots(options: SyncSlotsOptions = {}): Promise<{
     }
 
     // 5. Diff inventory
-    console.log('[slotSync] Computing diff...');
     const diff = diffInventory(existingInventory, generated, activeTemplateIds);
-    console.log(`[slotSync] Diff: ${diff.toCreate.length} to create, ${diff.toUpdate.length} to update, ${diff.toDeactivate.length} to deactivate`);
 
     // 6. Create missing slots
-    console.log('[slotSync] Creating missing slots...');
     for (const gen of diff.toCreate) {
       try {
         const fields: Partial<SlotInventoryAirtableFields> = {
@@ -598,7 +587,6 @@ export async function syncSlots(options: SyncSlotsOptions = {}): Promise<{
     }
 
     // 7. Update safe slots
-    console.log('[slotSync] Updating safe slots...');
     for (const { existing, generated: gen } of diff.toUpdate) {
       try {
         const fields: Partial<SlotInventoryAirtableFields> = {
@@ -670,7 +658,6 @@ export async function syncSlots(options: SyncSlotsOptions = {}): Promise<{
     }
 
     // 8. Deactivate orphaned slots (from deleted/disabled templates)
-    console.log('[slotSync] Deactivating orphaned slots...');
     for (const existing of diff.toDeactivate) {
       try {
         await airtableClient.updateRecord<SlotInventoryAirtableFields>(
@@ -690,7 +677,6 @@ export async function syncSlots(options: SyncSlotsOptions = {}): Promise<{
       }
     }
 
-    console.log(`[slotSync] Sync complete: ${created} created, ${updated} updated, ${deactivated} deactivated, ${errors.length} errors`);
 
     return { created, updated, deactivated, errors };
   } catch (error: any) {

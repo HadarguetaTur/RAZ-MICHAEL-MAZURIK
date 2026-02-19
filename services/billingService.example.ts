@@ -23,7 +23,7 @@ export async function exampleGenerateSingleBill() {
   }
 
   // Fetch data
-  const students = await nexusApi.getStudents();
+  const { students } = await nexusApi.getStudents();
   const lessons = await nexusApi.getLessons('2024-03-01T00:00:00', '2024-03-31T23:59:59');
   const subscriptions = await nexusApi.getSubscriptions();
 
@@ -57,7 +57,7 @@ export async function exampleGenerateAllBills() {
   }
 
   // Fetch data
-  const students = await nexusApi.getStudents();
+  const { students } = await nexusApi.getStudents();
   const lessons = await nexusApi.getLessons('2024-03-01T00:00:00', '2024-03-31T23:59:59');
   const subscriptions = await nexusApi.getSubscriptions();
 
@@ -95,7 +95,7 @@ export async function apiGenerateBills(billingMonth: string) {
     const startDate = `${billingMonth}-01T00:00:00`;
     const endDate = `${billingMonth}-31T23:59:59`;
     
-    const students = await nexusApi.getStudents();
+    const { students } = await nexusApi.getStudents();
     const lessons = await nexusApi.getLessons(startDate, endDate);
     const subscriptions = await nexusApi.getSubscriptions();
 

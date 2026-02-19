@@ -385,6 +385,30 @@ export type SlotInventoryRecord = AirtableRecord<SlotInventoryAirtableFields>;
 
 /**
  * ============================================================================
+ * STUDENT GROUPS TABLE
+ * ============================================================================
+ */
+export interface StudentGroupsAirtableFields {
+  /** Primary field - group name */
+  group_name: string;
+
+  /** Linked records to students table */
+  students?: LinkedRecord;
+
+  /** Group status: active or paused */
+  status: 'active' | 'paused';
+
+  // Computed fields (read-only)
+  /** Lookup of student full_name from linked students */
+  student_names?: string[];
+  /** Count of linked students */
+  student_count?: number;
+}
+
+export type StudentGroupsRecord = AirtableRecord<StudentGroupsAirtableFields>;
+
+/**
+ * ============================================================================
  * MISSING FIELDS ERROR TYPE
  * ============================================================================
  */

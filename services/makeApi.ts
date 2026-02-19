@@ -82,7 +82,6 @@ async function triggerMakeScenario(
   scenarioId: string,
   data: Record<string, unknown>
 ): Promise<{ success: boolean; error?: string; responseData?: any }> {
-  console.log('[makeApi] triggerMakeScenario called with:', { scenarioId, data });
   
   if (!scenarioId) {
     console.error('[makeApi] No scenario ID provided');
@@ -96,7 +95,6 @@ async function triggerMakeScenario(
     // Make.com On-Demand API endpoint: POST /scenarios/{scenarioId}/run
     // The Vite proxy rewrites /api/make to /api/v2
     const url = `/api/make/scenarios/${scenarioId}/run`;
-    console.log('[makeApi] Calling Make.com API:', url);
     
     const response = await fetch(url, {
       method: 'POST',
@@ -106,9 +104,7 @@ async function triggerMakeScenario(
       body: JSON.stringify({ data }),
     });
 
-    console.log('[makeApi] Response status:', response.status);
     const responseText = await response.text();
-    console.log('[makeApi] Response body:', responseText);
 
     if (!response.ok) {
       let errorMessage = `Make API error (${response.status})`;
@@ -132,7 +128,6 @@ async function triggerMakeScenario(
       responseData = responseText;
     }
     
-    console.log('[makeApi] triggerMakeScenario SUCCESS:', responseData);
     return { success: true, responseData };
   } catch (err: any) {
     console.error('[makeApi] triggerMakeScenario network error:', err);
@@ -196,14 +191,6 @@ export async function triggerCreateLessonScenario(
     };
   }
   
-  console.log('[makeApi] Triggering CREATE_LESSON scenario:', {
-    scenarioId: CREATE_LESSON_SCENARIO_ID,
-    lessonId,
-    studentId,
-    date,
-    startTime,
-    duration,
-  });
   
   // Trigger the Make scenario
   const result = await triggerMakeScenario(CREATE_LESSON_SCENARIO_ID, {
@@ -217,7 +204,6 @@ export async function triggerCreateLessonScenario(
   });
   
   if (result.success) {
-    console.log('[makeApi] CREATE_LESSON scenario triggered successfully for lesson:', lessonId);
     return {
       success: true,
       message: 'האירוע נוצר בלוח השנה בהצלחה',
@@ -274,16 +260,6 @@ export async function triggerCancelLessonScenario(
     };
   }
   
-  // #region agent log
-  fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'makeApi.ts:triggerCancelLessonScenario',message:'Triggering CANCEL_LESSON scenario',data:{scenarioId:CANCEL_LESSON_SCENARIO_ID,lessonId,date,startTime},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H7'})}).catch(()=>{});
-  // #endregion
-  
-  console.log('[makeApi] Triggering CANCEL_LESSON scenario:', {
-    scenarioId: CANCEL_LESSON_SCENARIO_ID,
-    lessonId,
-    date,
-    startTime,
-  });
   
   // Trigger the Make scenario
   const result = await triggerMakeScenario(CANCEL_LESSON_SCENARIO_ID, {
@@ -294,7 +270,6 @@ export async function triggerCancelLessonScenario(
   });
   
   if (result.success) {
-    console.log('[makeApi] CANCEL_LESSON scenario triggered successfully for lesson:', lessonId);
     return {
       success: true,
       message: 'האירוע נמחק מלוח השנה בהצלחה',

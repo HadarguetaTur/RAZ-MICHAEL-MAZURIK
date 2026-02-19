@@ -133,10 +133,10 @@ export function useDashboardData() {
   // Fetch Billing KPIs for current month
   const { kpis: billingKpis, isLoading: billingLoading, refresh: refreshBilling } = useBilling(currentMonthStr);
 
-  // Fetch Students data (first page only for dashboard - faster)
+  // Fetch all students so dashboard metrics are accurate
   const { students, isLoading: studentsLoading, refreshStudents } = useStudents({
     filterActiveOnly: false,
-    loadAllPages: false  // Only first 100 students for dashboard speed
+    loadAllPages: true,
   });
 
   // Fetch overdue bills (previous months, unpaid)
@@ -256,7 +256,7 @@ export function useDashboardData() {
 
   const metrics: DashboardMetrics = useMemo(() => {
     // 1. Daily Metrics
-    const completed = lessonsTodayData.filter(l => l.status === 'הסתיים').length;
+    const completed = lessonsTodayData.filter(l => l.status === 'בוצע').length;
     const cancelled = lessonsTodayData.filter(l => l.status === 'בוטל').length;
     
     // Missing attendance: past lessons still marked as scheduled
@@ -275,8 +275,8 @@ export function useDashboardData() {
     ).length;
 
     // Lesson stats (this week): scheduled, completed, cancelled
-    const scheduled = currentWeekLessons.filter(l => l.status === 'מתוכנן' || l.status === 'ממתין' || (l as any).status === 'אישר הגעה').length;
-    const completedThisWeek = currentWeekLessons.filter(l => l.status === 'הסתיים' || (l as any).status === 'בוצע').length;
+    const scheduled = currentWeekLessons.filter(l => l.status === 'מתוכנן' || l.status === 'אישר הגעה').length;
+    const completedThisWeek = currentWeekLessons.filter(l => l.status === 'בוצע').length;
     const cancelledLessons = currentWeekLessons.filter(l => l.status === 'בוטל').length;
 
     // Occupancy from slot inventory (open vs occupied/closed)

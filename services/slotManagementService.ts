@@ -10,6 +10,7 @@ import { WeeklySlotAirtableFields, SlotInventoryAirtableFields, LinkedRecord } f
 import { formatDate, generateNaturalKey, getDateForDayOfWeek, getWeekStart, calculateDuration, DAYS_HEBREW, DAY_HEBREW_TO_NUM } from './dateUtils';
 import { LessonStatus } from '../types';
 import { preventSlotOpeningIfLessonsOverlap } from './conflictValidationService';
+import { normalizeSlotStatus } from '../utils/slotStatus';
 
 // Lazy import to avoid circular dependency
 let _nexusApi: typeof import('./nexusApi').nexusApi | null = null;
@@ -143,24 +144,7 @@ function mapAirtableToSlotInventory(record: { id: string; fields: SlotInventoryA
     ? (typeof teacherIdValue[0] === 'string' ? teacherIdValue[0] : teacherIdValue[0]?.id || '')
     : (typeof teacherIdValue === 'string' ? teacherIdValue : teacherIdValue?.id || '');
   
-  const statusField = 'סטטוס';
-  const rawStatusValue = (fields[statusField] || 'open') as string;
-  // Normalize status value: trim whitespace and handle both Hebrew and English
-  const rawStatus = typeof rawStatusValue === 'string' ? rawStatusValue.trim() : String(rawStatusValue).trim();
-  // Normalize Hebrew and English values from Airtable to internal enum:
-  // Hebrew: "פתוח" → 'open', "סגור" → 'closed', "מבוטל" → 'canceled', "חסום ע"י מנהל" → 'blocked'
-  // English: "open" → 'open', "closed"/"booked" → 'closed', "canceled" → 'canceled', "blocked" → 'blocked'
-  const status = (
-    rawStatus === 'פתוח' || rawStatus === 'open'
-      ? 'open'
-      : rawStatus === 'סגור' || rawStatus === 'closed' || rawStatus === 'booked'
-      ? 'closed'
-      : rawStatus === 'מבוטל' || rawStatus === 'canceled'
-      ? 'canceled'
-      : rawStatus === 'חסום ע"י מנהל' || rawStatus === 'חסום' || rawStatus === 'blocked'
-      ? 'blocked'
-      : 'open' // Default to 'open' for unknown values
-  ) as 'open' | 'closed' | 'canceled' | 'blocked';
+  const status = normalizeSlotStatus(fields['סטטוס']);
   
   // Extract lesson IDs from linked record field (for filtering slots with lessons)
   const lessonsField = getField('slotInventory', 'lessons');
@@ -492,7 +476,6 @@ export async function createSlotInventoryForWeek(weekStart: Date): Promise<numbe
             startTime: slot.startTime,
             endTime: slot.endTime,
           });
-          console.log(`[createSlotInventoryForWeek] Updated existing slot ${existingByCreatedFrom.id} (template time changed): ${existingByCreatedFrom.startTime} -> ${slot.startTime}`);
         } catch (updateError) {
           console.warn(`[createSlotInventoryForWeek] Failed to update existing slot ${existingByCreatedFrom.id}:`, updateError);
         }

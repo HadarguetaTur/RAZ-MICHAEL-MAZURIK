@@ -3,7 +3,7 @@
  */
 
 import { nexusApi } from '../services/nexusApi';
-import { Lesson, WeeklySlot, SlotInventory, Subscription, MonthlyBill, HomeworkAssignment, Student } from '../types';
+import { Lesson, WeeklySlot, SlotInventory, Subscription, MonthlyBill, HomeworkAssignment, HomeworkLibraryItem, Student } from '../types';
 import {
   invalidateLessons,
   type LessonsRange,
@@ -42,10 +42,6 @@ export async function createLesson(lesson: Partial<Lesson>): Promise<Lesson> {
   invalidateLessons();
   invalidateSlotInventory();
   
-  if (import.meta.env.DEV) {
-    const stats = getApiStats();
-    console.log(`[Mutations] createLesson | invalidated: lessons:*, slot_inventory:* | calls/min: ${stats.callsPerMinute}`);
-  }
   
   return result;
 }
@@ -61,30 +57,16 @@ export async function updateLesson(
   
   // If lesson was cancelled, reopen linked slot_inventory records
   // LessonStatus.CANCELLED = 'בוטל' (Hebrew), so check both English and Hebrew values
-  // #region agent log
-  fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'mutations.ts:63',message:'Checking if lesson was cancelled',data:{lessonId:id,status:updates.status,isCancelled:updates.status === 'CANCELLED' || updates.status === 'cancelled' || updates.status === 'בוטל'},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H'})}).catch(()=>{});
-  // #endregion
   if (updates.status === 'CANCELLED' || updates.status === 'cancelled' || updates.status === 'בוטל') {
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'mutations.ts:65',message:'Lesson was cancelled - calling reopenSlotsForCancelledLesson',data:{lessonId:id},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H'})}).catch(()=>{});
-    // #endregion
     try {
       const { reopenSlotsForCancelledLesson } = await import('../services/slotReopeningService');
       const reopenedSlots = await reopenSlotsForCancelledLesson(id);
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'mutations.ts:69',message:'reopenSlotsForCancelledLesson returned',data:{lessonId:id,reopenedSlotsCount:reopenedSlots.length,reopenedSlots},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H'})}).catch(()=>{});
-      // #endregion
       if (import.meta.env.DEV) {
         if (reopenedSlots.length > 0) {
-          console.log(`[Mutations] updateLesson | Reopened ${reopenedSlots.length} slot(s) after cancelling lesson ${id}:`, reopenedSlots);
         } else {
-          console.log(`[Mutations] updateLesson | No slots found to reopen for cancelled lesson ${id}`);
         }
       }
     } catch (error) {
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'mutations.ts:78',message:'Error in reopenSlotsForCancelledLesson',data:{lessonId:id,error:error?.message,errorStack:error?.stack},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H'})}).catch(()=>{});
-      // #endregion
       // Don't fail lesson update if slot reopening fails
       console.warn(`[Mutations] updateLesson | Failed to reopen slots for cancelled lesson ${id}:`, error);
     }
@@ -93,13 +75,6 @@ export async function updateLesson(
   // Invalidate both lessons and slot inventory (slots may have been auto-closed or reopened)
   invalidateLessons();
   invalidateSlotInventory();
-  // #region agent log
-  fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'data/mutations.ts:updateLesson:afterInvalidate',message:'updateLesson: invalidateLessons and invalidateSlotInventory called',data:{lessonId:id},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H-cal-update'})}).catch(()=>{});
-  // #endregion
-  if (import.meta.env.DEV) {
-    const stats = getApiStats();
-    console.log(`[Mutations] updateLesson | invalidated: lessons:*, slot_inventory:* | calls/min: ${stats.callsPerMinute}`);
-  }
   
   return result;
 }
@@ -116,10 +91,6 @@ export async function createWeeklySlot(
   invalidateWeeklySlots();
   invalidateSlotInventory();
   
-  if (import.meta.env.DEV) {
-    const stats = getApiStats();
-    console.log(`[Mutations] createWeeklySlot | invalidated: weekly_slot:*, slot_inventory:* | calls/min: ${stats.callsPerMinute}`);
-  }
   
   return result;
 }
@@ -137,10 +108,6 @@ export async function updateWeeklySlot(
   invalidateWeeklySlots();
   invalidateSlotInventory();
   
-  if (import.meta.env.DEV) {
-    const stats = getApiStats();
-    console.log(`[Mutations] updateWeeklySlot | invalidated: weekly_slot:*, slot_inventory:* | calls/min: ${stats.callsPerMinute}`);
-  }
   
   return result;
 }
@@ -155,10 +122,17 @@ export async function deleteWeeklySlot(id: string): Promise<void> {
   invalidateWeeklySlots();
   invalidateSlotInventory();
   
-  if (import.meta.env.DEV) {
-    const stats = getApiStats();
-    console.log(`[Mutations] deleteWeeklySlot | invalidated: weekly_slot:*, slot_inventory:* | calls/min: ${stats.callsPerMinute}`);
-  }
+}
+
+/**
+ * Create a one-time slot inventory entry
+ */
+export async function createSlotInventory(
+  data: Parameters<typeof nexusApi.createSlotInventory>[0]
+): Promise<SlotInventory> {
+  const result = await nexusApi.createSlotInventory(data);
+  invalidateSlotInventory();
+  return result;
 }
 
 /**
@@ -173,10 +147,6 @@ export async function updateSlotInventory(
   // Invalidate slot inventory
   invalidateSlotInventory();
   
-  if (import.meta.env.DEV) {
-    const stats = getApiStats();
-    console.log(`[Mutations] updateSlotInventory | invalidated: slot_inventory:* | calls/min: ${stats.callsPerMinute}`);
-  }
   
   return result;
 }
@@ -190,10 +160,6 @@ export async function deleteSlotInventory(id: string): Promise<void> {
   // Invalidate slot inventory
   invalidateSlotInventory();
   
-  if (import.meta.env.DEV) {
-    const stats = getApiStats();
-    console.log(`[Mutations] deleteSlotInventory | invalidated: slot_inventory:* | calls/min: ${stats.callsPerMinute}`);
-  }
 }
 
 /**
@@ -209,10 +175,6 @@ export async function updateSlotInventoryWithLesson(
   invalidateLessons();
   invalidateSlotInventory();
   
-  if (import.meta.env.DEV) {
-    const stats = getApiStats();
-    console.log(`[Mutations] updateSlotInventoryWithLesson | invalidated: lessons:*, slot_inventory:* | calls/min: ${stats.callsPerMinute}`);
-  }
   
   return result;
 }
@@ -230,10 +192,6 @@ export async function createSubscription(
   // Invalidate subscriptions cache
   invalidateSubscriptions();
   
-  if (import.meta.env.DEV) {
-    const stats = getApiStats();
-    console.log(`[Mutations] createSubscription | invalidated: subscriptions:* | calls/min: ${stats.callsPerMinute}`);
-  }
   
   return result;
 }
@@ -252,10 +210,6 @@ export async function updateSubscription(
   // Invalidate subscriptions cache
   invalidateSubscriptions();
   
-  if (import.meta.env.DEV) {
-    const stats = getApiStats();
-    console.log(`[Mutations] updateSubscription | invalidated: subscriptions:* | calls/min: ${stats.callsPerMinute}`);
-  }
   
   return result;
 }
@@ -273,10 +227,6 @@ export async function updateBillStatus(
   // Invalidate billing cache
   invalidateBilling(month);
   
-  if (import.meta.env.DEV) {
-    const stats = getApiStats();
-    console.log(`[Mutations] updateBillStatus | invalidated: billing:${month || '*'}:* | calls/min: ${stats.callsPerMinute}`);
-  }
 }
 
 /**
@@ -291,10 +241,6 @@ export async function updateBillAdjustment(
   // Invalidate billing cache (we don't know the exact month, so invalidate all)
   invalidateBilling();
   
-  if (import.meta.env.DEV) {
-    const stats = getApiStats();
-    console.log(`[Mutations] updateBillAdjustment | invalidated: billing:* | calls/min: ${stats.callsPerMinute}`);
-  }
 }
 
 /**
@@ -308,10 +254,6 @@ export async function createMonthlyCharges(
   // Invalidate billing cache for the specific month
   invalidateBilling(billingMonth);
   
-  if (import.meta.env.DEV) {
-    const stats = getApiStats();
-    console.log(`[Mutations] createMonthlyCharges | invalidated: billing:${billingMonth}:* | calls/min: ${stats.callsPerMinute}`);
-  }
   
   return result;
 }
@@ -325,10 +267,6 @@ export async function deleteBill(billId: string, month?: string): Promise<void> 
   // Invalidate billing cache
   invalidateBilling(month);
   
-  if (import.meta.env.DEV) {
-    const stats = getApiStats();
-    console.log(`[Mutations] deleteBill | invalidated: billing:${month || '*'} | calls/min: ${stats.callsPerMinute}`);
-  }
 }
 
 /**
@@ -342,12 +280,39 @@ export async function assignHomework(
   // Invalidate homework assignments cache
   invalidateHomework();
   
-  if (import.meta.env.DEV) {
-    const stats = getApiStats();
-    console.log(`[Mutations] assignHomework | invalidated: homework:* | calls/min: ${stats.callsPerMinute}`);
-  }
   
   return result;
+}
+
+/**
+ * Create a new homework library item
+ */
+export async function createHomeworkLibraryItem(
+  item: Partial<HomeworkLibraryItem>
+): Promise<HomeworkLibraryItem> {
+  const result = await nexusApi.createHomeworkLibraryItem(item);
+  invalidateHomework();
+  return result;
+}
+
+/**
+ * Update a homework library item
+ */
+export async function updateHomeworkLibraryItem(
+  id: string,
+  updates: Partial<HomeworkLibraryItem>
+): Promise<HomeworkLibraryItem> {
+  const result = await nexusApi.updateHomeworkLibraryItem(id, updates);
+  invalidateHomework();
+  return result;
+}
+
+/**
+ * Delete a homework library item
+ */
+export async function deleteHomeworkLibraryItem(id: string): Promise<void> {
+  await nexusApi.deleteHomeworkLibraryItem(id);
+  invalidateHomework();
 }
 
 /**
@@ -362,10 +327,6 @@ export async function updateStudent(
   // Invalidate students cache
   invalidateStudents();
   
-  if (import.meta.env.DEV) {
-    const stats = getApiStats();
-    console.log(`[Mutations] updateStudent | invalidated: students:* | calls/min: ${stats.callsPerMinute}`);
-  }
   
   return result;
 }
@@ -381,10 +342,6 @@ export async function createStudent(
   // Invalidate students cache to refresh the list
   invalidateStudents();
   
-  if (import.meta.env.DEV) {
-    const stats = getApiStats();
-    console.log(`[Mutations] createStudent | created: ${result.id} | invalidated: students:* | calls/min: ${stats.callsPerMinute}`);
-  }
   
   return result;
 }
@@ -401,10 +358,6 @@ export async function updateStudentNotes(
   // Invalidate students cache
   invalidateStudents();
   
-  if (import.meta.env.DEV) {
-    const stats = getApiStats();
-    console.log(`[Mutations] updateStudentNotes | invalidated: students:* | calls/min: ${stats.callsPerMinute}`);
-  }
   
   return result;
 }

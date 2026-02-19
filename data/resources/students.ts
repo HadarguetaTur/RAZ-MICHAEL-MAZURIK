@@ -12,33 +12,43 @@ const STUDENTS_TTL = 12 * 60 * 60 * 1000; // 12 hours (relatively static)
 const PAGE_SIZE = 100;
 
 /**
- * Get students (single page)
+ * Get first page of students (for quick initial loads)
  */
-export async function getStudents(page: number = 1): Promise<Student[]> {
-  const key = buildKey(['students', String(page)]);
+export async function getStudents(): Promise<Student[]> {
+  const key = buildKey(['students', 'page1']);
 
   return fetchWithCache({
     key,
     ttlMs: STUDENTS_TTL,
-    fetcher: () => nexusApi.getStudents(page),
+    fetcher: async () => {
+      const { students } = await nexusApi.getStudents();
+      return students;
+    },
     staleWhileRevalidate: true,
   });
 }
 
 /**
- * Get all students (all pages) — for pages like Subscriptions that need full list for name resolution
+ * Get all students (all pages) using Airtable's offset token pagination
  */
 export async function getAllStudents(): Promise<Student[]> {
-  const all: Student[] = [];
-  let page = 1;
-  while (true) {
-    const batch = await getStudents(page);
-    if (batch.length === 0) break;
-    all.push(...batch);
-    if (batch.length < PAGE_SIZE) break;
-    page++;
-  }
-  return all;
+  const key = buildKey(['students', 'all']);
+
+  return fetchWithCache({
+    key,
+    ttlMs: STUDENTS_TTL,
+    fetcher: async () => {
+      const all: Student[] = [];
+      let offsetToken: string | undefined;
+      do {
+        const { students, nextOffset } = await nexusApi.getStudents(offsetToken);
+        all.push(...students);
+        offsetToken = nextOffset;
+      } while (offsetToken);
+      return all;
+    },
+    staleWhileRevalidate: true,
+  });
 }
 
 /**

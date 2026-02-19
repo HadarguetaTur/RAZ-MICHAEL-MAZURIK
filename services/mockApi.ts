@@ -18,13 +18,6 @@ const MOCK_STUDENTS: Student[] = [
     status: 'active',
     subscriptionType: 'חודשי פרימיום', 
     balance: 0,
-    homework: [
-      { id: 'h1', title: 'תרגול פונקציות קוויות', status: 'pending', dueDate: '2024-03-25' },
-      { id: 'h2', title: 'הכנה למבחן פתרון משוואות', status: 'completed', dueDate: '2024-03-18' }
-    ],
-    tests: [
-      { id: 'test1', subject: 'מתמטיקה', date: '2024-03-20', result: '95' }
-    ]
   },
   { 
     id: '2', 
@@ -61,9 +54,9 @@ export const mockData = {
     await new Promise(r => setTimeout(r, 200));
     return MOCK_TEACHERS;
   },
-  getStudents: async (): Promise<Student[]> => {
+  getStudents: async (): Promise<{ students: Student[]; nextOffset?: string }> => {
     await new Promise(r => setTimeout(r, 200));
-    return MOCK_STUDENTS;
+    return { students: MOCK_STUDENTS };
   },
   getLessons: async (start: string, end: string, teacherId?: string): Promise<Lesson[]> => {
     await new Promise(r => setTimeout(r, 300));

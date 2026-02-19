@@ -61,6 +61,9 @@ export const API_ENDPOINTS = {
   CONFLICTS_CHECK: '/api/conflicts/check',
   SLOT_INVENTORY: '/api/slot-inventory',
   HEALTH: '/health',
+  AUTH_LOGIN: '/api/auth/login',
+  AUTH_ME: '/api/auth/me',
+  AIRTABLE_PROXY: '/api/airtable',
 } as const;
 
 // Export for debugging

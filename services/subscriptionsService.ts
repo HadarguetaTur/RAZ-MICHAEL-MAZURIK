@@ -1,18 +1,22 @@
 
 import { Subscription } from '../types';
 import { AIRTABLE_CONFIG } from '../config/airtable';
+import { getAuthToken } from '../hooks/useAuth';
+import { apiUrl } from '../config/api';
 
-// Use Vite's import.meta.env for client-side environment variables
-const API_BASE_URL = 'https://api.airtable.com/v0';
-const AIRTABLE_API_KEY = import.meta.env.VITE_AIRTABLE_API_KEY || '';
-const AIRTABLE_BASE_ID = import.meta.env.VITE_AIRTABLE_BASE_ID || '';
+const PROXY_BASE_URL = '/api/airtable';
 
 /**
- * Airtable API helper function
+ * Airtable API helper function (via backend proxy)
  */
 async function airtableRequest<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
-  if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-    throw new Error('Airtable API Key or Base ID not configured. Please set VITE_AIRTABLE_API_KEY and VITE_AIRTABLE_BASE_ID in .env.local');
+  const token = getAuthToken();
+  if (!token) {
+    throw {
+      message: 'Authentication required. Please log in.',
+      code: 'AUTH_REQUIRED',
+      status: 401,
+    };
   }
 
   // Encode table IDs for safety
@@ -24,20 +28,24 @@ async function airtableRequest<T>(endpoint: string, options: RequestInit = {}): 
   const encodedPath = pathParts.join('/');
   const encodedEndpoint = queryString ? `${encodedPath}?${queryString}` : encodedPath;
   
-  const url = `${API_BASE_URL}/${encodeURIComponent(AIRTABLE_BASE_ID)}${encodedEndpoint}`;
-  console.log(`[SubscriptionsService] ${options.method || 'GET'} ${url}`);
+  const url = apiUrl(`${PROXY_BASE_URL}${encodedEndpoint}`);
 
   try {
     const response = await fetch(url, {
       ...options,
       headers: {
-        'Authorization': `Bearer ${AIRTABLE_API_KEY}`,
+        'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
         ...options.headers,
       },
     });
 
     if (!response.ok) {
+      if (response.status === 401) {
+        sessionStorage.removeItem('auth_token');
+        window.location.reload();
+      }
+
       const errorText = await response.text();
       let errorData;
       try {
@@ -47,7 +55,7 @@ async function airtableRequest<T>(endpoint: string, options: RequestInit = {}): 
       }
       console.error(`[SubscriptionsService] Error ${response.status}:`, errorData);
       throw {
-        message: errorData.error?.message || `Airtable API error: ${response.statusText}`,
+        message: errorData.error?.message || `API error: ${response.statusText}`,
         code: 'AIRTABLE_ERROR',
         status: response.status,
         details: errorData,
@@ -56,12 +64,12 @@ async function airtableRequest<T>(endpoint: string, options: RequestInit = {}): 
 
     return response.json() as Promise<T>;
   } catch (err: any) {
-    if (err.code === 'AIRTABLE_ERROR') {
+    if (err.code === 'AIRTABLE_ERROR' || err.code === 'AUTH_REQUIRED') {
       throw err;
     }
     // Network or other errors
     throw {
-      message: `Failed to connect to Airtable: ${err.message}`,
+      message: `Failed to connect to API: ${err.message}`,
       code: 'AIRTABLE_CONNECTION_ERROR',
       status: 0,
     };
@@ -287,10 +295,6 @@ export const subscriptionsService = {
    * List all subscriptions
    */
   listSubscriptions: async (): Promise<Subscription[]> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
-    }
-
     const params = new URLSearchParams({
       pageSize: '100',
     });
@@ -304,29 +308,20 @@ export const subscriptionsService = {
       const firstRecord = response.records[0];
       const fields = firstRecord.fields || {};
       const fieldKeys = Object.keys(fields);
-      console.log('[SubscriptionsService] Available field keys:', fieldKeys);
       // Log each field key and a short value summary to see exact Airtable response
       fieldKeys.forEach(k => {
         const v = fields[k];
         const summary = Array.isArray(v)
           ? `[${v.length}] ${v.length ? (typeof v[0] === 'string' ? v[0] : (v[0] && typeof v[0] === 'object' ? (v[0] as { id?: string }).id : '')) : ''}`
           : String(v);
-        console.log(`  [SubscriptionsService] fields["${k}"]:`, summary);
       });
     }
     
     const subscriptions = response.records.map(mapAirtableToSubscription);
-    console.log(`[SubscriptionsService] Fetched ${subscriptions.length} subscriptions`);
     
     // Log mapping results for first few subscriptions
     if (import.meta.env.DEV && subscriptions.length > 0) {
       subscriptions.slice(0, 3).forEach((sub, idx) => {
-        console.log(`[SubscriptionsService] Subscription ${idx + 1}:`, {
-          id: sub.id,
-          studentId: sub.studentId,
-          fullName: sub.fullName || '(empty)',
-          hasFullName: !!sub.fullName,
-        });
       });
     }
     
@@ -337,10 +332,6 @@ export const subscriptionsService = {
    * Create a new subscription
    */
   createSubscription: async (data: Partial<Subscription>): Promise<Subscription> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
-    }
-
     if (!data.studentId) {
       throw { 
         message: 'Missing required field: studentId', 
@@ -364,7 +355,6 @@ export const subscriptionsService = {
       fields: response.fields 
     });
     
-    console.log(`[SubscriptionsService] Created subscription ${response.id}`);
     return newSubscription;
   },
 
@@ -372,10 +362,6 @@ export const subscriptionsService = {
    * Update an existing subscription
    */
   updateSubscription: async (id: string, data: Partial<Subscription>): Promise<Subscription> => {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-      throw new Error('Airtable API Key or Base ID not configured');
-    }
-
     const airtableFields = mapSubscriptionToAirtable(data);
 
     const response = await airtableRequest<{ id: string; fields: any }>(
@@ -391,7 +377,6 @@ export const subscriptionsService = {
       fields: response.fields 
     });
     
-    console.log(`[SubscriptionsService] Updated subscription ${id}`);
     return updatedSubscription;
   },
 };
