@@ -104,20 +104,23 @@ function getAllowedOrigins(): string[] {
   return DEFAULT_ALLOWED_ORIGINS;
 }
 
+function isOriginAllowed(origin: string): boolean {
+  if (getAllowedOrigins().includes(origin)) return true;
+  // Allow all Vercel preview deployment URLs for this project
+  if (/^https:\/\/raz-michael-mazurik[a-z0-9-]*\.vercel\.app$/.test(origin)) return true;
+  return false;
+}
+
 function setCorsHeaders(req: http.IncomingMessage, res: http.ServerResponse): boolean {
   const origin = req.headers.origin || '';
-  const allowedOrigins = getAllowedOrigins();
   
-  // Allow if origin is in the allowed list
-  // For same-origin requests (no origin header), CORS headers are not needed
-  if (origin && allowedOrigins.includes(origin)) {
+  if (origin && isOriginAllowed(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    res.setHeader('Access-Control-Max-Age', '86400'); // 24 hours
+    res.setHeader('Access-Control-Max-Age', '86400');
     return true;
   }
-  // For same-origin requests (no origin header), allow without CORS headers
   if (!origin) return true;
   return false;
 }
