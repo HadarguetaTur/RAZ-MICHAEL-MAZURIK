@@ -3,7 +3,7 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { Subscription, Student } from '../types';
 import { parseApiError } from '../services/nexusApi';
 import { useSubscriptions } from '../data/hooks/useSubscriptions';
-import { createSubscription, updateSubscription } from '../data/mutations';
+import { createSubscription, updateSubscription, deleteSubscription } from '../data/mutations';
 import { subscriptionsService, parseMonthlyAmount } from '../services/subscriptionsService';
 import StudentPicker from './StudentPicker';
 import { useStudents } from '../hooks/useStudents';
@@ -397,26 +397,47 @@ const Subscriptions: React.FC = () => {
     setIsModalOpen(true);
   };
 
-  const handleEdit = (subscription: Subscription) => {
+  const handleEdit = async (subscription: Subscription) => {
     setSelectedSubscription(subscription);
+
+    const rawAmount = subscription.monthlyAmount;
+    const numericAmount = parseMonthlyAmount(rawAmount);
+    const formattedAmount = numericAmount > 0 ? `₪${numericAmount.toLocaleString()}` : '';
+
     setFormData({
       studentId: subscription.studentId,
       subscriptionStartDate: subscription.subscriptionStartDate || '',
       subscriptionEndDate: subscription.subscriptionEndDate || '',
-      monthlyAmount: subscription.monthlyAmount || '',
+      monthlyAmount: formattedAmount,
       subscriptionType: subscription.subscriptionType || '',
       pauseSubscription: subscription.pauseSubscription || false,
       pauseDate: subscription.pauseDate || '',
     });
     
-    // Load student if we have studentId (synchronous lookup from cache)
+    let resolved: Student | null = null;
     if (subscription.studentId) {
-      const student = getStudentById(subscription.studentId);
-      setSelectedStudent(student || null);
-    } else {
-      setSelectedStudent(null);
+      // 1. Synchronous lookup from already-loaded students array
+      resolved = students.find(s => s.id === subscription.studentId) || null;
+
+      // 2. Async fallback
+      if (!resolved) {
+        resolved = (await getStudentById(subscription.studentId)) || null;
+      }
+
+      // 3. If still not found but we have a display name, create a minimal Student
+      if (!resolved) {
+        const displayName = resolveStudentName(subscription);
+        if (displayName && displayName !== '—') {
+          resolved = { id: subscription.studentId, name: displayName } as Student;
+        }
+      }
+
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'6ce852'},body:JSON.stringify({sessionId:'6ce852',location:'Subscriptions.tsx:handleEdit',message:'Student resolution result',data:{subscriptionId:subscription.id,studentId:subscription.studentId,resolvedName:resolved?.name,resolvedId:resolved?.id,formattedAmount},timestamp:Date.now(),hypothesisId:'A'})}).catch(()=>{});
+      // #endregion
     }
-    
+
+    setSelectedStudent(resolved);
     setIsModalOpen(true);
   };
 
@@ -428,8 +449,15 @@ const Subscriptions: React.FC = () => {
   };
 
   const handleSave = async () => {
+    // #region agent log
+    const isSelectedStudentPromise = selectedStudent instanceof Promise;
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'6ce852'},body:JSON.stringify({sessionId:'6ce852',location:'Subscriptions.tsx:handleSave',message:'handleSave called',data:{hasSelectedSubscription:!!selectedSubscription,formStudentId:formData.studentId,selectedStudentId:(selectedStudent as any)?.id,selectedStudentName:(selectedStudent as any)?.name,isSelectedStudentPromise,selectedStudentType:typeof selectedStudent,selectedStudentTruthy:!!selectedStudent,isSaving,processingId},timestamp:Date.now(),hypothesisId:'A,B'})}).catch(()=>{});
+    // #endregion
     // Validation: Student is required
     if (!formData.studentId || !selectedStudent) {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'6ce852'},body:JSON.stringify({sessionId:'6ce852',location:'Subscriptions.tsx:handleSave:validationFail',message:'Validation failed - no student',data:{formStudentId:formData.studentId,selectedStudentTruthy:!!selectedStudent},timestamp:Date.now(),hypothesisId:'A'})}).catch(()=>{});
+      // #endregion
       setToast({ message: 'נא לבחור תלמיד', type: 'error' });
       return;
     }
@@ -453,6 +481,9 @@ const Subscriptions: React.FC = () => {
     setIsSaving(true);
     try {
       if (selectedSubscription) {
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'6ce852'},body:JSON.stringify({sessionId:'6ce852',location:'Subscriptions.tsx:handleSave:update',message:'About to call updateSubscription',data:{subscriptionId:selectedSubscription.id,studentIdToSend:selectedStudent.id,formData},timestamp:Date.now(),hypothesisId:'B'})}).catch(()=>{});
+        // #endregion
         // Update existing
         await updateSubscription(selectedSubscription.id, {
           ...formData,
@@ -475,6 +506,9 @@ const Subscriptions: React.FC = () => {
       setSelectedSubscription(null);
       setSelectedStudent(null);
     } catch (err) {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'6ce852'},body:JSON.stringify({sessionId:'6ce852',location:'Subscriptions.tsx:handleSave:error',message:'handleSave error caught',data:{error:String(err),errorMessage:(err as any)?.message,errorDetails:JSON.stringify(err)},timestamp:Date.now(),hypothesisId:'B'})}).catch(()=>{});
+      // #endregion
       setToast({ message: parseApiError(err), type: 'error' });
     } finally {
       setIsSaving(false);
@@ -535,6 +569,9 @@ const Subscriptions: React.FC = () => {
   };
 
   const handleEnd = async (id: string) => {
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'6ce852'},body:JSON.stringify({sessionId:'6ce852',location:'Subscriptions.tsx:handleEnd',message:'handleEnd called',data:{subscriptionId:id,isSaving,processingId},timestamp:Date.now(),hypothesisId:'D,E'})}).catch(()=>{});
+    // #endregion
     const confirmed = await confirm({
       title: 'סיום מנוי',
       message: 'האם אתה בטוח שברצונך לסיים מנוי זה? המנוי יסומן כפג תוקף.',
@@ -554,6 +591,29 @@ const Subscriptions: React.FC = () => {
       await subscriptionsHook.refresh();
       await loadSubscriptions(); // sync local state so table updates without page refresh
       setToast({ message: 'המנוי הסתיים בהצלחה', type: 'success' });
+    } catch (err) {
+      setToast({ message: parseApiError(err), type: 'error' });
+    } finally {
+      setProcessingId(null);
+    }
+  };
+
+  const handleDelete = async (id: string) => {
+    const confirmed = await confirm({
+      title: 'מחיקת מנוי',
+      message: 'האם אתה בטוח שברצונך למחוק מנוי זה? פעולה זו אינה ניתנת לביטול.',
+      variant: 'danger',
+      confirmLabel: 'מחק מנוי',
+      cancelLabel: 'ביטול'
+    });
+    if (!confirmed) return;
+
+    setProcessingId(id);
+    try {
+      await deleteSubscription(id);
+      await subscriptionsHook.refresh();
+      await loadSubscriptions();
+      setToast({ message: 'המנוי נמחק בהצלחה', type: 'success' });
     } catch (err) {
       setToast({ message: parseApiError(err), type: 'error' });
     } finally {
@@ -749,7 +809,7 @@ const Subscriptions: React.FC = () => {
                   </td>
                   <td className="px-6 py-5 text-slate-600">{sub.subscriptionType || '-'}</td>
                   <td className="px-6 py-5 font-black text-slate-900 text-lg">
-                    {sub.monthlyAmount || '-'}
+                    {parseMonthlyAmount(sub.monthlyAmount) > 0 ? `₪${parseMonthlyAmount(sub.monthlyAmount).toLocaleString()}` : '-'}
                   </td>
                   <td className="px-6 py-5 text-sm text-slate-600">{formatDate(sub.subscriptionStartDate)}</td>
                   <td className="px-6 py-5 text-sm text-slate-600">{formatDate(sub.subscriptionEndDate)}</td>
@@ -799,6 +859,13 @@ const Subscriptions: React.FC = () => {
                         // Expired subscriptions don't show pause/resume/end buttons
                         return null;
                       })()}
+                      <button 
+                        onClick={() => handleDelete(sub.id)}
+                        disabled={processingId === sub.id || isSaving}
+                        className="px-3 py-1.5 bg-red-50 text-red-600 text-xs font-black rounded-lg hover:bg-red-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {processingId === sub.id ? '...' : 'מחיקה'}
+                      </button>
                     </div>
                   </td>
                 </tr>
@@ -852,7 +919,7 @@ const Subscriptions: React.FC = () => {
                     {resolveStudentName(sub)}
                   </div>
                   <div className="text-sm text-slate-600 mb-1">{sub.subscriptionType || '-'}</div>
-                  <div className="text-xl font-black text-slate-900">{sub.monthlyAmount || '-'}</div>
+                  <div className="text-xl font-black text-slate-900">{parseMonthlyAmount(sub.monthlyAmount) > 0 ? `₪${parseMonthlyAmount(sub.monthlyAmount).toLocaleString()}` : '-'}</div>
                 </div>
                 <div className="flex flex-col items-end gap-2">
                   {getStatusBadge(sub)}
@@ -912,6 +979,13 @@ const Subscriptions: React.FC = () => {
                   // Expired subscriptions don't show pause/resume/end buttons
                   return null;
                 })()}
+                <button 
+                  onClick={() => handleDelete(sub.id)}
+                  disabled={processingId === sub.id || isSaving}
+                  className="flex-1 px-3 py-2 bg-red-50 text-red-600 text-xs font-black rounded-lg hover:bg-red-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {processingId === sub.id ? '...' : 'מחיקה'}
+                </button>
               </div>
             </div>
           ))}
@@ -988,10 +1062,16 @@ const Subscriptions: React.FC = () => {
             </label>
             <input
               type="text"
-              placeholder="₪480.00"
+              placeholder="₪480"
               className="w-full bg-slate-50 border border-slate-200 rounded-xl p-4 font-bold outline-none focus:bg-white focus:ring-2 focus:ring-blue-100"
               value={formData.monthlyAmount || ''}
               onChange={(e) => setFormData(prev => ({ ...prev, monthlyAmount: e.target.value }))}
+              onBlur={() => {
+                const num = parseMonthlyAmount(formData.monthlyAmount);
+                if (num > 0) {
+                  setFormData(prev => ({ ...prev, monthlyAmount: `₪${num.toLocaleString()}` }));
+                }
+              }}
             />
           </div>
 

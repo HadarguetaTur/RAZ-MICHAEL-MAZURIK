@@ -270,8 +270,8 @@ function mapSubscriptionToAirtable(subscription: Partial<Subscription>): any {
     airtableFields.fields['subscription_end_date'] = subscription.subscriptionEndDate || null;
   }
   if (subscription.monthlyAmount !== undefined) {
-    // Store as-is - Airtable expects currency string format
-    airtableFields.fields['monthly_amount'] = subscription.monthlyAmount || null;
+    const parsed = parseMonthlyAmount(subscription.monthlyAmount);
+    airtableFields.fields['monthly_amount'] = parsed > 0 ? parsed : null;
   }
   if (subscription.subscriptionType !== undefined) {
     airtableFields.fields['subscription_type'] = subscription.subscriptionType || null;
@@ -361,8 +361,18 @@ export const subscriptionsService = {
   /**
    * Update an existing subscription
    */
+  deleteSubscription: async (id: string): Promise<void> => {
+    await airtableRequest<{ deleted: boolean }>(
+      `/${AIRTABLE_CONFIG.tables.subscriptions}/${id}`,
+      { method: 'DELETE' }
+    );
+  },
+
   updateSubscription: async (id: string, data: Partial<Subscription>): Promise<Subscription> => {
     const airtableFields = mapSubscriptionToAirtable(data);
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/c84d89a2-beed-426a-aa89-c66f0cddbbf2',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'6ce852'},body:JSON.stringify({sessionId:'6ce852',location:'subscriptionsService.ts:updateSubscription',message:'Airtable payload',data:{id,inputData:data,airtableFields,monthlyAmountType:typeof airtableFields.fields?.monthly_amount,monthlyAmountValue:airtableFields.fields?.monthly_amount},timestamp:Date.now(),hypothesisId:'B'})}).catch(()=>{});
+    // #endregion
 
     const response = await airtableRequest<{ id: string; fields: any }>(
       `/${AIRTABLE_CONFIG.tables.subscriptions}/${id}`,

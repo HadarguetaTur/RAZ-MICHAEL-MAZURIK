@@ -197,6 +197,15 @@ export async function createSubscription(
 }
 
 /**
+ * Delete a subscription
+ */
+export async function deleteSubscription(id: string): Promise<void> {
+  const { subscriptionsService } = await import('../services/subscriptionsService');
+  await subscriptionsService.deleteSubscription(id);
+  invalidateSubscriptions();
+}
+
+/**
  * Update a subscription
  */
 export async function updateSubscription(

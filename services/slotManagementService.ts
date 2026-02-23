@@ -53,6 +53,31 @@ function mapAirtableToWeeklySlot(record: { id: string; fields: WeeklySlotAirtabl
   }
   const reservedFor = reservedForIds.length > 0 ? reservedForIds[0] : undefined;
 
+  // Extract student names from lookup field "full_name (from reserved_for)"
+  let reservedForNames: string[] = [];
+  const lookupFieldNames = [
+    'full_name (from reserved_for)',
+    'Full Name (from reserved_for)',
+    'שם מלא (from reserved_for)',
+  ];
+  for (const lookupFieldName of lookupFieldNames) {
+    const lookupValue = (fields as any)[lookupFieldName];
+    if (lookupValue) {
+      if (Array.isArray(lookupValue)) {
+        reservedForNames = lookupValue
+          .map((item: unknown) => {
+            if (typeof item === 'string') return item.trim();
+            if (item && typeof item === 'object' && 'name' in (item as any)) return String((item as any).name).trim();
+            return '';
+          })
+          .filter((name: string) => name.length > 0);
+      } else if (typeof lookupValue === 'string') {
+        reservedForNames = [lookupValue.trim()].filter(name => name.length > 0);
+      }
+      if (reservedForNames.length > 0) break;
+    }
+  }
+
   const isReservedField = getField('weeklySlot', 'is_reserved');
   const isReservedRaw = fields[isReservedField];
   const isReserved = isReservedRaw === true || isReservedRaw === 1 || isReservedRaw === 'לא פנוי';
@@ -127,6 +152,7 @@ function mapAirtableToWeeklySlot(record: { id: string; fields: WeeklySlotAirtabl
     isFixed: isFixed,
     reservedFor: reservedFor,
     reservedForIds: reservedForIds.length > 0 ? reservedForIds : undefined,
+    reservedForNames: reservedForNames.length > 0 ? reservedForNames : undefined,
     durationMin: durationMin,
     isReserved: isReserved,
   };
@@ -825,18 +851,18 @@ export async function updateWeeklySlot(
       fields[fixedField] = updates.isFixed ? true : false;
     }
     // Handle reservedForIds (preferred) or reservedFor (backward compatibility)
+    // Send [] to Airtable to clear linked records (undefined = skip field entirely)
     if (updates.reservedForIds !== undefined) {
       const reservedForField = getField('weeklySlot', 'reserved_for');
       fields[reservedForField] = Array.isArray(updates.reservedForIds) && updates.reservedForIds.length > 0
         ? updates.reservedForIds
-        : undefined;
+        : [];
     } else if (updates.reservedFor !== undefined) {
       const reservedForField = getField('weeklySlot', 'reserved_for');
-      // Support both single string and array of strings
       const reservedForArray = Array.isArray(updates.reservedFor) 
         ? updates.reservedFor 
         : (updates.reservedFor ? [updates.reservedFor] : []);
-      fields[reservedForField] = reservedForArray.length > 0 ? reservedForArray : undefined;
+      fields[reservedForField] = reservedForArray.length > 0 ? reservedForArray : [];
     }
     // Also handle reservedForStudents as array (for multi-select support) - legacy
     if ((updates as any).reservedForStudents !== undefined) {
@@ -846,14 +872,29 @@ export async function updateWeeklySlot(
         : [];
       fields[reservedForField] = reservedForArray.length > 0 ? reservedForArray : undefined;
     }
+    if (updates.teacherId !== undefined) {
+      const teacherIdField = getField('weeklySlot', 'teacher_id');
+      (fields as any)[teacherIdField] = [updates.teacherId];
+    }
     if (updates.durationMin !== undefined) {
       fields.duration_min = updates.durationMin;
+    }
+
+    // Auto-set is_reserved based on reservedForIds / reservedFor
+    const isReservedField = getField('weeklySlot', 'is_reserved');
+    if ((updates as any).isReserved !== undefined) {
+      (fields as any)[isReservedField] = (updates as any).isReserved ? 'לא פנוי' : 'פנוי';
+    } else if (updates.reservedForIds !== undefined) {
+      (fields as any)[isReservedField] = updates.reservedForIds.length > 0 ? 'לא פנוי' : 'פנוי';
+    } else if (updates.reservedFor !== undefined) {
+      (fields as any)[isReservedField] = updates.reservedFor ? 'לא פנוי' : 'פנוי';
     }
     
     const result = await airtableClient.updateRecord<WeeklySlotAirtableFields>(
       tableId,
       id,
-      fields
+      fields,
+      { typecast: true }
     );
     
     return mapAirtableToWeeklySlot(result, teachersMap);
@@ -1003,18 +1044,32 @@ export async function createWeeklySlot(slot: {
       const reservedForField = getField('weeklySlot', 'reserved_for');
       fields[reservedForField] = [slot.reservedFor];
     }
-    // is_reserved: when reserved (recurring), send "לא פנוי" for Single Select or true for Checkbox (Airtable may accept either)
+    // is_reserved: Single Select field with only "פנוי" and "לא פנוי"
     const isReservedField = getField('weeklySlot', 'is_reserved');
     if (slot.isReserved !== undefined) {
       (fields as any)[isReservedField] = slot.isReserved ? 'לא פנוי' : 'פנוי';
     } else if (slot.reservedForIds?.length || slot.reservedFor) {
       (fields as any)[isReservedField] = 'לא פנוי';
+    } else {
+      (fields as any)[isReservedField] = 'פנוי';
     }
     
     const result = await airtableClient.createRecord<WeeklySlotAirtableFields>(
       tableId,
-      fields as WeeklySlotAirtableFields
+      fields as WeeklySlotAirtableFields,
+      { typecast: true }
     );
+    
+    // Set unique slot field: SLOT-{recordId}
+    const slotField = getField('weeklySlot', 'slot');
+    const slotValue = `SLOT-${result.id}`;
+    await airtableClient.updateRecord<WeeklySlotAirtableFields>(
+      tableId,
+      result.id,
+      { [slotField]: slotValue } as any,
+      { typecast: true }
+    );
+    result.fields[slotField as keyof WeeklySlotAirtableFields] = slotValue as any;
     
     return mapAirtableToWeeklySlot(result, teachersMap);
   } catch (error) {

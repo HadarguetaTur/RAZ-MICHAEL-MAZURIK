@@ -573,10 +573,10 @@ const Availability: React.FC = () => {
             dayOfWeek: formData.dayOfWeek,
             startTime: formData.startTime,
             endTime: formData.endTime,
-            type: formData.type, // Use formData.type (from slot.type, not inferred)
+            type: formData.type,
             teacherId: formData.teacherId,
             isFixed: formData.isFixed,
-            reservedForIds: formData.reservedForIds.length > 0 ? formData.reservedForIds : undefined,
+            reservedForIds: formData.reservedForIds,
           };
           const updated = await nexusApi.updateWeeklySlot(selectedSlot.id, updates);
           
