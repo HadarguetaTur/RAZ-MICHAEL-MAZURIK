@@ -123,7 +123,7 @@ const Billing: React.FC = () => {
 
   // Force cache clear on first load after major logic updates
   useEffect(() => {
-    const CACHE_CLEANUP_KEY = 'billing_cache_cleanup_v3';
+    const CACHE_CLEANUP_KEY = 'billing_cache_cleanup_v4';
     if (!localStorage.getItem(CACHE_CLEANUP_KEY)) {
       // Clear billing related cache
       for (let i = 0; i < localStorage.length; i++) {

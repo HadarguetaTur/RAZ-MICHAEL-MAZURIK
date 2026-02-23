@@ -291,6 +291,8 @@ export async function getBillingBreakdown(
     subscriptionsTotal += amount;
   }
 
+  lessons.sort((a, b) => a.date.localeCompare(b.date));
+  paidCancellations.sort((a, b) => a.date.localeCompare(b.date));
 
   const result: BillingBreakdown = {
     lessons,

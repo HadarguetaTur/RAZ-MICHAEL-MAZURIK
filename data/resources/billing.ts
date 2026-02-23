@@ -9,7 +9,7 @@ import { MonthlyBill } from '../../types';
 import { ChargesReportKPIs } from '../../services/billingService';
 
 const BILLING_TTL = 10 * 60 * 1000; // 10 minutes
-const CACHE_VERSION = 'v3'; // Increment this to force cache clear for all users
+const CACHE_VERSION = 'v4'; // Increment this to force cache clear for all users
 
 /**
  * Get monthly bills with cache
