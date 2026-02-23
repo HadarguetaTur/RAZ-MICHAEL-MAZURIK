@@ -2061,10 +2061,6 @@ export async function getChargesReportKPIs(
   let totalSubscriptionsAmount = 0;
   const studentIds = new Set<string>();
   
-  const totalAmountFieldName = lookupFields.totalAmountField!;
-  const lessonsAmountFieldName = lookupFields.lessonsAmountField;
-  const subscriptionsAmountFieldName = lookupFields.subscriptionsAmountField;
-  
   for (const record of chargeRecords) {
     const fields = record.fields as any;
     
@@ -2074,12 +2070,18 @@ export async function getChargesReportKPIs(
       studentIds.add(studentId);
     }
     
-    // Extract totalAmount value
-    let totalAmount = extractNumericValue(record, totalAmountFieldName) || 0;
+    // Use same field resolution order as getChargesReport: billing table's own fields first, lookup fallback
+    let totalAmount =
+      extractNumericValue(record, getField('monthlyBills', 'total_amount')) ??
+      extractNumericValue(record, getField('monthlyBills', 'total_amount_from_student')) ??
+      extractNumericValue(record, lookupFields.totalAmountField) ?? 0;
     
-    // Extract breakdown amounts
-    const subscriptionsAmount = extractNumericValue(record, subscriptionsAmountFieldName) || 0;
-    let lessonsAmount = extractNumericValue(record, lessonsAmountFieldName) || 0;
+    const subscriptionsAmount =
+      extractNumericValue(record, getField('monthlyBills', 'subscriptions_amount')) ??
+      extractNumericValue(record, lookupFields.subscriptionsAmountField) ?? 0;
+    let lessonsAmount =
+      extractNumericValue(record, getField('monthlyBills', 'lessons_amount')) ??
+      extractNumericValue(record, lookupFields.lessonsAmountField) ?? 0;
     const adjustmentAmount = extractNumericValue(record, 'manual_adjustment_amount') || 0;
     
     // CALCULATION LOGIC:
