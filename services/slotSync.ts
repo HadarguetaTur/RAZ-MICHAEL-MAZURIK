@@ -26,6 +26,7 @@ export interface WeeklySlotTemplate {
   type?: string;
   durationMin?: number;
   isActive?: boolean; // Whether template is active (not deleted/disabled)
+  isFixed?: boolean; // Fixed slots create lessons directly, not slot_inventory
 }
 
 export interface GeneratedSlot {
@@ -126,8 +127,8 @@ export function generateInventoryFromTemplates(
   const endDate = new Date(weekStart);
   endDate.setDate(endDate.getDate() + daysAhead);
 
-  // Filter active templates only
-  const activeTemplates = templates.filter(t => t.isActive !== false);
+  // Filter active non-fixed templates (fixed slots create lessons, not slot_inventory)
+  const activeTemplates = templates.filter(t => t.isActive !== false && !t.isFixed);
 
   for (const template of activeTemplates) {
     if (!template.teacherId || template.dayOfWeek === undefined || !template.startTime || !template.endTime) {
@@ -425,6 +426,9 @@ export async function syncSlots(options: SyncSlotsOptions = {}): Promise<{
         ? parseInt(fields[dayOfWeekField], 10)
         : fields[dayOfWeekField];
 
+      const fixedRaw = (fields as any)['קבוע'];
+      const isFixed = fixedRaw === true || fixedRaw === 1 || fixedRaw === '1';
+
       return {
         id: record.id,
         teacherId: teacherIdValue || '',
@@ -433,7 +437,8 @@ export async function syncSlots(options: SyncSlotsOptions = {}): Promise<{
         endTime: fields[endTimeField] || '',
         type: fields[typeField] || undefined,
         durationMin: fields[durationMinField] || undefined,
-        isActive: true, // Assume active unless we have a status field
+        isActive: true,
+        isFixed,
       };
     }).filter(t => t.teacherId && t.startTime && t.endTime);
 

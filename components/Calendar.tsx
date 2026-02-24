@@ -200,12 +200,14 @@ const Calendar: React.FC = () => {
       const lessonEndISO = new Date(new Date(lessonStartISO).getTime() + lesson.duration * 60 * 1000).toISOString();
       
       const hasOverlap = openSlots.some(slot => {
-        // Must be open slot
         if (slot.status !== 'open') {
           return false;
         }
         
-        // Must be same date
+        if (slot.lessons && slot.lessons.length > 0) {
+          return false;
+        }
+        
         if (slot.date !== lesson.date) {
           return false;
         }
@@ -240,6 +242,10 @@ const Calendar: React.FC = () => {
     
     openSlots.forEach(slot => {
       if (slot.status !== 'open' || !slot.date || !slot.startTime || !slot.endTime) {
+        return;
+      }
+      
+      if (slot.lessons && slot.lessons.length > 0) {
         return;
       }
       
