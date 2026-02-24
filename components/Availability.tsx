@@ -31,94 +31,10 @@ export interface WeeklySlotOverlap {
   endTime: string;
 }
 
-/**
- * Normalize day of week to consistent format (0-6, where 0=Sunday).
- * Handles multiple input formats:
- * - number (0-6 or 1-7)
- * - string numeric ("0"-"6" or "1"-"7")
- * - string Hebrew ("ראשון", "שני", etc.)
- * - string English ("Sunday", "Monday", etc.)
- * 
- * Returns normalized number (0-6) or null if cannot parse.
- * Convention: 0=Sunday, 1=Monday, ..., 6=Saturday
- */
-function normalizeDayOfWeek(input: unknown): number | null {
-  if (input === null || input === undefined) {
-    return null;
-  }
-
-  // Handle number input
-  if (typeof input === 'number') {
-    const num = Math.floor(input);
-    // If 1-7 format, convert to 0-6 (1->0, 2->1, ..., 7->6)
-    if (num >= 1 && num <= 7) {
-      return num - 1;
-    }
-    // If already 0-6, validate and return
-    if (num >= 0 && num <= 6) {
-      return num;
-    }
-    return null;
-  }
-
-  // Handle string input
-  if (typeof input === 'string') {
-    const trimmed = input.trim();
-    
-    // Try parsing as number
-    const parsed = parseInt(trimmed, 10);
-    if (!isNaN(parsed)) {
-      // If 1-7 format, convert to 0-6
-      if (parsed >= 1 && parsed <= 7) {
-        return parsed - 1;
-      }
-      // If already 0-6, validate and return
-      if (parsed >= 0 && parsed <= 6) {
-        return parsed;
-      }
-      return null;
-    }
-
-    // Try Hebrew day names
-    const hebrewDays: Record<string, number> = {
-      'ראשון': 0, // Sunday
-      'שני': 1,   // Monday
-      'שלישי': 2, // Tuesday
-      'רביעי': 3, // Wednesday
-      'חמישי': 4, // Thursday
-      'שישי': 5,  // Friday
-      'שבת': 6,   // Saturday
-    };
-    if (hebrewDays[trimmed] !== undefined) {
-      return hebrewDays[trimmed];
-    }
-
-    // Try English day names (case-insensitive)
-    const englishDays: Record<string, number> = {
-      'sunday': 0,
-      'monday': 1,
-      'tuesday': 2,
-      'wednesday': 3,
-      'thursday': 4,
-      'friday': 5,
-      'saturday': 6,
-    };
-    const lowerTrimmed = trimmed.toLowerCase();
-    if (englishDays[lowerTrimmed] !== undefined) {
-      return englishDays[lowerTrimmed];
-    }
-
-    return null;
-  }
-
-  return null;
-}
-
 export function detectWeeklySlotOverlaps(
   editedSlot: { dayOfWeek: number; startTime: string; endTime: string; id?: string },
   allSlots: WeeklySlot[]
 ): WeeklySlotOverlap[] {
-  // Guard: missing required fields
   if (
     editedSlot.dayOfWeek === undefined ||
     !editedSlot.startTime ||
@@ -127,65 +43,40 @@ export function detectWeeklySlotOverlaps(
     return [];
   }
 
-  // Normalize edited slot's day of week
-  const editedNormalizedDay = normalizeDayOfWeek(editedSlot.dayOfWeek);
-  if (editedNormalizedDay === null) {
-    if (import.meta.env?.DEV) {
-      console.warn('[detectWeeklySlotOverlaps] Cannot normalize edited slot dayOfWeek:', editedSlot.dayOfWeek);
-    }
-    return []; // Cannot determine day, skip overlap check to avoid false positives
-  }
+  const parseTime = (timeStr: string): number => {
+    const [hours, minutes] = timeStr.split(':').map(Number);
+    return hours * 60 + (minutes || 0);
+  };
 
-
+  const editedDay = editedSlot.dayOfWeek;
+  const editedStart = parseTime(editedSlot.startTime);
+  const editedEnd = parseTime(editedSlot.endTime);
   const overlaps: WeeklySlotOverlap[] = [];
 
   for (const slot of allSlots) {
-    // Skip the slot being edited
     if (editedSlot.id && slot.id === editedSlot.id) {
       continue;
     }
 
-    // Normalize other slot's day of week
-    const otherNormalizedDay = normalizeDayOfWeek(slot.dayOfWeek);
-    if (otherNormalizedDay === null) {
-      if (import.meta.env?.DEV) {
-        console.warn('[detectWeeklySlotOverlaps] Cannot normalize slot dayOfWeek, skipping:', {
-          slotId: slot.id,
-          dayOfWeek: slot.dayOfWeek,
-        });
-      }
-      continue; // Skip slots with invalid dayOfWeek
+    if (slot.status === 'paused') {
+      continue;
     }
 
-    // STRICT GUARD: Only check overlaps if days match exactly
-    if (otherNormalizedDay !== editedNormalizedDay) {
-      // DEV log to debug day mismatch issues (only log first few to avoid spam)
-      continue; // Different day - no overlap possible
+    if (slot.dayOfWeek !== editedDay) {
+      continue;
     }
 
-    // Guard: missing time fields
     if (!slot.startTime || !slot.endTime) {
       continue;
     }
 
-    // Check time overlap: startA < endB && startB < endA
-    // Convert times to minutes for comparison
-    const parseTime = (timeStr: string): number => {
-      const [hours, minutes] = timeStr.split(':').map(Number);
-      return hours * 60 + (minutes || 0);
-    };
-
-    const editedStart = parseTime(editedSlot.startTime);
-    const editedEnd = parseTime(editedSlot.endTime);
     const slotStart = parseTime(slot.startTime);
     const slotEnd = parseTime(slot.endTime);
 
-    // Overlap condition: startA < endB && startB < endA (strict, no <=)
     if (editedStart < slotEnd && slotStart < editedEnd) {
-      // Use normalized day for display consistency
       overlaps.push({
         slotId: slot.id,
-        dayOfWeek: otherNormalizedDay, // Use normalized day, not raw value
+        dayOfWeek: slot.dayOfWeek,
         startTime: slot.startTime,
         endTime: slot.endTime,
       });
@@ -433,22 +324,10 @@ const Availability: React.FC = () => {
       };
       
       
-      // Set all state synchronously before opening modal
       setSelectedSlot(s);
       setModalMode('edit');
       setFormData(newFormData);
-      
-      // Check overlaps after prefill
-      const overlaps = detectWeeklySlotOverlaps(
-        {
-          id: s.id,
-          dayOfWeek: newFormData.dayOfWeek,
-          startTime: newFormData.startTime,
-          endTime: newFormData.endTime,
-        },
-        weeklySlots.filter(slot => slot.id !== s.id) // Exclude current slot
-      );
-      setWeeklySlotOverlaps(overlaps);
+      setWeeklySlotOverlaps([]);
       
       setIsModalOpen(true);
     } else if (slot) {
@@ -498,19 +377,8 @@ const Availability: React.FC = () => {
       setSelectedSlot(null);
       setModalMode('create');
       setFormData(newFormData);
+      setWeeklySlotOverlaps([]);
       
-      // Check overlaps when creating new slot
-      const overlaps = detectWeeklySlotOverlaps(
-        {
-          dayOfWeek: newFormData.dayOfWeek,
-          startTime: newFormData.startTime,
-          endTime: newFormData.endTime,
-        },
-        weeklySlots
-      );
-      setWeeklySlotOverlaps(overlaps);
-      
-      // Open modal AFTER state is set
       setTimeout(() => {
         setIsModalOpen(true);
       }, 0);

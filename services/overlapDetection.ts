@@ -1,30 +1,13 @@
 /**
  * Overlap detection utility for lesson-save and slot-save flows.
- * Rule: ranges overlap iff aStart < bEnd && aEnd > bStart (strict; touching counts as no overlap).
+ * Delegates core overlap logic to utils/overlaps.ts (single source of truth).
  */
 
-export type DateTimeLike = string | Date;
+import { isOverlapping, type DateTimeLike } from '../utils/overlaps';
 
-function toMs(x: DateTimeLike): number {
-  return typeof x === 'string' ? new Date(x).getTime() : x.getTime();
-}
+export type { DateTimeLike };
 
-/**
- * Returns true iff the two ranges [aStart, aEnd) and [bStart, bEnd) overlap.
- * Touching at an endpoint (e.g. aEnd === bStart) is not overlap.
- */
-export function hasOverlap(
-  aStart: DateTimeLike,
-  aEnd: DateTimeLike,
-  bStart: DateTimeLike,
-  bEnd: DateTimeLike
-): boolean {
-  const aS = toMs(aStart);
-  const aE = toMs(aEnd);
-  const bS = toMs(bStart);
-  const bE = toMs(bEnd);
-  return aS < bE && aE > bS;
-}
+export const hasOverlap = isOverlapping;
 
 /** Slot-like shape: either datetime fields (OpenSlot/OpenSlotRecord) or date+time fields (SlotInventory). */
 type OpenSlotLike =
