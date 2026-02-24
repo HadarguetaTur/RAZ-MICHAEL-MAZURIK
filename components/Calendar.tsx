@@ -62,10 +62,10 @@ function shouldRenderOpenSlot(
     const lessonDateNormalized = lesson.date.trim();
     const lessonTimeNormalized = lesson.startTime.trim().padStart(5, '0');
     
-    // Match by date, time, and teacher
     const dateMatches = lessonDateNormalized === slotDateNormalized;
     const timeMatches = lessonTimeNormalized === slotTimeNormalized;
-    const teacherMatches = lesson.teacherId === slot.teacherId;
+    const bothHaveTeacher = lesson.teacherId && slot.teacherId;
+    const teacherMatches = !bothHaveTeacher || lesson.teacherId === slot.teacherId;
     
     if (dateMatches && timeMatches && teacherMatches) {
       return true;
