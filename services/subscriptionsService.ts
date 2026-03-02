@@ -1,6 +1,7 @@
 
 import { Subscription } from '../types';
 import { AIRTABLE_CONFIG } from '../config/airtable';
+import { FIELDS } from '../contracts/fieldMap';
 import { getAuthToken } from '../hooks/useAuth';
 import { apiUrl } from '../config/api';
 
@@ -388,5 +389,45 @@ export const subscriptionsService = {
     });
     
     return updatedSubscription;
+  },
+
+  /**
+   * When a subscription is ended (expired), remove its link from the student's
+   * "מנוי בקתה" or "מנוי קבוצתי" field so the student no longer shows as having that subscription.
+   */
+  clearStudentSubscriptionLink: async (
+    studentId: string,
+    subscriptionId: string,
+    subscriptionType: string
+  ): Promise<void> => {
+    const typeNorm = (subscriptionType || '').trim();
+    const isBaketa = typeNorm.includes('בקתה');
+    const isGroup = typeNorm.includes('קבוצתי');
+    if (!isBaketa && !isGroup) return;
+
+    const studentsTableId = AIRTABLE_CONFIG.tables.students;
+    const fieldName = isBaketa
+      ? FIELDS.students['מנוי_בקתה']
+      : FIELDS.students['מנוי_קבוצתי'];
+
+    const studentRecord = await airtableRequest<{ id: string; fields: Record<string, unknown> }>(
+      `/${studentsTableId}/${studentId}`,
+      { method: 'GET' }
+    );
+    const fields = studentRecord?.fields ?? {};
+    const currentLinks = fields[fieldName];
+    const currentIds: string[] = Array.isArray(currentLinks)
+      ? currentLinks.filter((id: unknown) => typeof id === 'string' && id.startsWith('rec'))
+      : [];
+    const newIds = currentIds.filter((id) => id !== subscriptionId);
+    if (newIds.length === currentIds.length) return; // nothing to remove
+
+    await airtableRequest<{ id: string; fields: unknown }>(
+      `/${studentsTableId}/${studentId}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ fields: { [fieldName]: newIds } }),
+      }
+    );
   },
 };

@@ -7,7 +7,7 @@ import { createSubscription, updateSubscription, deleteSubscription } from '../d
 import { subscriptionsService, parseMonthlyAmount } from '../services/subscriptionsService';
 import StudentPicker from './StudentPicker';
 import { useStudents } from '../hooks/useStudents';
-import { getStudentByRecordId } from '../data/resources/students';
+import { getStudentByRecordId, invalidateStudents } from '../data/resources/students';
 import Toast, { ToastType } from './Toast';
 import AppSidePanel from './ui/AppSidePanel';
 import { useConfirmDialog } from '../hooks/useConfirmDialog';
@@ -357,7 +357,7 @@ const Subscriptions: React.FC = () => {
       case 'paused':
         return (
           <span className="px-2 py-0.5 rounded-full text-[9px] font-black border bg-amber-50 text-amber-600 border-amber-100">
-            מושעה
+            מושהה
           </span>
         );
       case 'expired':
@@ -583,14 +583,54 @@ const Subscriptions: React.FC = () => {
     
     setProcessingId(id);
     try {
+      const sub = subscriptions.find((s) => s.id === id);
       const today = new Date().toISOString().split('T')[0];
       await subscriptionsService.updateSubscription(id, {
         subscriptionEndDate: today,
         pauseSubscription: false, // Unpause if paused
       });
+      if (sub?.studentId && sub?.subscriptionType) {
+        await subscriptionsService.clearStudentSubscriptionLink(
+          sub.studentId,
+          id,
+          sub.subscriptionType
+        );
+        invalidateStudents();
+      }
       await subscriptionsHook.refresh();
       await loadSubscriptions(); // sync local state so table updates without page refresh
       setToast({ message: 'המנוי הסתיים בהצלחה', type: 'success' });
+    } catch (err) {
+      setToast({ message: parseApiError(err), type: 'error' });
+    } finally {
+      setProcessingId(null);
+    }
+  };
+
+  const handleRenew = async (id: string) => {
+    const confirmed = await confirm({
+      title: 'חידוש מנוי שפג תוקף',
+      message: 'המנוי יוארך לחודש נוסף מהיום. להמשיך?',
+      variant: 'info',
+      confirmLabel: 'חדש מנוי',
+      cancelLabel: 'ביטול'
+    });
+    if (!confirmed) return;
+
+    setProcessingId(id);
+    try {
+      const today = new Date();
+      const newEnd = new Date(today);
+      newEnd.setMonth(newEnd.getMonth() + 1);
+      await subscriptionsService.updateSubscription(id, {
+        subscriptionStartDate: today.toISOString().split('T')[0],
+        subscriptionEndDate: newEnd.toISOString().split('T')[0],
+        pauseSubscription: false,
+        pauseDate: '',
+      });
+      await subscriptionsHook.refresh();
+      await loadSubscriptions();
+      setToast({ message: 'המנוי חודש בהצלחה', type: 'success' });
     } catch (err) {
       setToast({ message: parseApiError(err), type: 'error' });
     } finally {
@@ -654,7 +694,7 @@ const Subscriptions: React.FC = () => {
 
         <div className="bg-white p-5 md:p-6 rounded-2xl md:rounded-3xl border border-slate-200 shadow-sm hover:shadow-md transition-shadow">
           <div className="flex items-center justify-between mb-3">
-            <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest">מושעים</div>
+            <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest">מושהים</div>
             <div className="w-2 h-2 rounded-full bg-amber-500"></div>
           </div>
           <div className="text-3xl md:text-4xl font-black text-slate-900">{kpis.paused}</div>
@@ -704,8 +744,9 @@ const Subscriptions: React.FC = () => {
           >
             <option value="all">כל הסטטוסים</option>
             <option value="active">פעילים</option>
-            <option value="paused">מושעים</option>
+            <option value="paused">מושהים</option>
             <option value="expired">פגי תוקף</option>
+            <option value="scheduled">מתוכננים</option>
           </select>
           <select 
             className="flex-1 md:w-40 bg-slate-50 border border-slate-100 rounded-xl px-4 py-3 text-sm font-black outline-none focus:bg-white focus:ring-2 focus:ring-blue-100"
@@ -855,8 +896,17 @@ const Subscriptions: React.FC = () => {
                               </button>
                             </>
                           );
+                        } else if (status === 'expired') {
+                          return (
+                            <button 
+                              onClick={() => handleRenew(sub.id)}
+                              disabled={isProcessing}
+                              className="px-3 py-1.5 bg-blue-50 text-blue-600 text-xs font-black rounded-lg hover:bg-blue-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                              {isProcessing ? '...' : 'חידוש'}
+                            </button>
+                          );
                         }
-                        // Expired subscriptions don't show pause/resume/end buttons
                         return null;
                       })()}
                       <button 
@@ -975,8 +1025,17 @@ const Subscriptions: React.FC = () => {
                         </button>
                       </>
                     );
+                  } else if (status === 'expired') {
+                    return (
+                      <button 
+                        onClick={() => handleRenew(sub.id)}
+                        disabled={isProcessing}
+                        className="flex-1 px-3 py-2 bg-blue-50 text-blue-600 text-xs font-black rounded-lg hover:bg-blue-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {isProcessing ? '...' : 'חידוש'}
+                      </button>
+                    );
                   }
-                  // Expired subscriptions don't show pause/resume/end buttons
                   return null;
                 })()}
                 <button 
@@ -1120,7 +1179,7 @@ const Subscriptions: React.FC = () => {
               }))}
             />
             <label htmlFor="pauseSubscription" className="text-sm font-bold text-slate-700">
-              השהות מנוי
+              השהיית מנוי
             </label>
           </div>
 
