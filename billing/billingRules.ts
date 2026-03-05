@@ -54,13 +54,28 @@ export function extractLessonId(linkedRecord: LinkedRecord): string {
 }
 
 /**
- * Check if lesson should be excluded (cancelled)
+ * Check if lesson should be excluded (cancelled).
+ * Covers Hebrew variants, English equivalents, and quotation-mark differences.
  */
+const EXCLUDED_STATUSES = new Set([
+  'בוטל',
+  'בוטל ע"י מנהל',
+  'בוטל ע״י מנהל',   // Hebrew gershayim (״) instead of ASCII quotes
+  'ביטול',
+  'cancelled',
+  'canceled',
+  'לא הגיע',
+  'no show',
+  'no_show',
+]);
+
 export function isLessonExcluded(status: string): boolean {
   if (!status) return false;
-  // Trim whitespace to handle cases with trailing spaces
-  const trimmedStatus = status.trim();
-  return trimmedStatus === 'בוטל' || trimmedStatus === 'בוטל ע"י מנהל';
+  const trimmedStatus = status.trim().toLowerCase();
+  for (const excluded of EXCLUDED_STATUSES) {
+    if (trimmedStatus === excluded.toLowerCase()) return true;
+  }
+  return false;
 }
 
 /**
@@ -573,6 +588,36 @@ export function parseMonthlyAmount(amount: string | number): number {
 }
 
 /**
+ * Calculate pro-rata amount for a subscription that is partially active in a month.
+ * Returns full amount if subscription covers the entire month.
+ */
+export function calculateProRataAmount(
+  monthlyAmount: number,
+  billingMonth: string,
+  subscriptionStartDate: string,
+  subscriptionEndDate?: string | null
+): number {
+  if (monthlyAmount <= 0) return 0;
+
+  const { start: startOfMonth, end: endOfMonth } = getMonthBoundaries(billingMonth);
+  const [year, month] = billingMonth.split('-').map(Number);
+  const daysInMonth = new Date(year, month, 0).getDate();
+
+  const subStart = new Date(subscriptionStartDate);
+  subStart.setHours(0, 0, 0, 0);
+  const subEnd = subscriptionEndDate ? new Date(subscriptionEndDate) : null;
+  if (subEnd) subEnd.setHours(23, 59, 59, 999);
+
+  const effectiveStart = subStart > startOfMonth ? subStart : startOfMonth;
+  const effectiveEnd = subEnd && subEnd < endOfMonth ? subEnd : endOfMonth;
+
+  const activeDays = Math.max(0, Math.floor((effectiveEnd.getTime() - effectiveStart.getTime()) / 86400000) + 1);
+
+  if (activeDays >= daysInMonth) return monthlyAmount;
+  return Math.round((monthlyAmount * activeDays / daysInMonth) * 100) / 100;
+}
+
+/**
  * Calculate subscriptions contribution
  */
 export interface SubscriptionsContribution {
@@ -594,7 +639,6 @@ export function calculateSubscriptionsContribution(
 
   // Check for overlapping subscriptions
   if (activeSubscriptions.length > 1) {
-    // Check if they overlap in time
     const overlapping = activeSubscriptions.some((sub1, i) => {
       return activeSubscriptions.some((sub2, j) => {
         if (i === j) return false;
@@ -620,8 +664,14 @@ export function calculateSubscriptionsContribution(
 
   let subscriptionsTotal = 0;
   for (const subscription of activeSubscriptions) {
-    const amount = parseMonthlyAmount(subscription.monthly_amount);
-    subscriptionsTotal += amount;
+    const fullAmount = parseMonthlyAmount(subscription.monthly_amount);
+    const proRataAmount = calculateProRataAmount(
+      fullAmount,
+      billingMonth,
+      subscription.subscription_start_date,
+      subscription.subscription_end_date
+    );
+    subscriptionsTotal += proRataAmount;
   }
 
   return {

@@ -7,6 +7,7 @@
 
 import type { AirtableClient } from './airtableClient';
 import { TABLES, FIELDS, getField } from '../contracts/fieldMap';
+import { isLessonExcluded, isBillableStatus } from '../billing/billingRules';
 
 // --- Types (output of getBillingBreakdown) ---
 
@@ -24,6 +25,7 @@ export interface BreakdownSubscription {
   startDate: string;
   endDate: string | null;
   paused: boolean;
+  status: 'active' | 'paused' | 'expired';
 }
 
 export interface PaidCancellation {
@@ -32,12 +34,13 @@ export interface PaidCancellation {
   isLt24h: boolean;
   isCharged: boolean;
   linkedLessonId?: string;
+  amount: number;
 }
 
 export interface BillingBreakdownTotals {
   lessonsTotal: number;
   subscriptionsTotal: number;
-  cancellationsTotal: number | null;
+  cancellationsTotal: number;
 }
 
 export interface BillingBreakdown {
@@ -134,7 +137,7 @@ export async function getBillingBreakdown(
     lessons: [],
     subscriptions: [],
     paidCancellations: [],
-    totals: { lessonsTotal: 0, subscriptionsTotal: 0, cancellationsTotal: null },
+    totals: { lessonsTotal: 0, subscriptionsTotal: 0, cancellationsTotal: 0 },
   };
 
   // --- A) Lessons: billing_month = monthKey OR start_datetime in month range ---
@@ -154,7 +157,7 @@ export async function getBillingBreakdown(
     if (import.meta.env.DEV) console.warn('[getBillingBreakdown] lessons fetch failed', e);
   }
 
-  // Fetch subscriptions now so we can set lesson amount to 0 for pair/group when subscription is active
+  // Fetch subscriptions so we can set lesson amount to 0 for pair/group when subscription is active
   const subsTableId = TABLES.subscriptions.id;
   let subsRaw: Array<{ id: string; fields: Record<string, unknown> }> = [];
   try {
@@ -163,6 +166,54 @@ export async function getBillingBreakdown(
     if (import.meta.env.DEV) console.warn('[getBillingBreakdown] subscriptions fetch failed (for lesson coverage)', e);
   }
 
+  // --- B) Cancellations: fetch ALL for the month (not just charged) so we can
+  //     cross-reference and exclude cancelled lessons from the lessons section. ---
+  const cancellationsTableId = TABLES.cancellations.id;
+  const cancelledFilter = `OR({${C.billing_month}} = "${monthKey}", FIND("${monthKey}", {${C.billing_month}}) = 1)`;
+  let cancellationsRaw: Array<{ id: string; fields: Record<string, unknown> }> = [];
+  try {
+    cancellationsRaw = await client.getRecords(cancellationsTableId, {
+      filterByFormula: cancelledFilter,
+      maxRecords: 2000,
+    });
+  } catch (e) {
+    if (import.meta.env.DEV) console.warn('[getBillingBreakdown] cancellations fetch failed', e);
+  }
+
+  // Build set of lesson IDs that have a cancellation record for this student
+  const cancellationsStudentField = getField('cancellations', 'student');
+  const cancelledLessonIds = new Set<string>();
+  const paidCancellations: PaidCancellation[] = [];
+  let cancellationsTotal = 0;
+
+  for (const r of cancellationsRaw) {
+    const f = r.fields;
+    const rawStudentLink = f[cancellationsStudentField] ?? (f as Record<string, unknown>)['student'];
+    const linkId = extractLinkedId(rawStudentLink);
+    if (linkId !== studentId) continue;
+
+    const lessonLink = f[C.lesson];
+    const linkedLessonId = extractLinkedId(lessonLink) ?? undefined;
+
+    // Track every cancelled lesson ID (regardless of charge status)
+    if (linkedLessonId) {
+      cancelledLessonIds.add(linkedLessonId);
+    }
+
+    // Only include charged cancellations in the paid cancellations output
+    const isCharged = f[C.is_charged] === true || f[C.is_charged] === 1;
+    if (!isCharged) continue;
+
+    const dateVal = f[C.cancellation_date];
+    const date = dateVal ? String(dateVal).split('T')[0] : '';
+    const hoursBefore = f[C.hours_before] != null ? Number(f[C.hours_before]) : null;
+    const isLt24h = f[C.is_lt_24h] === 1 || f[C.is_lt_24h] === '1' || f[C.is_lt_24h] === true;
+    const amount = parseAmount(f[C.charge] as string | number);
+    cancellationsTotal += amount;
+    paidCancellations.push({ date, hoursBefore, isLt24h, isCharged, linkedLessonId, amount });
+  }
+
+  // --- A) Lessons: process after cancellations so we can cross-reference ---
   const lessons: BreakdownLesson[] = [];
   let lessonsTotal = 0;
   const lessonsStudentField = getField('lessons', 'full_name');
@@ -185,6 +236,14 @@ export async function getBillingBreakdown(
       }
     }
     if (!belongsToMonth) continue;
+
+    // Exclude lessons that have a cancellation record (regardless of lesson status)
+    if (cancelledLessonIds.has(r.id)) continue;
+
+    // Filter out cancelled and non-billable lessons by status
+    const lessonStatus = String(f[L.status] ?? '');
+    if (isLessonExcluded(lessonStatus)) continue;
+    if (!isBillableStatus(lessonStatus)) continue;
     const dateVal = f[L.lesson_date] ?? f[L.start_datetime];
     const date = dateVal ? String(dateVal).split('T')[0] : '';
     let lineAmount = parseAmount(f[L.line_amount] as string | number);
@@ -193,11 +252,11 @@ export async function getBillingBreakdown(
     const isGroup = lessonType === 'group' || lessonType === 'קבוצתי';
     const isPrivate = lessonType === 'private' || lessonType === 'פרטי';
     // Private: prefer price (manual override by Raz), then line_amount (formula), then 175
-    // MUST match billingRules.ts which checks price FIRST (price > line_amount > 175)
+    // MUST match billingRules.ts: price field is checked first even if 0 (explicit waiver)
     if (isPrivate) {
-      const manualPrice = parseAmount(f[L.price] as string | number);
-      if (manualPrice > 0) {
-        lineAmount = manualPrice;
+      const rawPrice = f[L.price];
+      if (rawPrice !== undefined && rawPrice !== null && rawPrice !== '') {
+        lineAmount = parseAmount(rawPrice as string | number);
       } else if (lineAmount <= 0) {
         lineAmount = 175;
       }
@@ -228,43 +287,14 @@ export async function getBillingBreakdown(
     lessonsTotal += lineAmount;
   }
 
-
-  // --- B) Paid cancellations: billing_month = monthKey AND student contains studentId AND is_charged = true ---
-  const cancellationsTableId = TABLES.cancellations.id;
-  // Make filter more flexible
-  const cancelledFilter = `AND(OR({${C.billing_month}} = "${monthKey}", FIND("${monthKey}", {${C.billing_month}}) = 1), {${C.is_charged}} = TRUE())`;
-  let cancellationsRaw: Array<{ id: string; fields: Record<string, unknown> }> = [];
-  try {
-    cancellationsRaw = await client.getRecords(cancellationsTableId, {
-      filterByFormula: cancelledFilter,
-      maxRecords: 2000,
-    });
-  } catch (e) {
-    if (import.meta.env.DEV) console.warn('[getBillingBreakdown] cancellations fetch failed', e);
-  }
-
-  const paidCancellations: PaidCancellation[] = [];
-  const cancellationsStudentField = getField('cancellations', 'student');
-  for (const r of cancellationsRaw) {
-    const f = r.fields;
-    const rawStudentLink = f[cancellationsStudentField] ?? (f as Record<string, unknown>)['student'];
-    const linkId = extractLinkedId(rawStudentLink);
-    if (linkId !== studentId) continue;
-    const lessonLink = f[C.lesson];
-    const linkedLessonId = extractLinkedId(lessonLink) ?? undefined;
-    const dateVal = f[C.cancellation_date];
-    const date = dateVal ? String(dateVal).split('T')[0] : '';
-    const hoursBefore = f[C.hours_before] != null ? Number(f[C.hours_before]) : null;
-    const isLt24h = f[C.is_lt_24h] === 1 || f[C.is_lt_24h] === '1' || f[C.is_lt_24h] === true;
-    const isCharged = f[C.is_charged] === true || f[C.is_charged] === 1;
-    paidCancellations.push({ date, hoursBefore, isLt24h, isCharged, linkedLessonId });
-  }
-
-  // --- C) Subscriptions: use subsRaw already fetched (student_id contains studentId, active in month) ---
+  // --- C) Subscriptions: include active, paused & expired subs that overlap with month ---
 
   const subscriptions: BreakdownSubscription[] = [];
   let subscriptionsTotal = 0;
   const subsStudentField = getField('subscriptions', 'student_id');
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
   for (const r of subsRaw) {
     const f = r.fields;
     const rawStudentLink = f[subsStudentField] ?? (f as Record<string, unknown>)['student_id'];
@@ -274,21 +304,47 @@ export async function getBillingBreakdown(
     const startDate = f[S.subscription_start_date] ? String(f[S.subscription_start_date]).split('T')[0] : '';
     const endDateVal = f[S.subscription_end_date];
     const endDate = endDateVal ? String(endDateVal).split('T')[0] : null;
-    // Treat subscriptions with missing startDate as active (legacy rows)
-    const active =
-      !paused &&
+
+    const overlapsMonth =
       (!startDate || new Date(startDate) <= monthEndInclusive) &&
       (!endDate || new Date(endDate) >= monthStart);
-    if (!active) continue;
-    const amount = parseAmount(f[S.monthly_amount] as string | number);
+    if (!overlapsMonth) continue;
+
+    let status: 'active' | 'paused' | 'expired';
+    if (paused) {
+      status = 'paused';
+    } else if (endDate && new Date(endDate) < today) {
+      status = 'expired';
+    } else {
+      status = 'active';
+    }
+
+    const fullAmount = parseAmount(f[S.monthly_amount] as string | number);
+    let chargedAmount = fullAmount;
+
+    if (paused) {
+      chargedAmount = 0;
+    } else if (endDate || startDate) {
+      const daysInMonth = new Date(year, month, 0).getDate();
+      const effectiveStart = startDate && new Date(startDate) > monthStart
+        ? new Date(startDate) : monthStart;
+      const effectiveEnd = endDate && new Date(endDate) < monthEndInclusive
+        ? new Date(endDate) : monthEndInclusive;
+      const activeDays = Math.max(0, Math.floor((effectiveEnd.getTime() - effectiveStart.getTime()) / 86400000) + 1);
+      if (activeDays < daysInMonth) {
+        chargedAmount = Math.round((fullAmount * activeDays / daysInMonth) * 100) / 100;
+      }
+    }
+
     subscriptions.push({
       type: String(f[S.subscription_type] ?? ''),
-      amount,
+      amount: chargedAmount,
       startDate,
       endDate,
       paused,
+      status,
     });
-    subscriptionsTotal += amount;
+    subscriptionsTotal += chargedAmount;
   }
 
   lessons.sort((a, b) => a.date.localeCompare(b.date));
@@ -303,7 +359,7 @@ export async function getBillingBreakdown(
     totals: {
       lessonsTotal,
       subscriptionsTotal,
-      cancellationsTotal: null,
+      cancellationsTotal,
     },
   };
 

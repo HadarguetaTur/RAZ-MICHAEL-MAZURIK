@@ -270,9 +270,26 @@ export async function buildStudentMonth(
     }
   }
 
+  // Build set of lesson IDs that have a cancellation record — those lessons
+  // should not be counted as regular lessons (they may appear in the
+  // cancellations section instead if charged).
+  const cancelledLessonIds = new Set<string>();
+  for (const c of cancellations) {
+    if (c.fields.lesson) {
+      try {
+        const lessonId = extractLessonId(c.fields.lesson);
+        cancelledLessonIds.add(lessonId);
+      } catch { /* ignore invalid links */ }
+    }
+  }
+
+  const lessonsWithoutCancellations = lessons.filter(
+    r => !cancelledLessonIds.has(r.id)
+  );
+
   // Calculate lessons contribution
   const lessonsContribution = calculateLessonsContribution(
-    lessons.map(r => r.fields),
+    lessonsWithoutCancellations.map(r => r.fields),
     billingMonth,
     studentRecordId,
     subscriptions.map(r => r.fields)
