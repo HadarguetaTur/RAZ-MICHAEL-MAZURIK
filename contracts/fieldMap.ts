@@ -146,6 +146,11 @@ export const FIELDS = {
     price: 'price',
     calender_event_id: 'calender_event_id',
     source: 'source',
+    custom_billing_mode: 'custom_billing_mode',
+    custom_cancellation_policy: 'custom_cancellation_policy',
+    custom_cancellation_charge_pct: 'custom_cancellation_charge_pct',
+    custom_subscription_eligible: 'custom_subscription_eligible',
+    custom_fallback_price: 'custom_fallback_price',
     // Computed fields (read-only)
     'פרטי_השיעור': 'פרטי השיעור', // Formula
     count_this_week: 'count_this_week', // Formula

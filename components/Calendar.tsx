@@ -164,6 +164,9 @@ const Calendar: React.FC = () => {
         // This is fine as rawRecords are mainly used for detailed lesson info
         setTeachers(teachersData);
         setStudents(studentsData);
+        // #region agent log
+        console.log('[DEBUG-b89055][H1] students loaded (page1 only):', { count: studentsData.length, first3: studentsData.slice(0,3).map((s: any) => s.name), last3: studentsData.slice(-3).map((s: any) => s.name) });
+        // #endregion
       } catch (err: any) {
         console.error(parseApiError(err));
       } finally {
@@ -683,7 +686,8 @@ const Calendar: React.FC = () => {
           toast.success('שיעור מחזורי נקבע בהצלחה');
         } else {
           // Create new lesson (non-recurring) with server-side validation
-          const newLesson = await nexusApi.createLesson({
+          const createPayload: import('../types').Lesson = {
+            id: '',
             studentId: studentId,
             studentIds: editState.lessonType === 'private' ? undefined : editState.studentIds,
             date: editState.date!,
@@ -692,11 +696,27 @@ const Calendar: React.FC = () => {
             status: LessonStatus.SCHEDULED,
             subject: editState.subject || 'מתמטיקה',
             teacherId: editState.teacherId,
+            studentName: '',
             notes: editState.notes || '',
             isPrivate: editState.lessonType === 'private',
+            isChargeable: true,
             lessonType: editState.lessonType || 'private',
-            price: editState.lessonType === 'private' ? (editState.price !== undefined ? editState.price : Math.round(((editState.duration || 60) / 60) * 175 * 100) / 100) : (editState.lessonType === 'pair' ? (editState.price ?? 225) : undefined),
-          });
+            price: editState.lessonType === 'private'
+              ? (editState.price !== undefined ? editState.price : Math.round(((editState.duration || 60) / 60) * 175 * 100) / 100)
+              : editState.lessonType === 'pair'
+                ? (editState.price ?? 225)
+                : editState.lessonType === 'custom'
+                  ? editState.price
+                  : undefined,
+            ...(editState.lessonType === 'custom' && {
+              customBillingMode: editState.customBillingMode,
+              customCancellationPolicy: editState.customCancellationPolicy,
+              customCancellationChargePct: editState.customCancellationChargePct,
+              customSubscriptionEligible: editState.customSubscriptionEligible,
+              customFallbackPrice: editState.customFallbackPrice,
+            }),
+          };
+          const newLesson = await nexusApi.createLesson(createPayload);
           await refreshData(true);
         }
       }
@@ -1427,8 +1447,8 @@ const Calendar: React.FC = () => {
             <div className="flex-1 p-8 space-y-8 overflow-y-auto custom-scrollbar">
               <div className="space-y-3">
                 <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">סוג שיעור</label>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                  {(['private', 'pair', 'group', 'recurring'] as LessonType[]).map(type => (
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                  {(['private', 'pair', 'group', 'recurring', 'custom'] as LessonType[]).map(type => (
                     <button 
                       key={type}
                       type="button"
@@ -1437,12 +1457,17 @@ const Calendar: React.FC = () => {
                         lessonType: type,
                         studentIds: type === 'private' ? (p.studentIds?.slice(0, 1)) : p.studentIds,
                         recurringLessonType: type === 'recurring' ? (p.recurringLessonType ?? 'private') : undefined,
+                        customBillingMode: type === 'custom' ? (p.customBillingMode ?? 'per_student') : undefined,
+                        customCancellationPolicy: type === 'custom' ? (p.customCancellationPolicy ?? '24h') : undefined,
+                        customCancellationChargePct: type === 'custom' ? (p.customCancellationChargePct ?? 100) : undefined,
+                        customSubscriptionEligible: type === 'custom' ? (p.customSubscriptionEligible ?? false) : undefined,
+                        customFallbackPrice: type === 'custom' ? p.customFallbackPrice : undefined,
                       }))}
                       className={`py-2 text-[10px] font-bold border rounded-xl transition-all ${
                         editState.lessonType === type ? 'bg-blue-600 border-blue-600 text-white shadow-sm' : 'bg-white border-slate-200 text-slate-500 hover:border-slate-300'
                       }`}
                     >
-                      {type === 'private' ? 'פרטי' : type === 'pair' ? 'זוגי' : type === 'group' ? 'קבוצתי' : 'מחזורי'}
+                      {type === 'private' ? 'פרטי' : type === 'pair' ? 'זוגי' : type === 'group' ? 'קבוצתי' : type === 'recurring' ? 'מחזורי' : 'מותאם'}
                     </button>
                   ))}
                 </div>
@@ -1505,6 +1530,7 @@ const Calendar: React.FC = () => {
                   const isPrivate = editState.lessonType === 'private' || (editState.lessonType === 'recurring' && (editState.recurringLessonType ?? 'private') === 'private');
                   const isPair = editState.lessonType === 'pair' || (editState.lessonType === 'recurring' && editState.recurringLessonType === 'pair');
                   const isGroup = editState.lessonType === 'group' || (editState.lessonType === 'recurring' && editState.recurringLessonType === 'group');
+                  const isCustom = editState.lessonType === 'custom';
 
                   if (isPrivate) {
                     return (
@@ -1535,13 +1561,16 @@ const Calendar: React.FC = () => {
                         <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">קבוצה</label>
                         <GroupPicker
                           value={(editState as any)._selectedGroupId ?? null}
-                          onChange={(groupId, studentIds) => {
+                          onChange={(groupId, studentIds, studentNames) => {
+                            const nameMap: Record<string, string> = {};
+                            studentIds.forEach((id, i) => { if (studentNames?.[i]) nameMap[id] = studentNames[i]; });
                             setEditState(prev => ({
                               ...prev,
                               studentIds,
                               studentId: studentIds[0] || undefined,
                               studentName: undefined,
                               _selectedGroupId: groupId,
+                              _groupStudentNames: nameMap,
                             } as any));
                           }}
                           disabled={isSaving}
@@ -1549,7 +1578,10 @@ const Calendar: React.FC = () => {
                         {(editState.studentIds?.length || 0) > 0 && (
                           <div className="flex flex-wrap gap-1.5 p-2 bg-slate-50 border border-slate-200 rounded-xl">
                             {(editState.studentIds || []).map(id => {
-                              const name = students.find(s => s.id === id)?.name;
+                              const name = (editState as any)._groupStudentNames?.[id] || students.find(s => s.id === id)?.name;
+                              // #region agent log
+                              console.log(`[DEBUG-b89055][H1-post-fix] group chip id=${id} resolved=${!!name} name="${name||'MISSING'}"`);
+                              // #endregion
                               return (
                                 <span key={id} className="px-2.5 py-1 bg-blue-600 text-white rounded-lg text-xs font-bold">
                                   {name || id.slice(0, 8)}
@@ -1563,6 +1595,92 @@ const Calendar: React.FC = () => {
                             <div className="text-xs font-bold text-amber-800">
                               שיעור קבוצתי דורש לפחות 2 תלמידים. יש לבחור קבוצה.
                             </div>
+                          </div>
+                        )}
+                      </>
+                    );
+                  }
+
+                  if (isCustom) {
+                    const customPickerMode = (editState as any)._customPickerMode ?? 'group';
+                    return (
+                      <>
+                        <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">תלמידים</label>
+                        {/* Toggle between group picker and individual picker */}
+                        <div className="flex gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setEditState(p => ({ ...p, _customPickerMode: 'group', studentIds: [], studentId: undefined, _selectedGroupId: undefined } as any))}
+                            className={`flex-1 py-2 text-[10px] font-bold border rounded-xl transition-all ${customPickerMode === 'group' ? 'bg-violet-600 border-violet-600 text-white' : 'bg-white border-slate-200 text-slate-500 hover:border-slate-300'}`}
+                          >
+                            בחר קבוצה קיימת
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setEditState(p => ({ ...p, _customPickerMode: 'individual', studentIds: [], studentId: undefined, _selectedGroupId: undefined } as any))}
+                            className={`flex-1 py-2 text-[10px] font-bold border rounded-xl transition-all ${customPickerMode === 'individual' ? 'bg-violet-600 border-violet-600 text-white' : 'bg-white border-slate-200 text-slate-500 hover:border-slate-300'}`}
+                          >
+                            בחר תלמידים ידנית
+                          </button>
+                        </div>
+                        {customPickerMode === 'group' ? (
+                          <>
+                            <GroupPicker
+                              value={(editState as any)._selectedGroupId ?? null}
+                              onChange={(groupId, studentIds, studentNames) => {
+                                const nameMap: Record<string, string> = {};
+                                studentIds.forEach((id, i) => { if (studentNames?.[i]) nameMap[id] = studentNames[i]; });
+                                setEditState(prev => ({
+                                  ...prev,
+                                  studentIds,
+                                  studentId: studentIds[0] || undefined,
+                                  studentName: undefined,
+                                  _selectedGroupId: groupId,
+                                  _groupStudentNames: nameMap,
+                                } as any));
+                              }}
+                              disabled={isSaving}
+                            />
+                            {(editState.studentIds?.length || 0) > 0 && (
+                              <div className="flex flex-wrap gap-1.5 p-2 bg-slate-50 border border-slate-200 rounded-xl">
+                                {(editState.studentIds || []).map(id => {
+                                  const name = (editState as any)._groupStudentNames?.[id] || students.find(s => s.id === id)?.name;
+                                  // #region agent log
+                                  console.log(`[DEBUG-b89055][H1-post-fix] custom-group chip id=${id} resolved=${!!name} name="${name||'MISSING'}"`);
+                                  // #endregion
+                                  return (
+                                    <span key={id} className="px-2.5 py-1 bg-violet-600 text-white rounded-lg text-xs font-bold">
+                                      {name || id.slice(0, 8)}
+                                    </span>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </>
+                        ) : (
+                          <StudentsPicker
+                            values={editState.studentIds || []}
+                            onChange={(studentIds) => {
+                              setEditState(prev => ({
+                                ...prev,
+                                studentIds,
+                                studentId: studentIds[0] || undefined,
+                                studentName: studentIds.length === 1 ? students.find(s => s.id === studentIds[0])?.name : undefined,
+                              }));
+                            }}
+                            placeholder="חפש תלמידים לפי שם או טלפון..."
+                            disabled={isSaving}
+                            filterActiveOnly={true}
+                            fallbackNames={Object.fromEntries(
+                              (editState.studentIds || [])
+                                .map(id => [id, students.find(s => s.id === id)?.name ?? ''])
+                                .filter(([, n]) => n) as [string, string][]
+                            )}
+                          />
+                        )}
+                        {isCreating && (editState.studentIds?.length || 0) < 1 && (
+                          <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl">
+                            <div className="text-xs font-bold text-amber-800">יש לבחור לפחות תלמיד אחד.</div>
                           </div>
                         )}
                       </>
@@ -1824,6 +1942,153 @@ const Calendar: React.FC = () => {
                 </div>
               )}
 
+              {/* Custom lesson configuration */}
+              {editState.lessonType === 'custom' && (
+                <div className="p-5 bg-violet-50/60 border border-violet-100 rounded-2xl space-y-5">
+                  <div className="text-[10px] font-bold text-violet-600 uppercase tracking-widest">הגדרות שיעור מותאם</div>
+
+                  {/* Billing mode */}
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">אופן חיוב</label>
+                    <div className="grid grid-cols-2 gap-2">
+                      {([
+                        { value: 'per_student', label: 'מחיר קבוע לתלמיד' },
+                        { value: 'split_total', label: 'מחיר כולל ÷ תלמידים' },
+                        { value: 'subscription', label: 'דרך מנוי' },
+                        { value: 'free', label: 'חינם' },
+                      ] as { value: import('../types').CustomBillingMode; label: string }[]).map(opt => (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          onClick={() => setEditState(p => ({ ...p, customBillingMode: opt.value }))}
+                          className={`py-2 px-3 text-[10px] font-bold border rounded-xl transition-all text-right ${
+                            editState.customBillingMode === opt.value
+                              ? 'bg-violet-600 border-violet-600 text-white shadow-sm'
+                              : 'bg-white border-slate-200 text-slate-500 hover:border-slate-300'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Price field — hidden when free or subscription */}
+                  {editState.customBillingMode !== 'free' && editState.customBillingMode !== 'subscription' && (
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                        {editState.customBillingMode === 'split_total' ? 'מחיר כולל לשיעור (₪) — יתחלק בין התלמידים' : 'מחיר לתלמיד (₪)'}
+                      </label>
+                      <input
+                        type="number"
+                        step="1"
+                        min="0"
+                        className="w-full bg-slate-50 border border-slate-200 rounded-xl p-4 font-bold outline-none focus:bg-white focus:ring-2 focus:ring-violet-100 transition-all"
+                        value={editState.price ?? ''}
+                        onChange={(e) => {
+                          const v = parseFloat(e.target.value);
+                          setEditState(p => ({ ...p, price: isNaN(v) ? undefined : Math.round(v) }));
+                        }}
+                        placeholder="הכנס מחיר..."
+                      />
+                      {editState.customBillingMode === 'split_total' && (editState.studentIds?.length ?? 0) > 1 && (
+                        <div className="text-xs text-slate-400">
+                          {editState.price
+                            ? `${Math.round((editState.price / (editState.studentIds?.length ?? 1)) * 100) / 100} ₪ לכל תלמיד (${editState.studentIds?.length} תלמידים)`
+                            : 'הכנס מחיר לחישוב חלוקה'}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Subscription eligible + fallback price — shown only when billing mode is subscription */}
+                  {editState.customBillingMode === 'subscription' && (
+                    <div className="space-y-3">
+                      <div className="flex items-center gap-3">
+                        <input
+                          id="custom-sub-eligible"
+                          type="checkbox"
+                          className="w-4 h-4 accent-violet-600"
+                          checked={editState.customSubscriptionEligible ?? false}
+                          onChange={(e) => setEditState(p => ({ ...p, customSubscriptionEligible: e.target.checked }))}
+                        />
+                        <label htmlFor="custom-sub-eligible" className="text-xs font-bold text-slate-600">מנוי פעיל מכסה שיעור זה</label>
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                          מחיר גיבוי אם אין מנוי פעיל (₪) — אופציונלי
+                        </label>
+                        <input
+                          type="number"
+                          step="1"
+                          min="0"
+                          className="w-full bg-slate-50 border border-slate-200 rounded-xl p-4 font-bold outline-none focus:bg-white focus:ring-2 focus:ring-violet-100 transition-all"
+                          value={editState.customFallbackPrice ?? ''}
+                          onChange={(e) => {
+                            const v = parseFloat(e.target.value);
+                            setEditState(p => ({ ...p, customFallbackPrice: isNaN(v) ? undefined : Math.round(v) }));
+                          }}
+                          placeholder="0 = לא לחייב אם אין מנוי"
+                        />
+                        <div className="text-xs text-slate-400">
+                          אם לתלמיד אין מנוי פעיל ביום השיעור, ייגבה מחיר זה. השאר ריק כדי לא לחייב.
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Cancellation policy */}
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">מדיניות ביטול</label>
+                    <div className="grid grid-cols-2 gap-2">
+                      {([
+                        { value: '24h', label: 'חיוב < 24 שעות' },
+                        { value: '48h', label: 'חיוב < 48 שעות' },
+                        { value: 'percentage', label: 'אחוז מהמחיר' },
+                        { value: 'free', label: 'ביטול חינם תמיד' },
+                      ] as { value: import('../types').CustomCancellationPolicy; label: string }[]).map(opt => (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          onClick={() => setEditState(p => ({ ...p, customCancellationPolicy: opt.value }))}
+                          className={`py-2 px-3 text-[10px] font-bold border rounded-xl transition-all text-right ${
+                            editState.customCancellationPolicy === opt.value
+                              ? 'bg-violet-500 border-violet-500 text-white shadow-sm'
+                              : 'bg-white border-slate-200 text-slate-500 hover:border-slate-300'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Percentage charge — shown only when policy is percentage */}
+                  {editState.customCancellationPolicy === 'percentage' && (
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">אחוז חיוב על ביטול (%)</label>
+                      <input
+                        type="number"
+                        step="5"
+                        min="0"
+                        max="100"
+                        className="w-full bg-slate-50 border border-slate-200 rounded-xl p-4 font-bold outline-none focus:bg-white focus:ring-2 focus:ring-violet-100 transition-all"
+                        value={editState.customCancellationChargePct ?? 100}
+                        onChange={(e) => {
+                          const v = parseInt(e.target.value, 10);
+                          setEditState(p => ({ ...p, customCancellationChargePct: isNaN(v) ? 100 : Math.min(100, Math.max(0, v)) }));
+                        }}
+                      />
+                      <div className="text-xs text-slate-400">
+                        {editState.price && editState.customCancellationChargePct
+                          ? `חיוב ביטול: ${Math.round(editState.price * (editState.customCancellationChargePct / 100) * 100) / 100} ₪`
+                          : 'הכנס מחיר ואחוז לחישוב'}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* Status selector - only when editing existing lesson */}
               {!isCreating && (
                 <div className="space-y-3">
@@ -1867,6 +2132,15 @@ const Calendar: React.FC = () => {
                   if (editState.lessonType === 'group') {
                     // Group lesson requires at least 2 students
                     return (editState.studentIds?.length || 0) >= 2;
+                  }
+
+                  if (editState.lessonType === 'custom') {
+                    const hasBillingMode = !!editState.customBillingMode;
+                    const hasCancellationPolicy = !!editState.customCancellationPolicy;
+                    const hasStudents = (editState.studentIds?.length || 0) >= 1;
+                    const needsPrice = editState.customBillingMode !== 'free' && editState.customBillingMode !== 'subscription';
+                    const hasPrice = !needsPrice || (editState.price !== undefined && editState.price >= 0);
+                    return hasBillingMode && hasCancellationPolicy && hasStudents && hasPrice;
                   }
                   
                   if (editState.lessonType === 'recurring') {

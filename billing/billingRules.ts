@@ -98,9 +98,10 @@ export function isPrivateLesson(lessonType: string): boolean {
 }
 
 /**
- * Check if student has active subscription for a given lesson date
+ * Check if student has active subscription for a given lesson date.
+ * Exported so billingDetailsService can reuse the same logic.
  */
-function checkActiveSubscriptionForLesson(
+export function checkActiveSubscriptionForLesson(
   studentId: string,
   lessonDate: string,
   subscriptions: SubscriptionsAirtableFields[]
@@ -164,6 +165,34 @@ export function calculateLessonAmount(
 
   // Resolve lesson date: prefer start_datetime, fall back to lesson_date
   const lessonDateStr = lesson.start_datetime || lesson.lesson_date;
+
+  // Custom (מותאם): fully configurable billing mode
+  if (normalized === 'מותאם' || normalized === 'custom') {
+    const mode = lesson.custom_billing_mode ?? 'per_student';
+    if (mode === 'free') return 0;
+    if (mode === 'subscription') {
+      if (lesson.custom_subscription_eligible && subscriptions && subscriptions.length > 0 && lessonDateStr) {
+        const studentId = targetStudentId ?? extractStudentId(lesson.full_name);
+        const lessonDate = lessonDateStr.split('T')[0];
+        if (checkActiveSubscriptionForLesson(studentId, lessonDate, subscriptions)) {
+          return 0;
+        }
+      }
+      // No active subscription covers this lesson — charge the fallback price instead of silently returning 0
+      if (lesson.custom_fallback_price !== undefined && lesson.custom_fallback_price > 0) {
+        console.warn(
+          `[calculateLessonAmount] Lesson ${lesson.lesson_id ?? 'unknown'}: subscription mode but no active subscription — charging fallback price ${lesson.custom_fallback_price}`
+        );
+        return lesson.custom_fallback_price;
+      }
+      console.warn(
+        `[calculateLessonAmount] Lesson ${lesson.lesson_id ?? 'unknown'}: subscription mode, no active subscription, and no fallback price set — charging ₪0. Set custom_fallback_price to avoid silent zero-charge.`
+      );
+      return 0;
+    }
+    // per_student or split_total: price is frozen at creation (already divided by N students)
+    return lesson.price ?? lesson.line_amount ?? 0;
+  }
 
   // Group (קבוצתי): check subscription first — if active, do not charge regardless of line_amount
   if (normalized === 'group' || normalized === 'קבוצתי') {
@@ -313,13 +342,24 @@ export function calculateLessonsContribution(
       continue;
     }
 
-    // Include private lessons and pair/group lessons (pair/group will be charged if no subscription)
+    // Include private lessons and pair/group/custom lessons (pair/group/custom will be charged if applicable)
     const amount = calculateLessonAmount(lesson, subscriptions, targetStudentId);
-    
+    const lessonTypeNorm = (lesson.lesson_type || '').toLowerCase().trim();
+    const isCustom = lessonTypeNorm === 'מותאם' || lessonTypeNorm === 'custom';
+
     if (isPrivateLesson(lesson.lesson_type)) {
       console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} INCLUDED: private lesson, status=${lesson.status}, amount=${amount}`);
       lessonsTotal += amount;
       lessonsCount++;
+    } else if (isCustom) {
+      // Custom lesson: always include the row (even if 0 for free/subscription-covered)
+      if (amount > 0) {
+        console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} INCLUDED: custom lesson, status=${lesson.status}, amount=${amount}`);
+        lessonsTotal += amount;
+        lessonsCount++;
+      } else {
+        console.log(`[calculateLessonsContribution] Lesson ${lesson.id || 'unknown'} skipped: custom lesson with 0 amount (free or subscription-covered)`);
+      }
     } else {
       // Pair/Group lesson - include only if amount > 0 (no active subscription)
       if (amount > 0) {
@@ -357,6 +397,28 @@ export function calculateCancellationAmount(
 
   // If we have a linked lesson, use its lesson_type
   if (linkedLesson) {
+    const normalizedLinked = (linkedLesson.lesson_type || '').toLowerCase().trim();
+
+    // Custom (מותאם): apply the lesson's own cancellation policy
+    if (normalizedLinked === 'מותאם' || normalizedLinked === 'custom') {
+      const policy = linkedLesson.custom_cancellation_policy ?? '24h';
+
+      if (policy === 'free') return 0;
+
+      if (policy === 'percentage') {
+        const pct = linkedLesson.custom_cancellation_charge_pct ?? 0;
+        const lessonPrice = linkedLesson.price ?? linkedLesson.line_amount ?? 0;
+        return Math.round(lessonPrice * (pct / 100) * 100) / 100;
+      }
+
+      // For '24h' or '48h': check the hours_before threshold
+      const threshold = policy === '48h' ? 48 : 24;
+      if ((cancellation.hours_before ?? Infinity) < threshold) {
+        return linkedLesson.price ?? linkedLesson.line_amount ?? 0;
+      }
+      return 0;
+    }
+
     if (isPrivateLesson(linkedLesson.lesson_type)) {
       if (linkedLesson.price !== undefined && linkedLesson.price !== null) {
         return Number(linkedLesson.price);
@@ -438,13 +500,33 @@ export function calculateCancellationsContribution(
   }> = [];
 
   for (const cancellation of cancellations) {
-    // Only include if billing_month matches
-    if (cancellation.billing_month !== billingMonth) {
+    // Match billing_month with substring to handle both "YYYY-MM" and "YYYY-MM-DD" formats
+    const cancelBillingMonth = String(cancellation.billing_month ?? '').substring(0, 7);
+    if (cancelBillingMonth !== billingMonth) {
       continue;
     }
 
-    // Only include if is_lt_24h == 1
-    if (cancellation.is_lt_24h !== 1) {
+    // Calculate amount
+    const lessonId = extractLessonId(cancellation.lesson);
+    const linkedLesson = getLinkedLesson ? getLinkedLesson(lessonId) : undefined;
+
+    // When the linked lesson cannot be resolved, we cannot determine the correct policy.
+    // Emit a MissingFieldsError so the caller can surface this data gap rather than silently mis-billing.
+    if (!linkedLesson) {
+      missingFields.push({
+        table: 'cancellations',
+        field: 'lesson (linked record)',
+        why_needed: `Cancellation ${cancellation.natural_key ?? lessonId}: cannot resolve the linked lesson record. Without it, the correct billing policy (custom vs standard is_lt_24h gate) cannot be determined.`,
+        example_values: [lessonId],
+      });
+      continue;
+    }
+
+    // For custom lessons, the cancellation policy on the lesson itself governs eligibility.
+    // For all other types, fall back to the Airtable-computed is_lt_24h gate.
+    const linkedNormalized = (linkedLesson.lesson_type || '').toLowerCase().trim();
+    const isCustomLesson = linkedNormalized === 'מותאם' || linkedNormalized === 'custom';
+    if (!isCustomLesson && cancellation.is_lt_24h !== 1) {
       continue;
     }
 
@@ -453,10 +535,6 @@ export function calculateCancellationsContribution(
       pendingCancellationsCount++;
       continue;
     }
-
-    // Calculate amount
-    const lessonId = extractLessonId(cancellation.lesson);
-    const linkedLesson = getLinkedLesson ? getLinkedLesson(lessonId) : undefined;
     const amount = calculateCancellationAmount(cancellation, linkedLesson, subscriptions);
 
     if (amount === null) {

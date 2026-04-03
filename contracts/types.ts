@@ -29,7 +29,17 @@ export type LinkedRecord = string | string[];
 /**
  * Lesson type values (Hebrew)
  */
-export type LessonTypeValue = 'פרטי' | 'זוגי' | 'קבוצתי';
+export type LessonTypeValue = 'פרטי' | 'זוגי' | 'קבוצתי' | 'מותאם';
+
+/**
+ * Billing modes for custom lessons
+ */
+export type CustomBillingMode = 'per_student' | 'split_total' | 'subscription' | 'free';
+
+/**
+ * Cancellation policy options for custom lessons
+ */
+export type CustomCancellationPolicy = '24h' | '48h' | 'percentage' | 'free';
 
 /**
  * ============================================================================
@@ -137,8 +147,23 @@ export interface LessonsAirtableFields {
   /** Unit price (optional - may not exist) */
   unit_price?: number;
   
-  /** Price: for private = per-lesson; for pair/group = total (each student charged half when no subscription) */
+  /** Price: for private = per-lesson; for pair/group = total (each student charged half when no subscription); for custom = per-student (frozen at creation) */
   price?: number;
+
+  /** Custom lesson billing mode (only for lesson_type === 'מותאם') */
+  custom_billing_mode?: CustomBillingMode;
+
+  /** Custom lesson cancellation policy (only for lesson_type === 'מותאם') */
+  custom_cancellation_policy?: CustomCancellationPolicy;
+
+  /** Percentage of lesson price to charge on cancellation (used when custom_cancellation_policy === 'percentage') */
+  custom_cancellation_charge_pct?: number;
+
+  /** Whether an active subscription can cover this custom lesson */
+  custom_subscription_eligible?: boolean;
+
+  /** Fallback price (₪ per student) when billing mode is 'subscription' but no active subscription covers the lesson */
+  custom_fallback_price?: number;
 }
 
 export type LessonsRecord = AirtableRecord<LessonsAirtableFields>;

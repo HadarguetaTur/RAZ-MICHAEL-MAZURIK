@@ -7,7 +7,10 @@ export enum LessonStatus {
   CANCELLED_BY_ADMIN = 'בוטל ע"י מנהל'
 }
 
-export type LessonType = 'private' | 'pair' | 'group' | 'recurring';
+export type LessonType = 'private' | 'pair' | 'group' | 'recurring' | 'custom';
+
+export type CustomBillingMode = 'per_student' | 'split_total' | 'subscription' | 'free';
+export type CustomCancellationPolicy = '24h' | '48h' | 'percentage' | 'free';
 
 export interface Student {
   id: string;
@@ -53,6 +56,13 @@ export interface Lesson {
   price?: number; // מחיר השיעור (ניתן לעריכה)
   /** Optional: link to weekly_slot when lesson was created from a recurring template */
   weeklySlotId?: string;
+  // Custom lesson configuration (only for lessonType === 'custom')
+  customBillingMode?: CustomBillingMode;
+  customCancellationPolicy?: CustomCancellationPolicy;
+  customCancellationChargePct?: number;
+  customSubscriptionEligible?: boolean;
+  /** Fallback price (₪ per student) when billing mode is 'subscription' but no active subscription covers the lesson */
+  customFallbackPrice?: number;
 }
 
 export interface WeeklySlot {

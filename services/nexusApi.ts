@@ -274,15 +274,36 @@ function mapAirtableToLesson(record: any): Lesson {
     ? (typeof teacherIdRaw[0] === 'string' ? teacherIdRaw[0] : teacherIdRaw[0]?.id || '')
     : (typeof teacherIdRaw === 'string' ? teacherIdRaw : '');
 
-  // Map lesson_type from Hebrew to English (Airtable: "פרטי","זוגי","קבוצתי" -> "private","pair","group")
+  // Map lesson_type from Hebrew to English
   const lessonTypeField = getField('lessons', 'lesson_type');
   const lessonTypeRaw = (fields[lessonTypeField] || '').trim();
   const lessonTypeMap: Record<string, string> = {
     'פרטי': 'private',
     'זוגי': 'pair',
     'קבוצתי': 'group',
+    'מותאם': 'custom',
   };
   const lessonType = lessonTypeMap[lessonTypeRaw] || lessonTypeRaw || 'private';
+
+  // Custom lesson extra fields
+  let customBillingMode: string | undefined;
+  let customCancellationPolicy: string | undefined;
+  let customCancellationChargePct: number | undefined;
+  let customSubscriptionEligible: boolean | undefined;
+  let customFallbackPrice: number | undefined;
+  if (lessonType === 'custom') {
+    try {
+      customBillingMode = fields[getField('lessons', 'custom_billing_mode')] as string | undefined;
+      customCancellationPolicy = fields[getField('lessons', 'custom_cancellation_policy')] as string | undefined;
+      const rawPct = fields[getField('lessons', 'custom_cancellation_charge_pct')];
+      customCancellationChargePct = rawPct !== undefined && rawPct !== null ? Number(rawPct) : undefined;
+      customSubscriptionEligible = !!fields[getField('lessons', 'custom_subscription_eligible')];
+      const rawFallback = fields[getField('lessons', 'custom_fallback_price')];
+      customFallbackPrice = rawFallback !== undefined && rawFallback !== null ? Number(rawFallback) : undefined;
+    } catch (e) {
+      // fields not yet in Airtable — ignore silently
+    }
+  }
 
   const primaryStudentId = studentIdFromFullName || 
               fields['Student_ID'] || 
@@ -303,11 +324,18 @@ function mapAirtableToLesson(record: any): Lesson {
     isChargeable: fields['Is_Chargeable'] !== false,
     chargeReason: fields['Charge_Reason'] || fields['charge_reason'],
     isPrivate: lessonType === 'private',
-    lessonType: lessonType as 'private' | 'pair' | 'group',
-    notes: lessonDetails, // Use 'פרטי השיעור' as primary notes field
+    lessonType: lessonType as 'private' | 'pair' | 'group' | 'custom',
+    notes: lessonDetails,
     paymentStatus: fields['Payment_Status'] || fields['payment_status'],
     attendanceConfirmed: fields['Attendance_Confirmed'] || false,
     price: price,
+    ...(lessonType === 'custom' && {
+      customBillingMode,
+      customCancellationPolicy,
+      customCancellationChargePct,
+      customSubscriptionEligible,
+      customFallbackPrice,
+    }),
   };
   
   
@@ -421,6 +449,7 @@ function mapLessonToAirtable(lesson: Partial<Lesson>): any {
       'private': 'פרטי',
       'pair': 'זוגי',
       'group': 'קבוצתי',
+      'custom': 'מותאם',
     };
     const hebrewType = typeMap[lesson.lessonType] || lesson.lessonType;
     fields[lessonTypeField] = hebrewType;
@@ -445,7 +474,28 @@ function mapLessonToAirtable(lesson: Partial<Lesson>): any {
     const studentFieldName = getField('lessons', 'full_name');
     fields[studentFieldName] = [lesson.studentId];
   }
-  
+
+  // Custom lesson billing/cancellation fields — written on both create (via createLesson) and update
+  try {
+    if (lesson.customBillingMode !== undefined) {
+      fields[getField('lessons', 'custom_billing_mode')] = lesson.customBillingMode;
+    }
+    if (lesson.customCancellationPolicy !== undefined) {
+      fields[getField('lessons', 'custom_cancellation_policy')] = lesson.customCancellationPolicy;
+    }
+    if (lesson.customCancellationChargePct !== undefined) {
+      fields[getField('lessons', 'custom_cancellation_charge_pct')] = lesson.customCancellationChargePct;
+    }
+    if (lesson.customSubscriptionEligible !== undefined) {
+      fields[getField('lessons', 'custom_subscription_eligible')] = lesson.customSubscriptionEligible;
+    }
+    if (lesson.customFallbackPrice !== undefined) {
+      fields[getField('lessons', 'custom_fallback_price')] = lesson.customFallbackPrice;
+    }
+  } catch (e) {
+    console.warn('[nexusApi] custom lesson fields not in fieldMap yet — add them to Airtable first');
+  }
+
   return { fields };
 }
 
@@ -2673,6 +2723,7 @@ export const nexusApi = {
     const isActiveField = getField('students', 'is_active');
     const fullNameField = getField('students', 'full_name');
     const phoneField = getField('students', 'phone_number');
+    const parentNameField = getField('students', 'parent_name');
 
     // Try formula-based search first
     try {
@@ -2680,7 +2731,8 @@ export const nexusApi = {
         {${isActiveField}}=TRUE(),
         OR(
           SEARCH(LOWER("${searchQuery}"), LOWER({${fullNameField}}&"")),
-          SEARCH(LOWER("${searchQuery}"), LOWER({${phoneField}}&""))
+          SEARCH(LOWER("${searchQuery}"), LOWER({${phoneField}}&"")),
+          SEARCH(LOWER("${searchQuery}"), LOWER({${parentNameField}}&""))
         )
       )`;
 
@@ -2715,7 +2767,8 @@ export const nexusApi = {
           if (student.status === 'inactive') return false;
           const nameMatch = student.name?.toLowerCase().includes(searchQuery);
           const phoneMatch = student.phone?.toLowerCase().includes(searchQuery);
-          return nameMatch || phoneMatch;
+          const parentNameMatch = student.parentName?.toLowerCase().includes(searchQuery);
+          return nameMatch || phoneMatch || parentNameMatch;
         })
         .slice(0, limit)
         .sort((a, b) => (a.name || '').localeCompare(b.name || '', 'he'));
@@ -3140,7 +3193,7 @@ export const nexusApi = {
 
     // Notes: 'פרטי השיעור' is a computed/formula field in Airtable – skip writing to it
 
-    // Price - for private: per-lesson amount; for pair/group: total amount (each student charged half when no subscription)
+    // Price - for private: per-lesson amount; for pair: total; for custom: per-student (total / N)
     const priceField = getField('lessons', 'price');
     if (lesson.lessonType === 'private' || lesson.isPrivate) {
       const calculatedPrice = lesson.price !== undefined 
@@ -3150,6 +3203,37 @@ export const nexusApi = {
     } else if (lesson.lessonType === 'pair') {
       const pairTotalPrice = lesson.price !== undefined ? lesson.price : 225;
       airtableFields.fields[priceField] = Math.round(pairTotalPrice * 100) / 100;
+    } else if (lesson.lessonType === 'custom') {
+      // Custom lesson: freeze per-student price at creation time
+      const customBillingMode = lesson.customBillingMode;
+      const customPrice = lesson.price;
+      if (customPrice !== undefined && customBillingMode !== 'free' && customBillingMode !== 'subscription') {
+        const studentCount = Math.max(1, studentIdsToLink.length);
+        const perStudent = customBillingMode === 'split_total'
+          ? Math.round((customPrice / studentCount) * 100) / 100
+          : Math.round(customPrice * 100) / 100;
+        airtableFields.fields[priceField] = perStudent;
+      }
+      // Write custom lesson configuration fields
+      try {
+        if (customBillingMode) {
+          airtableFields.fields[getField('lessons', 'custom_billing_mode')] = customBillingMode;
+        }
+        if (lesson.customCancellationPolicy) {
+          airtableFields.fields[getField('lessons', 'custom_cancellation_policy')] = lesson.customCancellationPolicy;
+        }
+        if (lesson.customCancellationChargePct !== undefined) {
+          airtableFields.fields[getField('lessons', 'custom_cancellation_charge_pct')] = lesson.customCancellationChargePct;
+        }
+        if (lesson.customSubscriptionEligible !== undefined) {
+          airtableFields.fields[getField('lessons', 'custom_subscription_eligible')] = lesson.customSubscriptionEligible;
+        }
+        if (lesson.customFallbackPrice !== undefined) {
+          airtableFields.fields[getField('lessons', 'custom_fallback_price')] = lesson.customFallbackPrice;
+        }
+      } catch (e) {
+        console.warn('[nexusApi] custom lesson fields not in fieldMap yet — add them to Airtable first');
+      }
     }
     // Group (קבוצתי): fixed 120 per student at billing time - do not write price
 
@@ -3160,13 +3244,14 @@ export const nexusApi = {
     //   addFieldIfMapped('lessonSubject', lesson.subject, airtableFields);
     // }
 
-    // Lesson type - map English to Hebrew for Airtable (options in this base are without trailing space: "פרטי", "זוגי", "קבוצתי")
+    // Lesson type - map English to Hebrew for Airtable
     if (lesson.lessonType) {
       const lessonTypeField = getField('lessons', 'lesson_type');
       const typeMap: Record<string, string> = {
         'private': 'פרטי',
         'pair': 'זוגי',
         'group': 'קבוצתי',
+        'custom': 'מותאם',
       };
       const hebrewType = typeMap[lesson.lessonType] || lesson.lessonType;
       airtableFields.fields[lessonTypeField] = hebrewType;

@@ -7,7 +7,8 @@
 
 import type { AirtableClient } from './airtableClient';
 import { TABLES, FIELDS, getField } from '../contracts/fieldMap';
-import { isLessonExcluded, isBillableStatus } from '../billing/billingRules';
+import { isLessonExcluded, isBillableStatus, checkActiveSubscriptionForLesson } from '../billing/billingRules';
+import type { SubscriptionsAirtableFields, LinkedRecord } from '../contracts/types';
 
 // --- Types (output of getBillingBreakdown) ---
 
@@ -83,36 +84,34 @@ function parseAmount(val: string | number | undefined | null): number {
   return Number.isNaN(n) ? 0 : n;
 }
 
-/** True if student has an active (non-paused) subscription covering the given lesson date. */
+/**
+ * Map raw Airtable subscription records to typed SubscriptionsAirtableFields,
+ * then delegate to the shared checkActiveSubscriptionForLesson from billingRules.
+ */
 function hasActiveSubscriptionForDate(
   studentId: string,
   lessonDateStr: string,
   subsRaw: Array<{ id: string; fields: Record<string, unknown> }>,
   S: typeof FIELDS.subscriptions
 ): boolean {
-  const lessonDate = new Date(lessonDateStr);
-  lessonDate.setHours(0, 0, 0, 0);
-  for (const r of subsRaw) {
-    const f = r.fields;
-    const linkId = extractLinkedId(f[S.student_id]);
-    if (linkId !== studentId) continue;
-    if (f[S.pause_subscription] === true || f[S.pause_subscription] === 1) continue;
-    const startDate = f[S.subscription_start_date] ? String(f[S.subscription_start_date]).split('T')[0] : '';
-    if (startDate) {
-      const start = new Date(startDate);
-      start.setHours(0, 0, 0, 0);
-      if (start > lessonDate) continue;
-    }
-    const endDateVal = f[S.subscription_end_date];
-    const endDate = endDateVal ? String(endDateVal).split('T')[0] : null;
-    if (endDate) {
-      const end = new Date(endDate);
-      end.setHours(0, 0, 0, 0);
-      if (end < lessonDate) continue;
-    }
-    return true;
-  }
-  return false;
+  const typed: SubscriptionsAirtableFields[] = subsRaw.map((r) => ({
+    id: r.id,
+    student_id: (r.fields[S.student_id] ?? '') as LinkedRecord,
+    subscription_start_date: r.fields[S.subscription_start_date]
+      ? String(r.fields[S.subscription_start_date]).split('T')[0]
+      : '',
+    subscription_end_date: r.fields[S.subscription_end_date]
+      ? String(r.fields[S.subscription_end_date]).split('T')[0]
+      : undefined,
+    monthly_amount: (r.fields[S.monthly_amount] ?? 0) as string | number,
+    subscription_type: String(r.fields[S.subscription_type] ?? ''),
+    pause_subscription:
+      r.fields[S.pause_subscription] === true || r.fields[S.pause_subscription] === 1,
+    pause_date: r.fields[S.pause_date]
+      ? String(r.fields[S.pause_date]).split('T')[0]
+      : undefined,
+  }));
+  return checkActiveSubscriptionForLesson(studentId, lessonDateStr.split('T')[0], typed);
 }
 
 /**
@@ -251,6 +250,7 @@ export async function getBillingBreakdown(
     const isPair = lessonType === 'pair' || lessonType === 'זוגי';
     const isGroup = lessonType === 'group' || lessonType === 'קבוצתי';
     const isPrivate = lessonType === 'private' || lessonType === 'פרטי';
+    const isCustom = lessonType === 'מותאם' || lessonType === 'custom';
     // Private: prefer price (manual override by Raz), then line_amount (formula), then 175
     // MUST match billingRules.ts: price field is checked first even if 0 (explicit waiver)
     if (isPrivate) {
@@ -270,11 +270,39 @@ export async function getBillingBreakdown(
     if (lineAmount <= 0 && isGroup) {
       lineAmount = 120;
     }
+    // Custom: price (frozen per-student at creation) → line_amount fallback
+    if (isCustom) {
+      const billingMode = String(f[L.custom_billing_mode] ?? 'per_student');
+      if (billingMode === 'free') {
+        // Deliberately free — skip entirely, nothing to show in breakdown
+        continue;
+      }
+      if (billingMode === 'subscription') {
+        const eligible = f[L.custom_subscription_eligible];
+        const coveredCustom =
+          eligible && date && hasActiveSubscriptionForDate(studentId, date, subsRaw, S);
+        if (coveredCustom) {
+          lineAmount = 0;
+        } else {
+          // Subscription doesn't cover this lesson — use fallback price
+          const fallback = parseAmount(f[L.custom_fallback_price] as string | number);
+          lineAmount = fallback > 0 ? fallback : 0;
+        }
+      } else {
+        const rawPrice = parseAmount(f[L.price] as string | number);
+        if (rawPrice > 0) {
+          lineAmount = rawPrice;
+        }
+        // If price is still 0/missing, keep lineAmount as-is (from line_amount formula or 0).
+        // per_student/split_total lessons with missing price are shown as ₪0 (data gap, not a waiver).
+      }
+    }
     // Pair/group with active subscription for this date => do not charge (show row with 0)
     const coveredBySubscription =
       (isPair || isGroup) && date && hasActiveSubscriptionForDate(studentId, date, subsRaw, S);
     if (coveredBySubscription && lineAmount > 0) lineAmount = 0;
-    if (lineAmount <= 0 && !coveredBySubscription) continue;
+    // Non-custom lessons with lineAmount = 0 that aren't subscription-covered are not billable
+    if (lineAmount <= 0 && !coveredBySubscription && !isCustom) continue;
     lessons.push({
       date,
       type: String(f[L.lesson_type] ?? ''),
