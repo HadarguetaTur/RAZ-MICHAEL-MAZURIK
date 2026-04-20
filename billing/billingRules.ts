@@ -218,12 +218,13 @@ export function calculateLessonAmount(
         return 0;
       }
     }
-    if (lesson.line_amount !== undefined && lesson.line_amount !== null) {
-      return lesson.line_amount;
-    }
+    // Prefer explicit price (manual override) over line_amount formula value
     const totalPrice = lesson.price !== undefined && lesson.price !== null ? Number(lesson.price) : null;
     if (totalPrice !== null && totalPrice >= 0) {
       return Math.round((totalPrice / 2) * 100) / 100;
+    }
+    if (lesson.line_amount !== undefined && lesson.line_amount !== null) {
+      return lesson.line_amount;
     }
     return 112.5;
   }
@@ -457,11 +458,12 @@ export function calculateCancellationAmount(
         );
         if (hasActive) return 0;
       }
-      if (linkedLesson.line_amount !== undefined && linkedLesson.line_amount !== null) {
-        return linkedLesson.line_amount;
-      }
+      // Prefer explicit price (manual override) over line_amount formula value
       if (linkedLesson.price !== undefined && linkedLesson.price !== null) {
         return Math.round((Number(linkedLesson.price) / 2) * 100) / 100;
+      }
+      if (linkedLesson.line_amount !== undefined && linkedLesson.line_amount !== null) {
+        return linkedLesson.line_amount;
       }
       return 112.5;
     }

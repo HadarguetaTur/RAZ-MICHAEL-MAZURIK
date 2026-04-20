@@ -261,10 +261,15 @@ export async function getBillingBreakdown(
         lineAmount = 175;
       }
     }
-    // Pair: line_amount, then price/2, then 112.5
-    if (lineAmount <= 0 && isPair) {
+    // Pair: prefer explicit price (manual override), then line_amount formula value, then 112.5
+    if (isPair) {
       const totalPrice = parseAmount(f[L.price] as string | number);
-      lineAmount = totalPrice > 0 ? Math.round((totalPrice / 2) * 100) / 100 : 112.5;
+      if (totalPrice > 0) {
+        lineAmount = Math.round((totalPrice / 2) * 100) / 100;
+      } else if (lineAmount <= 0) {
+        lineAmount = 112.5;
+      }
+      // else: line_amount from formula (112.5) is the correct default — keep it
     }
     // Group: line_amount, then 120
     if (lineAmount <= 0 && isGroup) {
